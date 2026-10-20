@@ -2797,6 +2797,18 @@ struct Engine {
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
                   const std::atomic<bool>* cancel = nullptr) {
+        D = spec_verify(x_tok, fix, D, drafts);
+        int a = 0;
+        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        if (cancel != nullptr && cancel->load()) a = 0;
+        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        spec_commit(a);
+        return a;
+    }
+    /// A speculative step's first half: the MTP drafts and the verify window [x, d1 .. dD] (D may come back smaller:
+    /// a hybrid rebalance boundary); every row's logits in `logits`, the greedy picks in hpin[2 ..].  spec_commit(a)
+    /// then keeps x and the first a drafts.
+    int spec_verify(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -2845,15 +2857,20 @@ struct Engine {
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        if (cancel != nullptr && cancel->load()) a = 0;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        return D;
+    }
+    void spec_commit(int a) {
+        const int N = (int) m->g.n_embd;
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
         after_rows(a + 1);
-        return a;
+    }
+    /// The first n rows of `logits` (a verify window's), on the host.
+    void host_logits_rows(int n, std::vector<float>& out) {
+        out.resize((size_t) n * m->g.n_vocab);
+        CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
     }
 
     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
@@ -3550,6 +3567,73 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
     return idx[keep - 1];
 }
 
+/// The sampler's final distribution (sample()'s steps: the penalties over hist, top-k, temperature, min-p, top-p) as
+/// token ids and probabilities summing to 1; a greedy sampler's is its argmax alone.
+void sample_dist(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::vector<int>& ids,
+                 std::vector<double>& pr) {
+    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
+        std::map<int, int> cnt;
+        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
+        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+        for (const auto& [id, c] : cnt) {
+            float& v = lg[(size_t) id];
+            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
+            v -= (float) c * s.freq + s.present;
+        }
+    }
+    ids.clear();
+    pr.clear();
+    if (s.temperature <= 0.f) {
+        ids.push_back((int) (std::max_element(lg.begin(), lg.end()) - lg.begin()));
+        pr.push_back(1.0);
+        return;
+    }
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+    idx.resize((size_t) kk);
+    std::vector<double> p(idx.size());
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    size_t keep = idx.size();
+    double cum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
+        cum += p[i] / sum;
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max<size_t>(1, keep);
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    for (size_t i = 0; i < keep; ++i) {
+        ids.push_back(idx[i]);
+        pr.push_back(p[i] / tot);
+    }
+}
+
+/// Speculative sampling against a deterministic draft (the MTP block's greedy pick d): d is kept with probability
+/// p(d); else the token is drawn from p without d (renormalized).  The kept text is a draw from p exactly.
+/// Returns -1 when d is kept, else the token drawn instead.
+int spec_accept(const std::vector<int>& ids, const std::vector<double>& pr, int d, std::mt19937_64& rng) {
+    double pd = 0;
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (ids[i] == d) pd = pr[i];
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    if (pd > 0 && u01(rng) < pd) return -1;
+    const double rest = 1.0 - pd;
+    std::uniform_real_distribution<double> ur(0.0, rest > 0 ? rest : 1.0);
+    double r = ur(rng);
+    int last = ids.empty() ? d : ids.back();
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == d) continue;
+        last = ids[i];
+        if ((r -= pr[i]) <= 0) return ids[i];
+    }
+    return last;
+}
+
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
     while (*s) {
@@ -3680,7 +3764,9 @@ struct Serve {
     std::atomic<bool> stop{false};
     std::vector<Slot> slots;
     int n_active = 0;
-    std::vector<float> lg;
+    std::vector<float> lg, lgw;            // (lgw: a verify window's rows, speculative sampling)
+    std::vector<int> sids;
+    std::vector<double> sprs;
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
@@ -4079,7 +4165,10 @@ struct Serve {
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); sampled ones, and requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        // (sampled ones too: speculative sampling of the MTP block's greedy drafts, spec_accept)
+        const bool spec = E.mtp_d > 0 && !adm && std::getenv("STRATA_Q36_NO_SAMPLED_MTP") == nullptr ? true
+                          : E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        bool have_nx = false;   // a sampled speculative step decided the next token already
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -4118,10 +4207,11 @@ struct Serve {
             return;
         }
         for (;;) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() && !have_nx) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
+            have_nx = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
@@ -4134,6 +4224,43 @@ struct Serve {
             };
             if (!emit(nx)) break;
             if (n_active > 0) window();
+            if (spec && smp.needs_logits() && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
+                // speculative sampling: the window's row i is the distribution after x and the first i drafts
+                const int D = E.spec_verify(nx, fix, E.mtp_d, drafts);
+                E.host_logits_rows(D + 1, lgw);
+                std::vector<int32_t> h2 = hist;
+                int a = 0, next = -1;
+                const size_t V = (size_t) E.m->g.n_vocab;
+                for (; a <= D; ++a) {
+                    lg.assign(lgw.begin() + (ptrdiff_t) (a * V), lgw.begin() + (ptrdiff_t) ((a + 1) * V));
+                    sample_dist(lg, smp, h2, sids, sprs);
+                    if (a == D) {   // every draft kept: the token after them from the last row
+                        std::uniform_real_distribution<double> u01(0.0, 1.0);
+                        double r = u01(rng);
+                        next = sids.back();
+                        for (size_t i = 0; i < sids.size(); ++i)
+                            if ((r -= sprs[i]) <= 0) { next = sids[i]; break; }
+                        break;
+                    }
+                    const int t = spec_accept(sids, sprs, drafts[(size_t) a], rng);
+                    if (t >= 0) { next = t; break; }
+                    h2.push_back(drafts[(size_t) a]);
+                }
+                if (stop.load()) a = 0;
+                E.spec_commit(a);
+                offered += D;
+                accepted += a;
+                ss.live.push_back(nx);
+                for (int i = 0; i < a; ++i) ss.live.push_back(drafts[(size_t) i]);
+                fix.assign(drafts.begin(), drafts.begin() + a);
+                bool ended = false;
+                for (int i = 0; i < a && !ended; ++i)
+                    if (!emit(drafts[(size_t) i])) ended = true;
+                if (ended) break;
+                nx = next;
+                have_nx = true;
+                continue;
+            }
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
                 offered += E.mtp_d;
