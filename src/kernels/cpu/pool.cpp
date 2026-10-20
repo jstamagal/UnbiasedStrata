@@ -834,7 +834,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
                 if (mode_ == 5 && q2_native_kernels(nfmt->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+                    thread_local float gbuf[MAXT][kNativeMaxFF > FF ? kNativeMaxFF : FF], ubuf[MAXT][kNativeMaxFF > FF ? kNativeMaxFF : FF];
                     float* gp[MAXT];
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
