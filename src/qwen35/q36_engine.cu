@@ -535,6 +535,30 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
 
+/// The softmax probability of the largest of x[0 .. n): one block (the drafts' confidence, --spec-min-p).
+__global__ void k_top_prob(const float* x, int n, float* out) {
+    __shared__ float red[1024];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, x[i]);
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    mx = red[0];
+    __syncthreads();
+    float sum = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += __expf(x[i] - mx);
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = 1.f / red[0];
+}
+
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
 
 /// out[t][o] = W[o] . x[t] in FP32 for a prompt chunk's small F32 projections (the router, the GDN alpha / beta,
@@ -1309,7 +1333,7 @@ struct Engine {
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
         count_rows(n);
-        if (pos % kRebalanceEvery == 0) {
+        if (pos % kRebalanceEvery == 0 || (n_dev > 1 && (pos - n) / kRebalanceEvery != pos / kRebalanceEvery)) {
             CK(cudaStreamSynchronize(st));
             rebalance(8);
         }
@@ -2823,10 +2847,13 @@ struct Engine {
     bool prof = std::getenv("STRATA_Q36_PROF") != nullptr;
     double pf_mtp = 0, pf_ver = 0, pf_commit = 0, pf_host = 0, pf_cpu0 = 0;
     long long pf_steps = 0, pf_rows = 0;
-    int spec_verify(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts) {
+    int spec_verify(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts,
+                    const std::vector<int32_t>* lookup = nullptr) {
         const int N = (int) m->g.n_embd;
         const auto pt0 = Clock::now();
-        if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        // (one device: a window never steps over a rebalance position, so plain and speculative decoding see the same slot
+        // tables everywhere; a layer split lets it - the rebalance then follows the window - for whole drafts every step)
+        if (main_hybrid && n_dev == 1) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -2842,13 +2869,45 @@ struct Engine {
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
         drafts.assign((size_t) D, 0);
+        // --spec-min-p: a draft whose probability under the block is below it ends the chain (it and the ones after)
+        const int n_dl = draft_n > 0 && draft_n < m->g.n_vocab ? draft_n : (int) m->g.n_vocab;
+        auto draft_prob = [&]() {
+            if (spec_min_p <= 0.f) return;
+            if (!d_prob) CK(cudaMalloc((void**) &d_prob, 4));
+            k_top_prob<<<1, 1024, 0, st>>>(logits_m, n_dl, d_prob);
+            CK(cudaMemcpyAsync(hpin + 3, d_prob, 4, cudaMemcpyDeviceToHost, st));
+        };
+        auto prob_ok = [&]() {
+            if (spec_min_p <= 0.f) return true;
+            float pr;
+            std::memcpy(&pr, hpin + 3, 4);
+            return pr >= spec_min_p;
+        };
         if (D > 0) {
+            draft_prob();
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[0] = hpin[2];
         }
+        bool low = D > 0 && !prob_ok();
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
-        for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
+        // the lookup drafts (the text's own continuation of its last tokens, earlier in the conversation) instead of the
+        // chain when they agree with the block's first draft: a longer window for repeated text (code, markup)
+        if (D > 0 && lookup && !lookup->empty() && (*lookup)[0] == drafts[0]) {
+            const int L = (int) std::min<size_t>(lookup->size(), (size_t) (kVerify - 1));
+            const int room = (int) std::min<int64_t>(L, ctx - pos - 1);
+            if (room > D || (low && room > 0)) {
+                drafts.assign(lookup->begin(), lookup->begin() + room);
+                D = room;
+                low = false;
+                ++lookup_steps;
+            }
+        }
+        if (low) {   // the first draft is a guess: a plain step
+            D = 0;
+            drafts.clear();
+        }
+        for (int d = 1; d < D && !(lookup_steps_mark != lookup_steps); ++d) {   // chained: (the block's own output, the last draft) at the next position
             hpin[0] = drafts[(size_t) d - 1];
             hpin[1] = (int32_t) (pos + d);
             CK(cudaMemcpyAsync(tok_m, hpin, 4, cudaMemcpyHostToDevice, st));
@@ -2857,10 +2916,17 @@ struct Engine {
             last_row = 0;
             if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else forward_mtp(1, pos + d, seeds, true, false);
+            draft_prob();
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
+            if (!prob_ok()) {   // this draft and the rest dropped
+                D = d;
+                drafts.resize((size_t) D);
+                break;
+            }
         }
+        lookup_steps_mark = lookup_steps;
         // the verify window
         const auto pt1 = Clock::now();
         const int T = D + 1;
@@ -2883,6 +2949,9 @@ struct Engine {
         return D;
     }
     Clock::time_point pf_host_t;
+    long long lookup_steps = 0, lookup_steps_mark = 0;   // speculative steps that took the lookup drafts
+    float spec_min_p = 0.f;   // --spec-min-p (STRATA_Q36_SPEC_MIN_P): the drafts' confidence floor (0: every draft)
+    float* d_prob = nullptr;
     void spec_commit(int a) {
         const int N = (int) m->g.n_embd;
         const auto pt0 = Clock::now();
@@ -2902,11 +2971,14 @@ struct Engine {
             }
         }
     }
-    /// The first n rows of `logits` (a verify window's), on the host.
-    void host_logits_rows(int n, std::vector<float>& out) {
-        out.resize((size_t) n * m->g.n_vocab);
-        CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
+    /// The first n rows of `logits` (a verify window's) in pinned host memory (valid until the next call).
+    float* lg_pin = nullptr;
+    float* host_logits_rows(int n) {
+        const size_t V = (size_t) m->g.n_vocab;
+        if (!lg_pin) CK(cudaHostAlloc((void**) &lg_pin, (size_t) kVerify * V * 4, cudaHostAllocPortable));
+        CK(cudaMemcpyAsync(lg_pin, logits, (size_t) n * V * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        return lg_pin;
     }
 
     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
@@ -3634,7 +3706,7 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
 
 /// The sampler's final distribution (sample()'s steps: the penalties over hist, top-k, temperature, min-p, top-p) as
 /// token ids and probabilities summing to 1; a greedy sampler's is its argmax alone.
-void sample_dist(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::vector<int>& ids,
+void sample_dist(float* lg, size_t n_lg, const Sampling& s, const std::vector<int32_t>& hist, std::vector<int>& ids,
                  std::vector<double>& pr) {
     if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
         std::map<int, int> cnt;
@@ -3649,15 +3721,25 @@ void sample_dist(std::vector<float>& lg, const Sampling& s, const std::vector<in
     ids.clear();
     pr.clear();
     if (s.temperature <= 0.f) {
-        ids.push_back((int) (std::max_element(lg.begin(), lg.end()) - lg.begin()));
+        ids.push_back((int) (std::max_element(lg, lg + n_lg) - lg));
         pr.push_back(1.0);
         return;
     }
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) n_lg));
+    // the top kk (the same order as sample()'s partial_sort: value, then the lower id first on a tie)
+    auto better = [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b] || (lg[(size_t) a] == lg[(size_t) b] && a < b); };
+    std::vector<int> idx;
+    idx.reserve((size_t) kk + 1);
+    for (int i = 0; i < (int) n_lg; ++i) {
+        if ((int) idx.size() == kk && !better(i, idx.front())) continue;
+        idx.push_back(i);
+        std::push_heap(idx.begin(), idx.end(), better);
+        if ((int) idx.size() > kk) {
+            std::pop_heap(idx.begin(), idx.end(), better);
+            idx.pop_back();
+        }
+    }
+    std::sort(idx.begin(), idx.end(), better);
     std::vector<double> p(idx.size());
     const double mx = lg[(size_t) idx[0]];
     double sum = 0;
@@ -3832,6 +3914,25 @@ struct Serve {
     std::vector<float> lg, lgw;            // (lgw: a verify window's rows, speculative sampling)
     std::vector<int> sids;
     std::vector<double> sprs;
+    std::vector<int32_t> lkd;   // lookup drafts
+    /// The continuation of the text's last n tokens (n = 4, then 3) at their latest earlier occurrence, up to 7 tokens
+    /// (STRATA_Q36_LOOKUP=0: none).
+    static void lookup_drafts(const std::vector<int32_t>& h, std::vector<int32_t>& out) {
+        out.clear();
+        static const bool off = [] { const char* v = std::getenv("STRATA_Q36_LOOKUP"); return v && v[0] == '0'; }();
+        if (off) return;
+        const int e = (int) h.size();
+        for (int n = 4; n >= 3; --n) {
+            if (e < n + 1) continue;
+            for (int j = e - n - 1; j >= 0; --j) {
+                bool ok = true;
+                for (int k = 0; k < n && ok; ++k) ok = h[(size_t) (j + k)] == h[(size_t) (e - n + k)];
+                if (!ok) continue;
+                for (int k = j + n; k < e && (int) out.size() < 7; ++k) out.push_back(h[(size_t) k]);
+                if (!out.empty()) return;
+            }
+        }
+    }
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
@@ -4291,14 +4392,14 @@ struct Serve {
             if (n_active > 0) window();
             if (spec && smp.needs_logits() && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 // speculative sampling: the window's row i is the distribution after x and the first i drafts
-                const int D = E.spec_verify(nx, fix, E.mtp_d, drafts);
-                E.host_logits_rows(D + 1, lgw);
+                lookup_drafts(hist, lkd);
+                const int D = E.spec_verify(nx, fix, E.mtp_d, drafts, lkd.empty() ? nullptr : &lkd);
+                float* rows_lg = E.host_logits_rows(D + 1);
                 std::vector<int32_t> h2 = hist;
                 int a = 0, next = -1;
                 const size_t V = (size_t) E.m->g.n_vocab;
                 for (; a <= D; ++a) {
-                    lg.assign(lgw.begin() + (ptrdiff_t) (a * V), lgw.begin() + (ptrdiff_t) ((a + 1) * V));
-                    sample_dist(lg, smp, h2, sids, sprs);
+                    sample_dist(rows_lg + (size_t) a * V, V, smp, h2, sids, sprs);
                     if (a == D) {   // every draft kept: the token after them from the last row
                         std::uniform_real_distribution<double> u01(0.0, 1.0);
                         double r = u01(rng);
@@ -4426,7 +4527,8 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
-    std::string layer_split = "auto";   // as Flash-Next's engine: auto, 0 (one device), or the first layer of each later device
+    std::string layer_split = "auto";
+    float spec_min_p = std::getenv("STRATA_Q36_SPEC_MIN_P") ? (float) std::atof(std::getenv("STRATA_Q36_SPEC_MIN_P")) : 0.f;   // as Flash-Next's engine: auto, 0 (one device), or the first layer of each later device
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -4468,6 +4570,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
         else if (a == "--layer-split") layer_split = next();
+        else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next().c_str());
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
@@ -4587,6 +4690,7 @@ int strata::qwen35::run(int argc, char** argv) {
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
+    E.spec_min_p = spec_min_p;
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
     if (warm) E.warmup();

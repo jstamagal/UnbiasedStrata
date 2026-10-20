@@ -218,6 +218,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 56;
         return true;
+    case 19:   // IQ1_S (Unsloth's Qwen3.5-122B-A10B UD-Q3_K_XL experts)
+        elems = 256;
+        bytes = 50;
+        return true;
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
         elems = 1;
         bytes = 1;
