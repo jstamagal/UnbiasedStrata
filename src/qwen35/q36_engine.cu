@@ -535,6 +535,63 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
 
+/// Coupled drafts (Gumbel-max): the noise of token `tok` at cell `pos` of a request, the same bits on the host and the
+/// device.  The host samples the target as argmax(log p + G), the MTP block drafts argmax(logit / T + G) with the same
+/// G: the target is an exact sample whatever the drafts are, and close distributions give the same token.
+__host__ __device__ inline uint64_t q36_mix(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+__host__ __device__ inline float q36_unif(uint64_t seed, int64_t pos, int tok) {
+    const uint64_t h = q36_mix(seed ^ q36_mix((uint64_t) pos * 0x100000001B3ull + (uint64_t) tok));
+    return ((float) (h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+}
+/// One block: the noise on the k largest of x (the sampler's top-k; the threshold by bisection on the count), the
+/// others out of the draw.
+__global__ void k_gumbel(float* x, int n, float inv_t, uint64_t seed, int64_t pos, int k) {
+    __shared__ float red[1024];
+    __shared__ int cnt[1024];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, x[i]);
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float lo = mx - 64.f, hi = mx;   // count(x >= lo) >= k, count(x >= hi) >= 1
+    for (int it = 0; it < 24; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        int c = 0;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) c += x[i] >= mid;
+        __syncthreads();
+        cnt[threadIdx.x] = c;
+        __syncthreads();
+        for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+            if ((int) threadIdx.x < o) cnt[threadIdx.x] += cnt[threadIdx.x + o];
+            __syncthreads();
+        }
+        if (cnt[0] >= k) lo = mid; else hi = mid;
+        __syncthreads();
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        x[i] = x[i] >= lo ? x[i] * inv_t - logf(-logf(q36_unif(seed, pos, i))) : -INFINITY;
+}
+
+/// The sampler's penalties on draft logits (sample()'s arithmetic): ids[j] seen cnt[j] times in the window.
+__global__ void k_penalize(float* x, int n, const int32_t* ids, const float* cnt, int m, float rep, float freq, float pres) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    const int id = ids[j];
+    if (id < 0 || id >= n) return;
+    float v = x[id];
+    if (rep != 1.f) v = v > 0 ? v / rep : v * rep;
+    x[id] = v - (cnt[j] * freq + pres);
+}
+
 /// The softmax probability of the largest of x[0 .. n): one block (the drafts' confidence, --spec-min-p).
 __global__ void k_top_prob(const float* x, int n, float* out) {
     __shared__ float red[1024];
@@ -984,6 +1041,34 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
+// ggml's quantizer (ggml-base, linked for the CPU pool): the dense requantization of STRATA_Q36_DENSE_Q
+extern "C" size_t ggml_quantize_chunk(int type, const float* src, void* dst, int64_t start, int64_t nrows, int64_t n_per_row,
+                                      const float* imatrix);
+
+/// STRATA_Q36_DENSE_Q=T (opt-in; 13 = Q5_K, 12 = Q4_K, 6 = Q5_0): a Q8_0 dense matrix requantized to ggml type T at load
+/// - fewer bytes read per decode step, the outputs no longer the file's.  Rows on several threads.
+std::vector<uint8_t> requant_q8_0(const uint8_t* src, int n_in, int n_out, int type) {
+    const size_t rb = row_bytes(type, n_in);
+    std::vector<uint8_t> out((size_t) n_out * rb);
+    const int nthr = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (int t = 0; t < nthr; ++t)
+        th.emplace_back([&, t] {
+            std::vector<float> row((size_t) n_in);
+            for (int r = t; r < n_out; r += nthr) {
+                const uint8_t* q = src + (size_t) r * (n_in / 32) * 34;
+                for (int b = 0; b < n_in / 32; ++b) {
+                    const uint8_t* blk = q + (size_t) b * 34;
+                    const float d = f16_to_f32((uint16_t) (blk[0] | (blk[1] << 8)));
+                    for (int j = 0; j < 32; ++j) row[(size_t) b * 32 + j] = d * (float) (int8_t) blk[2 + j];
+                }
+                ggml_quantize_chunk(type, row.data(), out.data() + (size_t) r * rb, 0, 1, n_in, nullptr);
+            }
+        });
+    for (auto& x : th) x.join();
+    return out;
+}
+
 /// `dev_of` (a layer split): the device of each layer, the MTP block's at [n_layers] (the last device, which also holds
 /// the head); empty = the current device for everything.
 bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, const std::vector<int>& dev_of = {},
@@ -1032,6 +1117,18 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
         if (!K::native_mmvq_supported(w.type)) {
             std::fprintf(stderr, "strata-q36: %s is %s, which the native MMVQ does not take\n", name.c_str(), t->type_name());
             std::exit(1);
+        }
+        static const int dense_q = std::getenv("STRATA_Q36_DENSE_Q") ? std::atoi(std::getenv("STRATA_Q36_DENSE_Q")) : 0;
+        if (dense_q > 0 && w.type == 8 && name != "output.weight" && w.n_in % 256 == 0 && K::native_mmvq_supported(dense_q) &&
+            row_bytes(dense_q, w.n_in) > 0) {
+            const std::vector<uint8_t> rq = requant_q8_0(gm.shard(s).tensor_data(*t), w.n_in, w.n_out, dense_q);
+            uint8_t* d = nullptr;
+            CK(cudaMalloc(&d, rq.size()));
+            CK(cudaMemcpy(d, rq.data(), rq.size(), cudaMemcpyHostToDevice));
+            bytes += rq.size();
+            w.d = d;
+            w.type = dense_q;
+            return w;
         }
         const uint64_t nb = strata::tensor_payload_bytes(*t);
         uint8_t* d = nullptr;
@@ -2174,18 +2271,46 @@ struct Engine {
         if (n_dev > 1) split_enter(T);   // the inputs and the embedded rows to the other devices, the first layer's active
         if (main_hybrid && T > hybrid_t && use_mmq) stream_dev();
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
-        for (size_t l = 0; l < m->layers.size(); ++l) {
+        const size_t nl = m->layers.size();
+        for (size_t l = 0; l < nl;) {
             if (dev_of[l] != cur_dev) {   // the next device's layers: the residual goes over, its norm is taken there
                 split_cross(dev_of[l], T);
                 k_rms<<<T, kThreads, 0, st>>>(x, m->layers[l].attn_norm, h, N, m->eps);
                 if (main_hybrid && T > hybrid_t && use_mmq) stream_dev();
             }
-            const bool last = l + 1 == m->layers.size();
-            const bool edge = !last && dev_of[l + 1] != dev_of[l];   // (the next layer's norm weights are on its device)
-            layer(m->layers[l], l, T, p0, pos0, graph_mode, verify,
-                  last ? m->out_norm : edge ? nullptr : m->layers[l + 1].attn_norm, last ? hmain : h);
+            size_t e = l;   // this device's run of layers [l, e)
+            while (e < nl && dev_of[e] == cur_dev) ++e;
+            auto run = [&, l, e](bool gm) {
+                for (size_t k = l; k < e; ++k) {
+                    const bool last = k + 1 == nl;
+                    const bool edge = !last && dev_of[k + 1] != dev_of[k];   // (the next layer's norm weights are on its device)
+                    layer(m->layers[k], k, T, p0, pos0, gm, verify,
+                          last ? m->out_norm : edge ? nullptr : m->layers[k + 1].attn_norm, last ? hmain : h);
+                }
+                if (e == nl && heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+            };
+            // a layer split: a device's run of layers (and the head) as one graph per window shape when no layer of it
+            // takes the host's part (STRATA_Q36_SEG_GRAPHS=0: eager)
+            static const bool seg_off = [] { const char* v = std::getenv("STRATA_Q36_SEG_GRAPHS"); return v && v[0] == '0'; }();
+            bool can = n_dev > 1 && !seg_off && T <= kVerify && !rows_mode && !mtab_now && !map_on;
+            for (size_t k = l; k < e && can; ++k) can = !lhy(k);
+            if (can) {
+                const long long key = (((long long) cur * 64 + (long long) l) * 16 + T) * 16 + heads * 2 + (verify ? 1 : 0);
+                cudaGraphExec_t& gx = seg_graphs[key];
+                if (!gx) {
+                    cudaGraph_t graph = nullptr;
+                    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                    run(true);
+                    CK(cudaStreamEndCapture(st, &graph));
+                    CK(cudaGraphInstantiate(&gx, graph, 0));
+                    CK(cudaGraphDestroy(graph));
+                }
+                CK(cudaGraphLaunch(gx, st));
+            } else {
+                run(graph_mode);
+            }
+            l = e;
         }
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -2199,6 +2324,64 @@ struct Engine {
     /// the most frequent ones).  A draft only proposes: the verify window decides, so a token outside the subset is a
     /// rejected draft and nothing else - the answer is the plain greedy answer whatever draft_n is.  0 = the whole vocabulary.
     int draft_n = 0;
+    // coupled drafts (set per request by the server): the noise's seed and 1 / temperature; draft_pos the cell of the
+    // token being drafted
+    bool gumbel_on = false;
+    uint64_t g_seed = 0;
+    float g_inv_t = 1.f;
+    int g_top_k = 20;
+    int64_t draft_pos = 0;
+    // the sampler's penalties for the drafts (set per request): the window's tokens and counts, pinned + device
+    bool pen_on = false;
+    float pen_rep = 1.f, pen_freq = 0.f, pen_pres = 0.f;
+    int pen_n = 0;
+    int32_t *pen_ids_h = nullptr, *pen_ids_d = nullptr;
+    float *pen_cnt_h = nullptr, *pen_cnt_d = nullptr;
+    static constexpr int kPenMax = 256;
+    void pen_upload() {
+        CK(cudaMemcpyAsync(pen_ids_d, pen_ids_h, (size_t) pen_n * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pen_cnt_d, pen_cnt_h, (size_t) pen_n * 4, cudaMemcpyHostToDevice, st));
+    }
+    void pen_set(const std::vector<int32_t>& hist, int last_n, float rep, float freq, float pres) {
+        pen_on = last_n != 0 && (rep != 1.f || freq != 0.f || pres != 0.f);
+        if (!pen_on) return;
+        if (!pen_ids_h) {
+            CK(cudaHostAlloc((void**) &pen_ids_h, kPenMax * 4, cudaHostAllocPortable));
+            CK(cudaHostAlloc((void**) &pen_cnt_h, kPenMax * 4, cudaHostAllocPortable));
+            CK(cudaMalloc((void**) &pen_ids_d, kPenMax * 4));
+            CK(cudaMalloc((void**) &pen_cnt_d, kPenMax * 4));
+        }
+        pen_rep = rep; pen_freq = freq; pen_pres = pres;
+        const size_t from = last_n < 0 || (size_t) last_n >= hist.size() ? 0 : hist.size() - (size_t) last_n;
+        std::map<int, int> c;
+        for (size_t i = from; i < hist.size(); ++i) ++c[hist[i]];
+        pen_n = 0;
+        for (const auto& [id, k] : c) {
+            if (pen_n >= kPenMax - 8) break;
+            pen_ids_h[pen_n] = id;
+            pen_cnt_h[pen_n] = (float) k;
+            ++pen_n;
+        }
+        pen_upload();
+    }
+    void pen_push(int32_t t) {   // a draft joins the window
+        if (!pen_on) return;
+        for (int j = 0; j < pen_n; ++j)
+            if (pen_ids_h[j] == t) { pen_cnt_h[j] += 1.f; pen_upload(); return; }
+        if (pen_n >= kPenMax) return;
+        pen_ids_h[pen_n] = t;
+        pen_cnt_h[pen_n] = 1.f;
+        ++pen_n;
+        pen_upload();
+    }
+    void draft_hooks(int n) {
+        if (pen_on && pen_n > 0) k_penalize<<<(pen_n + 255) / 256, 256, 0, st>>>(logits_m, n, pen_ids_d, pen_cnt_d, pen_n, pen_rep, pen_freq, pen_pres);
+        if (spec_min_p > 0.f) {
+            if (!d_prob) CK(cudaMalloc((void**) &d_prob, 4));
+            k_top_prob<<<1, 1024, 0, st>>>(logits_m, n, d_prob);
+        }
+        if (gumbel_on) k_gumbel<<<1, 1024, 0, st>>>(logits_m, n, g_inv_t, g_seed, draft_pos, g_top_k);
+    }
     void head_draft(const float* hn) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
@@ -2206,7 +2389,10 @@ struct Engine {
         // (N / 32 blocks per row: 64 for Qwen3.6-35B-A3B, 96 for Qwen3.5-122B-A10B / Ornith 1.5)
         if (!fast_k || draft_n <= 0 || draft_n >= g.n_vocab || draft_n % 8 != 0 || hd.type != 8 || hd.n_in != N ||
             (N / 32 != 64 && N / 32 != 96)) {
-            head_rows(hn, 1, logits_m, pick_m);
+            mm(m->head, hn, logits_m, 1);
+            draft_hooks((int) g.n_vocab);
+            k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits_m, (int) g.n_vocab, pick_m, amv, ami, false);
+            k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits_m, kArgBlocks, pick_m, amv, ami, true);
             return;
         }
         quant(hn, N, 1, q8);
@@ -2222,6 +2408,7 @@ struct Engine {
             if (nb == 96) q36k::launch_q8_rows<1, 3, false>(hd.d, nullptr, q8, logits_m, nb, draft_n, st);
             else q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, q8, logits_m, nb, draft_n, st);
         }
+        draft_hooks(draft_n);
         k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits_m, draft_n, pick_m, amv, ami, false);
         k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits_m, kArgBlocks, pick_m, amv, ami, true);
     }
@@ -2240,6 +2427,7 @@ struct Engine {
         mm(m->eh_proj, mtp_cat, x, T);
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
         layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
+        draft_pos = p0 + T;
         if (draft) head_draft(hmtp + (size_t) (T - 1) * N);
     }
 
@@ -2871,10 +3059,9 @@ struct Engine {
         drafts.assign((size_t) D, 0);
         // --spec-min-p: a draft whose probability under the block is below it ends the chain (it and the ones after)
         const int n_dl = draft_n > 0 && draft_n < m->g.n_vocab ? draft_n : (int) m->g.n_vocab;
-        auto draft_prob = [&]() {
+        (void) n_dl;
+        auto draft_prob = [&]() {   // (k_top_prob ran in head_draft, before the coupled noise)
             if (spec_min_p <= 0.f) return;
-            if (!d_prob) CK(cudaMalloc((void**) &d_prob, 4));
-            k_top_prob<<<1, 1024, 0, st>>>(logits_m, n_dl, d_prob);
             CK(cudaMemcpyAsync(hpin + 3, d_prob, 4, cudaMemcpyDeviceToHost, st));
         };
         auto prob_ok = [&]() {
@@ -2914,6 +3101,7 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
+            pen_push(drafts[(size_t) d - 1]);
             if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else forward_mtp(1, pos + d, seeds, true, false);
             draft_prob();
@@ -3029,6 +3217,7 @@ struct Engine {
     int n_dev = 1, cur_dev = 0, home = 0;
     std::vector<int> dev_of;                  // per state index (the layers, then the MTP block): its device
     const uint8_t* embd_d = nullptr;          // the token table on the active device
+    std::map<long long, cudaGraphExec_t> seg_graphs;   // the device's runs of layers as graphs (see forward)
     std::vector<bool> dev_mmq;                // MMQ built for each device's layers
     uint8_t* bounce = nullptr;                // rebalance: the evicted experts' blobs on their way to host memory
     size_t bounce_bytes = 0;
@@ -3040,7 +3229,7 @@ struct Engine {
     X(rinv) X(mq_x) X(mq_hq) X(mq_gu) X(mq_h) X(x16) X(d_conv_tab) X(d_S_tab) X(d_kc_tab) X(d_vc_tab) X(d_rcell) \
     X(d_rslot) X(d_rdelta) X(d_gslot) X(d_grow0) X(d_gcnt) X(d_mtab) X(d_delta) X(d_img) X(img_cap) X(d_map) X(ecpu) \
     X(d_miss) X(ev_route) X(stage) X(cst) X(ev_copy) X(ev_used) X(vbuf) X(vgrp) X(vx_) X(vh_) X(vq) X(logits_mr) \
-    X(pick_mr) X(row_graphs) X(embd_d)
+    X(pick_mr) X(row_graphs) X(embd_d) X(seg_graphs)
 #define Q36_DECL(n) decltype(Engine::n) n{};
     struct DevSet {
         Q36_DEV(Q36_DECL)
@@ -3760,6 +3949,18 @@ void sample_dist(float* lg, size_t n_lg, const Sampling& s, const std::vector<in
     }
 }
 
+/// The coupled target sample: argmax over the sampler's kept tokens of log p + G (exact: Gumbel-max).
+int gumbel_pick(const std::vector<int>& ids, const std::vector<double>& pr, uint64_t seed, int64_t pos) {
+    int best = ids.empty() ? 0 : ids[0];
+    double bv = -1e300;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (pr[i] <= 0) continue;
+        const double v = std::log(pr[i]) - std::log(-std::log((double) q36_unif(seed, pos, ids[i])));
+        if (v > bv) { bv = v; best = ids[i]; }
+    }
+    return best;
+}
+
 /// Speculative sampling against a deterministic draft (the MTP block's greedy pick d): d is kept with probability
 /// p(d); else the token is drawn from p without d (renormalized).  The kept text is a draw from p exactly.
 /// Returns -1 when d is kept, else the token drawn instead.
@@ -4335,6 +4536,7 @@ struct Serve {
         const bool spec = E.mtp_d > 0 && !adm && std::getenv("STRATA_Q36_NO_SAMPLED_MTP") == nullptr ? true
                           : E.mtp_d > 0 && !smp.needs_logits() && !adm;
         bool have_nx = false;   // a sampled speculative step decided the next token already
+        const uint64_t gseed = rng();   // the coupled drafts' noise for this request
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -4393,13 +4595,30 @@ struct Serve {
             if (spec && smp.needs_logits() && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 // speculative sampling: the window's row i is the distribution after x and the first i drafts
                 lookup_drafts(hist, lkd);
+                static const bool gum_off = [] { const char* v = std::getenv("STRATA_Q36_GUMBEL"); return v && v[0] == '0'; }();
+                const bool gum = !gum_off && smp.temperature > 0.f;
+                const int64_t p_x = E.pos;   // x's cell: row a samples the token at p_x + 1 + a
+                E.gumbel_on = gum;
+                static const bool pen_off = [] { const char* v = std::getenv("STRATA_Q36_DRAFT_PEN"); return v && v[0] == '0'; }();
+                if (!pen_off) E.pen_set(hist, smp.last_n, smp.repeat, smp.freq, smp.present);
+                E.g_seed = gseed;
+                E.g_inv_t = gum ? 1.f / smp.temperature : 1.f;
+                E.g_top_k = smp.top_k > 0 ? smp.top_k : 64;
                 const int D = E.spec_verify(nx, fix, E.mtp_d, drafts, lkd.empty() ? nullptr : &lkd);
+                E.gumbel_on = false;
+                E.pen_on = false;
                 float* rows_lg = E.host_logits_rows(D + 1);
                 std::vector<int32_t> h2 = hist;
                 int a = 0, next = -1;
                 const size_t V = (size_t) E.m->g.n_vocab;
                 for (; a <= D; ++a) {
                     sample_dist(rows_lg + (size_t) a * V, V, smp, h2, sids, sprs);
+                    if (gum) {   // coupled: the target's sample decides, the draft matched it or not
+                        const int t = gumbel_pick(sids, sprs, gseed, p_x + 1 + a);
+                        if (a == D || t != drafts[(size_t) a]) { next = t; break; }
+                        h2.push_back(t);
+                        continue;
+                    }
                     if (a == D) {   // every draft kept: the token after them from the last row
                         std::uniform_real_distribution<double> u01(0.0, 1.0);
                         double r = u01(rng);
