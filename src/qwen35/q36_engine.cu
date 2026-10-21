@@ -546,9 +546,10 @@ __global__ void k_put_rows(float* x, const float* img, const int32_t* map, int n
 /// The prompt's routed entries sorted by expert for MMQ: bounds[x] .. bounds[x + 1] are expert x's rows; sorted row r
 /// holds entry dst[r] (= t * K + k, the row of the per-slot outputs) of token src[r].  The order inside an expert is the
 /// atomics' (no output depends on it: every row's products are its own).  cnt / cur: n_expert ints of scratch.
-__global__ void k_route_count(const int32_t* ids, int n_ent, int32_t* cnt) {
+// map (optional): expert -> the index its entries sort under (the split MMQ order: slots, then host slots)
+__global__ void k_route_count(const int32_t* ids, int n_ent, int32_t* cnt, const int32_t* map) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e < n_ent) atomicAdd(&cnt[ids[e]], 1);
+    if (e < n_ent) atomicAdd(&cnt[map ? map[ids[e]] : ids[e]], 1);
 }
 __global__ void k_route_scan(const int32_t* cnt, int n_expert, int32_t* bounds, int32_t* cur, int32_t* max_rows) {
     if (threadIdx.x != 0) return;
@@ -563,10 +564,10 @@ __global__ void k_route_scan(const int32_t* cnt, int n_expert, int32_t* bounds, 
     *max_rows = mx;
 }
 __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* cur, int32_t* dst, int32_t* src,
-                                int32_t* inv) {
+                                int32_t* inv, const int32_t* map) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_ent) return;
-    const int r = atomicAdd(&cur[ids[e]], 1);
+    const int r = atomicAdd(&cur[map ? map[ids[e]] : ids[e]], 1);
     dst[r] = e;
     src[r] = e / K_;
     inv[e] = r;   // entry e's sorted row: where its down product lands
@@ -1475,6 +1476,13 @@ struct Engine {
         std::vector<int> hpos, host_exp;
         std::vector<double> score;   // routing counts, halved at each rebalance
         int32_t* slot_of_d = nullptr;
+        // the split stream (stream_split): expert x's index in the MMQ order - its slot, or S + its host slot
+        std::vector<int32_t> vmap;
+        int32_t* vmap_d = nullptr;
+        void fill_vmap(int S) {
+            vmap.resize(slot_of.size());
+            for (size_t x = 0; x < slot_of.size(); ++x) vmap[x] = slot_of[x] >= 0 ? slot_of[x] : S + hpos[x];
+        }
 #if defined(STRATA_Q36_CPU_POOL)
         strata::kernels::cpu::NativeFmt fmt;
 #endif
@@ -2313,29 +2321,55 @@ struct Engine {
             // combine reads through entry -> sorted row
             const int ne = (int) g.n_expert;
             CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
-            k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
+            const bool split = lhy(li) && stream_split();
+            const int S = L.n_slots;
+            const int32_t* rmap = split ? hy[li].vmap_d : nullptr;
+            k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt, rmap);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
-            k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
+            k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv, rmap);
             CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
-            if (lhy(li))
-                for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+            if (lhy(li)) {
+                Hy& H = hy[li];
+                for (int v = 0; v < ne; ++v) {   // (split: the counts are in the MMQ order)
+                    const int x = !split ? v : v < S ? H.exp_in_slot[(size_t) v] : H.host_exp[(size_t) (v - S)];
+                    H.score[(size_t) x] += h_cnt[li * g.n_expert + v];
+                }
+            }
             const int64_t maxr = hpin[10];
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             MMQ::Product gu;
-            gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
+            // split: the slotted experts from their slots, the others from the staging buffer (bounds past the slots)
+            auto run_mmq = [&](MMQ::Product p, size_t off) {
+                if (!split) {
+                    p.w = wbase + off;
+                    mctx->run(p, st);
+                    return;
+                }
+                if (S > 0) {
+                    MMQ::Product a = p;
+                    a.w = L.blobs + off;
+                    a.n = S;
+                    mctx->run(a, st);
+                }
+                p.w = wbase + off;
+                p.n = ne - S;
+                p.bounds += S;
+                mctx->run(p, st);
+            };
+            gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
             gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
-            mctx->run(gu, st);
+            run_mmq(gu, 0);
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
             MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
             MMQ::Product dn;
-            dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
+            dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
-            mctx->run(dn, st);
+            run_mmq(dn, L.L.down_off);
             if (lhy(li)) stream_done();
             prow = rinv;
         } else {
@@ -2563,10 +2597,23 @@ struct Engine {
         stream_pos = 0;
         for (int i = 0; i < n_stage && i < (int) seq.size(); ++i) stream_kick(i);
     }
+    /// The prompt's MMQ reads the slotted experts where they are and only the host ones from the staging buffer (two
+    /// products per matrix), so a buffer holds a layer's slotless experts, not the whole layer.  STRATA_Q36_STREAM_WHOLE=1:
+    /// the whole layer through the buffer, as before.
+    static bool stream_split() {
+        static const bool on = std::getenv("STRATA_Q36_STREAM_WHOLE") == nullptr;
+        return on;
+    }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % n_stage, after its last reader
         const int b = i % n_stage;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
+        if (stream_split()) {   // the host slots are one run (and the zeroed tail after them)
+            CK(cudaMemcpyAsync(stage[b], L.hblobs, (size_t) (m->g.n_expert - L.n_slots) * L.stride + kMmqTail,
+                               cudaMemcpyHostToDevice, cst));
+            CK(cudaEventRecord(ev_copy[b], cst));
+            return;
+        }
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
         // host memory (the first version: PCIe-bound)
@@ -2700,7 +2747,7 @@ struct Engine {
 
     /// The slots to the experts the routing used most (the counts halved each time): at most max_swaps replacements
     /// over all layers, between forwards (the copies are on the engine's stream).
-    void rebalance(int max_swaps) {
+    void rebalance(int max_swaps, bool after_prompt = false) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
         if (!m->hybrid || off || warming) return;
         // STRATA_Q36_SWAP_MARGIN=c: a newcomer takes a slot only when its routing count beats the resident's by more
@@ -2779,14 +2826,17 @@ struct Engine {
                 if (vi >= victims.size()) break;
             }
             flush(li);
-            if (changed)
+            if (changed) {
                 CK(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st));
+                H.fill_vmap(S);
+                CK(cudaMemcpyAsync(H.vmap_d, H.vmap.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st));
+            }
             for (double& v : H.score) v *= 0.5;
             CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
         }
         use_dev(home);
         CK(cudaStreamSynchronize(st));
-        const int kind = max_swaps > 8;
+        const int kind = after_prompt ? 1 : 0;
         hy_reb_ms[kind] += ms_since(t_reb);
         ++hy_reb_n[kind];
         hy_reb_sw[kind] += hy_swaps - sw0;
@@ -2933,11 +2983,11 @@ struct Engine {
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
-                if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+                if (m->hybrid) rebalance(hybrid_swaps_after_prompt, true);
                 return i + T;
             }
         }
-        if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+        if (m->hybrid) rebalance(hybrid_swaps_after_prompt, true);
         return n;
     }
 
@@ -3134,7 +3184,9 @@ struct Engine {
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
     }
-    int hybrid_swaps_after_prompt = 2048;
+    // STRATA_Q36_PROMPT_SWAPS=n: at most n slot replacements after a prompt (each moves two expert blobs over PCIe,
+    // ~0.8 ms on a V620: the full 2048 can hold the first token back by most of a second)
+    int hybrid_swaps_after_prompt = std::getenv("STRATA_Q36_PROMPT_SWAPS") ? std::max(0, std::atoi(std::getenv("STRATA_Q36_PROMPT_SWAPS"))) : 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
@@ -3531,11 +3583,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    const bool stg_on = E.use_mmq && E.main_hybrid, split = stg_on && Engine::stream_split();
+    const size_t ms = max_layer / (size_t) ne;   // the widest expert blob
+    size_t staging = stg_on ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+    if (split && slots <= 0 && per_slot > 2 * ms) {   // a buffer of the slotless experts: each slot also shrinks the pair
+        const size_t fixed = 2 * ((size_t) ne * ms + kMmqTail);
+        size_t room = budget2 > fixed ? budget2 - fixed : 0;
+        if (room + fixed + ((size_t) 256 << 20) > fr) room = fr > fixed + ((size_t) 512 << 20) ? fr - fixed - ((size_t) 512 << 20) : 0;
+        S = (int) std::min<size_t>((size_t) ne, room / (per_slot - 2 * ms));
+    }
+    if (split) staging = 2 * ((size_t) (ne - S) * ms + kMmqTail);
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
@@ -3616,6 +3677,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         H.score.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+        H.fill_vmap(S);
+        CK(cudaMalloc(&H.vmap_d, (size_t) ne * 4));
+        CK(cudaMemcpy(H.vmap_d, H.vmap.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
@@ -3641,8 +3705,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+            CK(cudaMalloc(&E.stage[b], staging / 2));
+            CK(cudaMemset(E.stage[b], 0, staging / 2));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
@@ -3726,6 +3790,25 @@ bool place_experts_split(Model& m, Engine& E, int threads, int hybrid_t, std::st
         const size_t bufs = staging[(size_t) d] + Tn * Kn * Nn * 4 + Tn * Kn * 4 + (mtp_whole && d == E.home ? mtp_bytes : 0);
         const size_t slot_bytes = budget > bufs ? budget - bufs : 0;
         S_dev[(size_t) d] = (int) std::min<size_t>((size_t) ne, slot_bytes / std::max<size_t>(1, per_slot[(size_t) d]));
+        const size_t ms = max_layer[(size_t) d] / (size_t) ne, ns = (size_t) E.n_stage;
+        if (staging[(size_t) d] && Engine::stream_split() && per_slot[(size_t) d] > ns * ms) {
+            // the buffers hold only the slotless experts: each slot also shrinks them
+            const size_t fixed = bufs - staging[(size_t) d] + ns * ((size_t) ne * ms + kMmqTail);
+            const size_t room = budget > fixed ? budget - fixed : 0;
+            S_dev[(size_t) d] = (int) std::min<size_t>((size_t) ne, room / (per_slot[(size_t) d] - ns * ms));
+            staging[(size_t) d] = ns * ((size_t) (ne - S_dev[(size_t) d]) * ms + kMmqTail);
+        }
+        // STRATA_Q36_SLOTS_DEV=a,b,...: at most that many slots on device d (tests: the same slots on two builds)
+        if (const char* v = std::getenv("STRATA_Q36_SLOTS_DEV")) {
+            const char* q = v;
+            for (int k = 0; k < d && q; ++k) q = std::strchr(q, ',') ? std::strchr(q, ',') + 1 : nullptr;
+            const int cap = q ? std::atoi(q) : 0;
+            if (cap > 0 && cap < S_dev[(size_t) d]) {
+                S_dev[(size_t) d] = cap;
+                if (staging[(size_t) d] && Engine::stream_split() && per_slot[(size_t) d] > ns * ms)
+                    staging[(size_t) d] = ns * ((size_t) (ne - cap) * ms + kMmqTail);
+            }
+        }
         for (size_t li = 0; li < m.layers.size(); ++li)
             if (E.dev_of[li] == d) main_hy = true;
     }
@@ -3823,6 +3906,9 @@ bool place_experts_split(Model& m, Engine& E, int threads, int hybrid_t, std::st
             }
             CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
             CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+            H.fill_vmap(S);
+            CK(cudaMalloc(&H.vmap_d, (size_t) ne * 4));
+            CK(cudaMemcpy(H.vmap_d, H.vmap.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         }
         if (S_dev[(size_t) d] < ne) {   // this device's hybrid buffers
             const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
@@ -3833,8 +3919,8 @@ bool place_experts_split(Model& m, Engine& E, int threads, int hybrid_t, std::st
         if (staging[(size_t) d]) {
             CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
             for (int b = 0; b < E.n_stage; ++b) {
-                CK(cudaMalloc(&E.stage[b], max_layer[(size_t) d] + kMmqTail));
-                CK(cudaMemset(E.stage[b], 0, max_layer[(size_t) d] + kMmqTail));
+                CK(cudaMalloc(&E.stage[b], staging[(size_t) d] / (size_t) E.n_stage));
+                CK(cudaMemset(E.stage[b], 0, staging[(size_t) d] / (size_t) E.n_stage));
                 CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
                 CK(cudaEventRecord(E.ev_used[b], E.st));
