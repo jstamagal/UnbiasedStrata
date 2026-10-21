@@ -2010,6 +2010,9 @@ if(STRATA_NATIVE_EXPERTS)
       # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
       list(APPEND _strata_mmq_types q4_k q5_k q5_1 q6_k)
     endif()
+    # Unsloth's UD-Q3_K_XL MoE files (Ornith 1.5 122B) mix Q3_K downs and IQ1_S experts into a few layers: without
+    # these two the whole prompt path falls back to the native grouped kernels.  HIP only (no CUDA VRAM cost).
+    list(APPEND _strata_mmq_types q3_k iq1_s)
     foreach(_t IN LISTS _strata_mmq_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
@@ -2046,7 +2049,7 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_tq_overlay)
       target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_tq_overlay_dir} ${_strata_tq_overlay_dir}/include)
     endif()
-    target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1 STRATA_MMQ_Q3K_IQ1S=1)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()

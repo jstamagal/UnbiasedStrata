@@ -1504,6 +1504,8 @@ struct Engine {
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
     double hy_cpu_ms = 0;
+    double hy_reb_ms[2] = {};             // time in rebalance: [0] the decode / verify boundaries, [1] after a prompt
+    long long hy_reb_n[2] = {}, hy_reb_sw[2] = {};
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
     // window never steps over one), so plain and speculative decoding see the same slot tables at every position
@@ -1721,7 +1723,9 @@ struct Engine {
             rcur = dalloc_t<int32_t>((size_t) g.n_expert);
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             rmax = dalloc_t<int32_t>(1);
-            ident = dalloc_t<int32_t>((size_t) ne);
+            // MMQ reads a whole tile (up to 128 columns) of ids past an expert's last row: the padding keeps that in
+            // the allocation (on a layer split the second device's table can end a mapping: a GPU memory fault)
+            ident = dalloc_t<int32_t>((size_t) ne + 128);
             rinv = dalloc_t<int32_t>((size_t) ne);
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
             MMQ::iota(ident, ne, st);
@@ -2699,6 +2703,11 @@ struct Engine {
     void rebalance(int max_swaps) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
         if (!m->hybrid || off || warming) return;
+        // STRATA_Q36_SWAP_MARGIN=c: a newcomer takes a slot only when its routing count beats the resident's by more
+        // than c (0, the default: any lead), so near-ties stop trading places after every prompt
+        static const double swap_margin = [] { const char* v = std::getenv("STRATA_Q36_SWAP_MARGIN"); return v ? std::atof(v) : 0.0; }();
+        const auto t_reb = Clock::now();
+        const long long sw0 = hy_swaps;
         const int64_t ne = m->g.n_expert;
         int left = max_swaps;
         // an evicted expert goes to the host slot of the one that takes its VRAM slot: its blob comes down first (a
@@ -2753,7 +2762,7 @@ struct Engine {
                 while (vi < victims.size()) {
                     const int s = victims[vi];
                     const int y = H.exp_in_slot[(size_t) s];
-                    if (H.score[(size_t) y] >= H.score[(size_t) x]) { vi = victims.size(); break; }
+                    if (H.score[(size_t) y] + swap_margin >= H.score[(size_t) x]) { vi = victims.size(); break; }
                     // y must not be in the top S itself
                     ++vi;
                     H.slot_of[(size_t) y] = -1;
@@ -2777,6 +2786,10 @@ struct Engine {
         }
         use_dev(home);
         CK(cudaStreamSynchronize(st));
+        const int kind = max_swaps > 8;
+        hy_reb_ms[kind] += ms_since(t_reb);
+        ++hy_reb_n[kind];
+        hy_reb_sw[kind] += hy_swaps - sw0;
     }
 
     void shrink_att(size_t floats) {
@@ -5017,6 +5030,9 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+            std::fprintf(stderr, "strata-q36: rebalances: decode %lld in %.0f ms (%lld swaps), after prompts %lld in %.0f ms "
+                         "(%lld swaps)\n", E.hy_reb_n[0], E.hy_reb_ms[0], E.hy_reb_sw[0], E.hy_reb_n[1], E.hy_reb_ms[1],
+                         E.hy_reb_sw[1]);
         }
     } report{E};
     E.reset();
