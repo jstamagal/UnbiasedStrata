@@ -339,7 +339,9 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
 }
 /// k_attn_part for the G query heads of one KV head in one block: each K / V cell of the chunk is read once for the
 /// group, not once per head.  The same sums in the same order, so the same numbers.  K goes through LDS in tiles of
-/// 16 cells; thread (g, cell) = (j / 16, j % 16) takes one score.  grid (n_chunk, n_tok * HKV), block 256, HD == 256.
+/// 16 cells; thread (g, cell) = (j / 16, j % 16) takes one score.  Block x takes chunks x, x + gridDim.x, ... (a
+/// graph's grid covers the whole context; a block per chunk would be mostly empty blocks holding 49 KB of LDS each).
+/// grid (n_slots, n_tok * HKV), block 256, HD == 256.
 template <int G>
 __global__ void k_attn_part_gqa(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
                                 int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
@@ -347,58 +349,60 @@ __global__ void k_attn_part_gqa(const float* q, const float* kc, const float* vc
     static_assert(G * kTile <= kThreads, "one score per thread");
     __shared__ float qs[G][HD], sc[G][kChunkCells], sh[kThreads];
     __shared__ __align__(16) float kt[kTile][kPad];
-    const int c = blockIdx.x, lt = blockIdx.y / HKV, kvh = blockIdx.y % HKV, t = t0 + lt;
+    const int lt = blockIdx.y / HKV, kvh = blockIdx.y % HKV, t = t0 + lt;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     if (rs.kc) {
         kc = rs.kc[rs.slot[t]];
         vc = rs.vc[rs.slot[t]];
     }
-    const int p0 = c * kChunkCells;
-    if (p0 >= npos) return;
-    const int j = threadIdx.x, n = min(kChunkCells, npos - p0);
+    if ((int) blockIdx.x * kChunkCells >= npos) return;
+    const int j = threadIdx.x;
 #pragma unroll
     for (int g = 0; g < G; ++g) qs[g][j] = q[((size_t) t * H + kvh * G + g) * HD + j];
     const int tg = j / kTile, tc = j % kTile;
-    const float* kb = kc + ((size_t) kvh * ctx + p0) * HD;
-    for (int c0 = 0; c0 < n; c0 += kTile) {
-        __syncthreads();
-        for (int x = j; x < kTile * HD / 4; x += kThreads) {
-            const int cell = x / (HD / 4), d4 = x % (HD / 4);
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (c0 + cell < n) v = reinterpret_cast<const float4*>(kb + (size_t) (c0 + cell) * HD)[d4];
-            *reinterpret_cast<float4*>(&kt[cell][d4 * 4]) = v;
+    for (int c = blockIdx.x; c < n_chunk && c * kChunkCells < npos; c += gridDim.x) {
+        const int p0 = c * kChunkCells, n = min(kChunkCells, npos - p0);
+        const float* kb = kc + ((size_t) kvh * ctx + p0) * HD;
+        for (int c0 = 0; c0 < n; c0 += kTile) {
+            __syncthreads();
+            for (int x = j; x < kTile * HD / 4; x += kThreads) {
+                const int cell = x / (HD / 4), d4 = x % (HD / 4);
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (c0 + cell < n) v = reinterpret_cast<const float4*>(kb + (size_t) (c0 + cell) * HD)[d4];
+                *reinterpret_cast<float4*>(&kt[cell][d4 * 4]) = v;
+            }
+            __syncthreads();
+            if (tg < G && c0 + tc < n) {
+                float a = 0.f;
+                for (int i = 0; i < HD; ++i) a += qs[tg][i] * kt[tc][i];
+                sc[tg][c0 + tc] = a * scale;
+            }
         }
         __syncthreads();
-        if (tg < G && c0 + tc < n) {
-            float a = 0.f;
-            for (int i = 0; i < HD; ++i) a += qs[tg][i] * kt[tc][i];
-            sc[tg][c0 + tc] = a * scale;
+        const size_t o0 = (size_t) (lt * H + kvh * G) * n_chunk + c;
+        for (int g = 0; g < G; ++g) {
+            const float s = j < n ? sc[g][j] : -INFINITY;
+            const float m = block_max(s, sh);
+            const float e = j < n ? expf(s - m) : 0.f;
+            sc[g][j] = e;
+            const float l = block_sum(e, sh);
+            if (j == 0) {
+                pm[o0 + (size_t) g * n_chunk] = m;
+                pl[o0 + (size_t) g * n_chunk] = l;
+            }
         }
-    }
-    __syncthreads();
-    const size_t o0 = (size_t) (lt * H + kvh * G) * n_chunk + c;
-    for (int g = 0; g < G; ++g) {
-        const float s = j < n ? sc[g][j] : -INFINITY;
-        const float m = block_max(s, sh);
-        const float e = j < n ? expf(s - m) : 0.f;
-        sc[g][j] = e;
-        const float l = block_sum(e, sh);
-        if (j == 0) {
-            pm[o0 + (size_t) g * n_chunk] = m;
-            pl[o0 + (size_t) g * n_chunk] = l;
+        float acc[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) acc[g] = 0.f;
+        const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+        for (int k = 0; k < n; ++k) {
+            const float v = vp[(size_t) k * HD];
+#pragma unroll
+            for (int g = 0; g < G; ++g) acc[g] += sc[g][k] * v;
         }
+#pragma unroll
+        for (int g = 0; g < G; ++g) pacc[(o0 + (size_t) g * n_chunk) * HD + j] = acc[g];
     }
-    float acc[G];
-#pragma unroll
-    for (int g = 0; g < G; ++g) acc[g] = 0.f;
-    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
-    for (int k = 0; k < n; ++k) {
-        const float v = vp[(size_t) k * HD];
-#pragma unroll
-        for (int g = 0; g < G; ++g) acc[g] += sc[g][k] * v;
-    }
-#pragma unroll
-    for (int g = 0; g < G; ++g) pacc[(o0 + (size_t) g * n_chunk) * HD + j] = acc[g];
 }
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
@@ -481,6 +485,16 @@ __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, 
     }
 }
 /// The CPU pool's expert rows into the entries' rows: parts[e] = cpu[e] where miss[e].  grid (n_ent), block 256.
+/// A hybrid layer's routing and rows written straight into pinned host memory: a copy command costs its fences
+/// (~16-40 us of idle GPU on gfx1030 each), far more than these bytes.  grid1(max(n_ent, n)).
+__global__ void k_to_host(const int32_t* ids, int n_ent, const float* h, int n, int32_t* h_ids, float* h_h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h_h[i] = h[i];
+    if (i < n_ent) h_ids[i] = ids[i];
+    __threadfence_system();
+}
+/// The CPU half's rows into the entries' rows; `cpu` and `miss` may be pinned host memory (only the missed rows cross
+/// the bus then).  grid (n_ent).
 __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss, int n) {
     const int e = blockIdx.x;
     if (!miss[e]) return;
@@ -612,35 +626,47 @@ __host__ __device__ inline float q36_unif(uint64_t seed, int64_t pos, int tok) {
     return ((float) (h >> 40) + 0.5f) * (1.0f / 16777216.0f);
 }
 /// One block: the noise on the k largest of x (the sampler's top-k; the threshold by bisection on the count), the
-/// others out of the draw.
-__global__ void k_gumbel(float* x, int n, float inv_t, uint64_t seed, int64_t pos, int k) {
-    __shared__ float red[1024];
-    __shared__ int cnt[1024];
+/// others out of the draw.  The first kR x blockDim values stay in registers for the 24 counts; wave sums, one
+/// barrier a count (the counts are exact, so the threshold is the one a tree of sums finds).
+__global__ void __launch_bounds__(1024) k_gumbel(float* x, int n, float inv_t, uint64_t seed, int64_t pos, int k) {
+    constexpr int kR = 32;
+    __shared__ float red[32];
+    __shared__ int cnt[2][32];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, nw = blockDim.x >> 5, B = blockDim.x;
+    float v[kR];
     float mx = -INFINITY;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, x[i]);
-    red[threadIdx.x] = mx;
-    __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
-        __syncthreads();
+#pragma unroll
+    for (int j = 0; j < kR; ++j) {
+        const int i = tid + j * B;
+        v[j] = i < n ? x[i] : -INFINITY;
+        mx = fmaxf(mx, v[j]);
     }
+    for (int i = tid + kR * B; i < n; i += B) mx = fmaxf(mx, x[i]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 32));
+    if (lane == 0) red[w] = mx;
+    __syncthreads();
     mx = red[0];
+    for (int i = 1; i < nw; ++i) mx = fmaxf(mx, red[i]);
     float lo = mx - 64.f, hi = mx;   // count(x >= lo) >= k, count(x >= hi) >= 1
     for (int it = 0; it < 24; ++it) {
         const float mid = 0.5f * (lo + hi);
         int c = 0;
-        for (int i = threadIdx.x; i < n; i += blockDim.x) c += x[i] >= mid;
+#pragma unroll
+        for (int j = 0; j < kR; ++j) c += v[j] >= mid;
+        for (int i = tid + kR * B; i < n; i += B) c += x[i] >= mid;
+        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o, 32);
+        if (lane == 0) cnt[it & 1][w] = c;
         __syncthreads();
-        cnt[threadIdx.x] = c;
-        __syncthreads();
-        for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-            if ((int) threadIdx.x < o) cnt[threadIdx.x] += cnt[threadIdx.x + o];
-            __syncthreads();
-        }
-        if (cnt[0] >= k) lo = mid; else hi = mid;
-        __syncthreads();
+        int s = 0;
+        for (int i = 0; i < nw; ++i) s += cnt[it & 1][i];
+        if (s >= k) lo = mid; else hi = mid;
     }
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
+#pragma unroll
+    for (int j = 0; j < kR; ++j) {
+        const int i = tid + j * B;
+        if (i < n) x[i] = v[j] >= lo ? v[j] * inv_t - logf(-logf(q36_unif(seed, pos, i))) : -INFINITY;
+    }
+    for (int i = tid + kR * B; i < n; i += B)
         x[i] = x[i] >= lo ? x[i] * inv_t - logf(-logf(q36_unif(seed, pos, i))) : -INFINITY;
 }
 
@@ -2244,11 +2270,12 @@ struct Engine {
                     const float* kl = rows_mode ? nullptr : kc[li];
                     const float* vl = rows_mode ? nullptr : vc[li];
                     const float a_scale = 1.0f / sqrtf((float) HD);
+                    const int slots = std::min(nc, 32);   // GQA blocks per row: each takes every 32nd chunk
                     if (!gqa_off && HD == 256 && H == 16 * HKV)
-                        k_attn_part_gqa<16><<<dim3(nc, nt * HKV), kThreads, 0, st>>>(q, kl, vl, dpos, t0, H, HKV, ctx, a_scale,
+                        k_attn_part_gqa<16><<<dim3(slots, nt * HKV), kThreads, 0, st>>>(q, kl, vl, dpos, t0, H, HKV, ctx, a_scale,
                                                                                     n_chunk, pacc, pm, pl, rs);
                     else if (!gqa_off && HD == 256 && H == 8 * HKV)
-                        k_attn_part_gqa<8><<<dim3(nc, nt * HKV), kThreads, 0, st>>>(q, kl, vl, dpos, t0, H, HKV, ctx, a_scale,
+                        k_attn_part_gqa<8><<<dim3(slots, nt * HKV), kThreads, 0, st>>>(q, kl, vl, dpos, t0, H, HKV, ctx, a_scale,
                                                                                    n_chunk, pacc, pm, pl, rs);
                     else
                         k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kl, vl, dpos, t0, H, HKV, ctx, a_scale, n_chunk,
@@ -2581,13 +2608,22 @@ struct Engine {
         ++stream_pos;
     }
 
+    /// STRATA_Q36_HOST_COPIES=1: the hybrid layers' host traffic as copy commands, as before k_to_host
+    static bool host_copies() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_HOST_COPIES"); return v && v[0] == '1'; }();
+        return on;
+    }
     /// The GPU half of a hybrid MoE: the routing to the host, the resident experts' entries grouped and run.
     void moe_hybrid_gpu(const Layer& L, size_t li, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int64_t n_ent = (int64_t) T * Kp;
-        CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+        if (host_copies()) {
+            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+        } else {
+            k_to_host<<<grid1(std::max<int64_t>(n_ent, (int64_t) T * N)), kThreads, 0, st>>>(ids, (int) n_ent, h, T * N, h_ids, h_h);
+        }
         CK(cudaEventRecord(ev_route, st));
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
@@ -2645,9 +2681,13 @@ struct Engine {
         if (n_miss == 0) return;
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
-        CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
-        k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+        if (host_copies()) {
+            CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+            k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+        } else {
+            k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, cpu_out, h_miss, N);   // read over the bus, missed rows only
+        }
 #else
         (void) li;
         (void) T;
