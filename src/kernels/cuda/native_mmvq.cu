@@ -2405,6 +2405,7 @@ int g_row_set = -1;   // native_mmvq_set_tune: -1 = the environment
 #endif
 
 #include "poly_head_wide.cuh"
+#include "poly_dense_wave.cuh"
 
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -2415,6 +2416,11 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    if (poly_dense_wave<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols,
+                                                static_cast<cudaStream_t>(stream))) {
+        launch_check();
+        return;
+    }
     STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
     if (ncols > 1) {
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);

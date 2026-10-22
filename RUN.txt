@@ -128,3 +128,7 @@ STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_Q40_EXPERT_BL
 STRATA_POLY_HEAD_PAIR=1  # paired output rows share Q8 head inputs for 1-4 columns
 STRATA_POLY_HEAD_PRELOAD=1  # decode Q6_K head preloads Q8 inputs across persistent rows
 STRATA_POLY_HEAD_PRELOAD=1 STRATA_POLY_HEAD_PRELOAD_GRID=2048  # explicit persistent head grid, range 256-16384
+STRATA_POLY_Q40_DENSE_WAVE=1  # Q4_0 dense paired-row wave kernel, 1-4 columns
+STRATA_POLY_Q80_DENSE_WAVE=1  # Q8_0 dense paired-row wave kernel, 1-4 columns
+STRATA_POLY_DENSE_WAVE_WIDE=1  # Q4_0/Q8_0 dense wave kernels for 5-8 verify columns
+STRATA_POLY_Q80_DENSE_WAVE=1 STRATA_POLY_Q80_DENSE_ROWS=4  # Q8_0 activation reuse over 1/2/4 output rows, default 2
