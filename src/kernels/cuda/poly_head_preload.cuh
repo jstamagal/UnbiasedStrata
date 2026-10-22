@@ -1,5 +1,6 @@
 #pragma once
 
+template<bool ALIGNED = false>
 __launch_bounds__(128)
 __global__ void poly_head_q6k_preload_kernel(const Q6KBlock* __restrict__ w,
                                             const Q81Block* __restrict__ x,
@@ -23,7 +24,7 @@ __global__ void poly_head_q6k_preload_kernel(const Q6KBlock* __restrict__ w,
         const Q6KBlock* wr = w + size_t(row) * kPolyHeadBlocks;
 #pragma unroll
         for (int kb = 0; kb < kPolyHeadBlocks; ++kb) {
-            const Q6KTraits::W weight = Q6KTraits::load(wr + kb, lane);
+            const Q6KTraits::W weight = poly_head_q6k_load<ALIGNED>(wr + kb, lane, kb);
             sum[kb & 3] += q6_q8_dot_impl(weight.vl, weight.vh, u[kb], weight.scales, weight.d, d8[kb]);
         }
         const float value = warp_sum(((sum[0] + sum[1]) + sum[2]) + sum[3]);
@@ -47,5 +48,8 @@ inline void poly_head_preload(const Q6KBlock* weights, const Q81Block* x, float*
         return parsed > 0 ? std::max(256, std::min(16384, parsed)) : 2048;
     }();
     const unsigned grid = unsigned(std::min((n_out + 3) / 4, requested_grid));
-    poly_head_q6k_preload_kernel<<<grid, dim3(32, 4), 0, stream>>>(weights, x, y, n_out);
+    if (poly_head_aligned_enabled() && (reinterpret_cast<uintptr_t>(weights) & 3) == 0)
+        poly_head_q6k_preload_kernel<true><<<grid, dim3(32, 4), 0, stream>>>(weights, x, y, n_out);
+    else
+        poly_head_q6k_preload_kernel<false><<<grid, dim3(32, 4), 0, stream>>>(weights, x, y, n_out);
 }

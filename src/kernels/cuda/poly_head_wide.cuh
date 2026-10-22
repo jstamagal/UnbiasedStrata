@@ -5,6 +5,7 @@ constexpr int kPolyHeadIn = 3072;
 constexpr int kPolyHeadBlocks = kPolyHeadIn / 256;
 constexpr int kPolyHeadBlockBytes = 210;
 
+#include "poly_head_aligned.cuh"
 #include "poly_head_preload.cuh"
 #include "poly_head_verify.cuh"
 

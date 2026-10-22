@@ -1,6 +1,6 @@
 #pragma once
 
-template<int NC, int ROWS>
+template<int NC, int ROWS, bool ALIGNED = false>
 __launch_bounds__(128)
 __global__ void poly_head_q6k_verify_kernel(const Q6KBlock* __restrict__ w,
                                            const Q81Block* __restrict__ x,
@@ -32,8 +32,9 @@ __global__ void poly_head_q6k_verify_kernel(const Q6KBlock* __restrict__ w,
 #pragma unroll
             for (int row = 0; row < ROWS; ++row) {
                 const int actual_row = min(row0 + row, n_out - 1);
-                const Q6KTraits::W weight = Q6KTraits::load(
-                    w + size_t(actual_row) * kPolyHeadBlocks + wave + 4 * s, lane);
+                const int kb = wave + 4 * s;
+                const Q6KTraits::W weight = poly_head_q6k_load<ALIGNED>(
+                    w + size_t(actual_row) * kPolyHeadBlocks + kb, lane, kb);
 #pragma unroll
                 for (int col = 0; col < NC; ++col)
                     sum[row][col] += q6_q8_dot_impl(
@@ -82,7 +83,7 @@ inline bool poly_head_verify_enabled() {
     return on;
 }
 
-template<int NC>
+template<int NC, bool ALIGNED>
 inline void poly_head_verify_cols(const Q6KBlock* w, const Q81Block* x, float* y,
                                   int n_out, cudaStream_t stream) {
     static const int rows = [] {
@@ -98,18 +99,27 @@ inline void poly_head_verify_cols(const Q6KBlock* w, const Q81Block* x, float* y
     const unsigned grid = unsigned(std::min((n_out + rows - 1) / rows, requested_grid));
     const dim3 threads(32, 4);
     if (rows == 1)
-        poly_head_q6k_verify_kernel<NC, 1><<<grid, threads, 0, stream>>>(w, x, y, n_out);
+        poly_head_q6k_verify_kernel<NC, 1, ALIGNED><<<grid, threads, 0, stream>>>(w, x, y, n_out);
     else if (rows == 2)
-        poly_head_q6k_verify_kernel<NC, 2><<<grid, threads, 0, stream>>>(w, x, y, n_out);
+        poly_head_q6k_verify_kernel<NC, 2, ALIGNED><<<grid, threads, 0, stream>>>(w, x, y, n_out);
     else
-        poly_head_q6k_verify_kernel<NC, 4><<<grid, threads, 0, stream>>>(w, x, y, n_out);
+        poly_head_q6k_verify_kernel<NC, 4, ALIGNED><<<grid, threads, 0, stream>>>(w, x, y, n_out);
+}
+
+template<bool ALIGNED>
+inline void poly_head_verify_dispatch(const Q6KBlock* w, const Q81Block* x, float* y,
+                                      int n_out, int ncols, cudaStream_t stream) {
+    switch (ncols) {
+    case 2: poly_head_verify_cols<2, ALIGNED>(w, x, y, n_out, stream); break;
+    case 3: poly_head_verify_cols<3, ALIGNED>(w, x, y, n_out, stream); break;
+    case 4: poly_head_verify_cols<4, ALIGNED>(w, x, y, n_out, stream); break;
+    }
 }
 
 inline void poly_head_verify(const Q6KBlock* w, const Q81Block* x, float* y,
                              int n_out, int ncols, cudaStream_t stream) {
-    switch (ncols) {
-    case 2: poly_head_verify_cols<2>(w, x, y, n_out, stream); break;
-    case 3: poly_head_verify_cols<3>(w, x, y, n_out, stream); break;
-    case 4: poly_head_verify_cols<4>(w, x, y, n_out, stream); break;
-    }
+    if (poly_head_aligned_enabled() && (reinterpret_cast<uintptr_t>(w) & 3) == 0)
+        poly_head_verify_dispatch<true>(w, x, y, n_out, ncols, stream);
+    else
+        poly_head_verify_dispatch<false>(w, x, y, n_out, ncols, stream);
 }
