@@ -274,6 +274,71 @@ __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const flo
     }
 }
 
+// The join matches router_doorbell.cu's partial_add[_cached] protocol. The norm and Q8 expressions below
+// match native_add_rms_norm_q8_1_kernel, including SUM's reduction order and the two rounded additions.
+template<int SUM>
+__launch_bounds__(1024, 1)
+__global__ void native_partial_join_rms_norm_q8_1_kernel(
+    const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+    const void* const* slots, const int32_t* ids, int route_count, int n_expert,
+    const float* __restrict__ cpu, float* __restrict__ fo, float* __restrict__ r,
+    const float* __restrict__ w, float* __restrict__ xn, Q81Block* __restrict__ xq, int n, float eps) {
+    const auto* ready_word = reinterpret_cast<const volatile uint32_t*>(ready);
+    const auto* done_word = reinterpret_cast<const volatile uint32_t*>(done);
+    const auto* abort_word = reinterpret_cast<const volatile uint32_t*>(abort);
+    __shared__ int needs_cpu;
+    __shared__ int cancelled;
+    __shared__ float part[SUM / WARP];
+    if (threadIdx.x == 0) {
+        needs_cpu = slots ? 0 : 1;
+        cancelled = 0;
+        if (slots) {
+            for (int j = 0; j < route_count; ++j) {
+                const int e = ids[j];
+                if (e < 0 || e >= n_expert || !slots[e]) { needs_cpu = 1; break; }
+            }
+        }
+        if (needs_cpu) {
+            const uint32_t need = *ready_word;
+            while (*done_word != need && *abort_word == 0) { }
+            cancelled = *abort_word != 0;
+        }
+    }
+    __syncthreads();
+    if (needs_cpu && !cancelled) __threadfence_system();
+    const std::size_t row = std::size_t(blockIdx.x) * n;
+    const float* cr = cpu + row;
+    float* fr = fo + row;
+    float* rr = r + row;
+    float* yr = xn + row;
+    Q81Block* qr = xq + std::size_t(blockIdx.x) * (n / Q8K);
+    if (threadIdx.x < SUM) {
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < n; i += SUM) {
+            float joined = fr[i];
+            if (needs_cpu && !cancelled) fr[i] = joined = __fadd_rn(joined, cr[i]);
+            const float v = rr[i] = __fadd_rn(rr[i], joined);
+            ss = __fmaf_rn(v, v, ss);
+        }
+        ss = warp_sum(ss);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    for (int k = 0; k < SUM / WARP; ++k) sum = __fadd_rn(sum, part[k]);
+    const float scale = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, float(n)), eps)));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float xi = __fmul_rn(__fmul_rn(rr[i], scale), w[i]);
+        yr[i] = xi;
+        const float amax = warp_max(fabsf(xi));
+        const float bsum = warp_sum(xi);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        qr[i / Q8K].qs[i % Q8K] = q;
+        if (i % Q8K == 0) qr[i / Q8K].ds = q8_1_ds(d, bsum);
+    }
+}
+
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
 __device__ __forceinline__ float q5_q8_dot_impl(
     const int* __restrict__ vl, const int* __restrict__ vh, const int* __restrict__ u,
@@ -3113,6 +3178,44 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     case 512: native_add_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     case 1024: native_add_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+}
+
+void native_partial_join_rms_norm_q8_1(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                      const void* const* slots, const int32_t* ids, int route_count, int n_expert,
+                                      const float* cpu, float* fo, float* r, const float* w, float* xn, void* xq,
+                                      int n, int rows, float eps, int threads, void* stream) {
+    validate_shape(n, rows);
+    validate_pointer(ready);
+    validate_pointer(done);
+    validate_pointer(abort);
+    if (slots) {
+        validate_pointer(slots);
+        validate_pointer(ids);
+        if (route_count < 0 || n_expert <= 0)
+            throw std::invalid_argument("native_partial_join_rms_norm_q8_1: invalid routed expert shape");
+    }
+    validate_pointer(cpu);
+    validate_pointer(fo);
+    validate_pointer(r);
+    validate_pointer(w);
+    validate_pointer(xn);
+    validate_pointer(xq);
+    validate_stream(stream);
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto* q = static_cast<Q81Block*>(xq);
+    const int block = std::max(threads, std::min(1024, n));
+    switch (threads) {
+    case 128: native_partial_join_rms_norm_q8_1_kernel<128><<<rows, block, 0, s>>>(
+        ready, done, abort, slots, ids, route_count, n_expert, cpu, fo, r, w, xn, q, n, eps); break;
+    case 256: native_partial_join_rms_norm_q8_1_kernel<256><<<rows, block, 0, s>>>(
+        ready, done, abort, slots, ids, route_count, n_expert, cpu, fo, r, w, xn, q, n, eps); break;
+    case 512: native_partial_join_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(
+        ready, done, abort, slots, ids, route_count, n_expert, cpu, fo, r, w, xn, q, n, eps); break;
+    case 1024: native_partial_join_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(
+        ready, done, abort, slots, ids, route_count, n_expert, cpu, fo, r, w, xn, q, n, eps); break;
+    default: throw std::invalid_argument("native_partial_join_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
     }
     launch_check();
 }

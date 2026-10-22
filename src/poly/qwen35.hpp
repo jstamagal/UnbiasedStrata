@@ -38,6 +38,7 @@ protected:
     int streams() const override { return 1; }
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
+    bool partial_join_norm(Layer& L, int il, int n, const void* const* slots, bool runahead) override;
     void output_rows(int first, int rows, float* h) override;
     const void* output_rows_q8(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
@@ -95,6 +96,7 @@ private:
     int s_dim_ = 0, k_heads_ = 0, v_heads_ = 0, d_inner_ = 0, conv_dim_ = 0;
     int n_gdn_ = 0, n_attn_ = 0;
     int chunk_ = 1;   ///< tokens the attention takes at a time
+    int partial_norm_layer_ = -1, partial_norm_rows_ = 0; ///< next input norm emitted during partial capture
 
     // device scratch
     float *proj_ = nullptr, *qkv_ = nullptr, *z_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *gated_ = nullptr;

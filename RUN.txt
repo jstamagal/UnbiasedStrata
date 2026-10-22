@@ -179,3 +179,4 @@ STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_EXPERT_REUSE_
 STRATA_POLY_DENSE_WAVE_WIDE=1 STRATA_POLY_DENSE_TSUM_WIDE=1  # combine dense wave output reductions for 5-8 columns
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_HANDOFF_NORM_Q8=1  # back-card mapped input copy, first RMS norm and Q8 quantization in one kernel
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_EXPERT_REUSE_GROUP4=1 STRATA_POLY_EXPERT_REUSE_SKIP_SINGLE=1  # unique single-token top-k skips multi-occurrence kernels
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PARTIAL_JOIN_NORM=1  # fuse CPU-result join, residual add and next-layer input RMS/Q8

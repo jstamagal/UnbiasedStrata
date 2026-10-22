@@ -357,6 +357,11 @@ protected:
     virtual void layer_head(Layer& L, int il, int n) = 0;
     /// The routed experts' sum (fo_) into the layer's output.
     virtual void layer_tail(Layer& L, int il, int n) = 0;
+    /// Join the CPU result, finish the layer and prepare its successor's input. False launches nothing.
+    virtual bool partial_join_norm(Layer& L, int il, int n, const void* const* slots, bool runahead) {
+        (void) L, (void) il, (void) n, (void) slots, (void) runahead;
+        return false;
+    }
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
     virtual const void* output_rows_q8(int first, int rows, float* h) {

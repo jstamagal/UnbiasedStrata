@@ -3870,14 +3870,16 @@ void Engine::run(const int32_t* tokens, int n) {
                     kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
                     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 }
-                if (runahead)
-                    partial_graph_add_cached(partial_device_words_, partial_device_words_ + 1,
-                                             partial_device_words_ + 2, table, d_ids_, rr, n_expert_,
-                                             d_partial_cpu_, fo_, n * n_embd_, st_);
-                else
-                    partial_graph_add(partial_device_words_, partial_device_words_ + 1,
-                                      partial_device_words_ + 2, d_partial_cpu_, fo_, n * n_embd_, st_);
-                layer_tail(L, il, n);
+                if (!partial_join_norm(L, il, n, table, runahead)) {
+                    if (runahead)
+                        partial_graph_add_cached(partial_device_words_, partial_device_words_ + 1,
+                                                 partial_device_words_ + 2, table, d_ids_, rr, n_expert_,
+                                                 d_partial_cpu_, fo_, n * n_embd_, st_);
+                    else
+                        partial_graph_add(partial_device_words_, partial_device_words_ + 1,
+                                          partial_device_words_ + 2, d_partial_cpu_, fo_, n * n_embd_, st_);
+                    layer_tail(L, il, n);
+                }
             }
             if (with_head) {
                 float* out = draft_ ? hn_ + n_embd_ : xn_;

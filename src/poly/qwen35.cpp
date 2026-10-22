@@ -42,11 +42,21 @@ bool tail_next_norm_on() {
     return on;
 }
 
+bool partial_join_norm_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_PARTIAL_JOIN_NORM");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 }  // namespace
 
 void Qwen35::begin_pass() {
     blocks_.assign(layers_.size(), Block{});
     n_gdn_ = n_attn_ = 0;
+    partial_norm_layer_ = -1;
+    partial_norm_rows_ = 0;
 }
 
 void Qwen35::check_draft_block() {
@@ -660,15 +670,23 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
     const bool quick = fuse && n <= 8 && !opt_.dump;
     const bool carried = tail_next_norm_on() && partial_capture_ && n <= 8 && !opt_.dump &&
                          il > lo_ && layers_[(size_t) il - 1].moe;
-    if (handoff_norm_active_ && partial_capture_ && il == lo_)
-        kernels::native_copy_rms_norm_q8_1(d_handoff_input_, r_, fp(L.attn_norm), xn_, xq_, n_embd_, n,
-                                          rms_eps_, sum_threads(n_embd_), st_);
-    else if (quick || carried)
-        kernels::native_add_rms_norm_q8_1(r_, carried ? fo_ : nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, n,
-                                           rms_eps_, sum_threads(n_embd_), st_);
-    else {
-        rms_norm(r_, fp(L.attn_norm), xn_, n_embd_, n, rms_eps_, st_);
-        kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    const bool prepared = partial_capture_ && il > lo_ && partial_norm_layer_ == il &&
+                          partial_norm_rows_ == n;
+    // Consume only the immediately following captured head. A new pass, a failed capture,
+    // or a noncaptured head discards any readiness left by an earlier capture.
+    partial_norm_layer_ = -1;
+    partial_norm_rows_ = 0;
+    if (!prepared) {
+        if (handoff_norm_active_ && partial_capture_ && il == lo_)
+            kernels::native_copy_rms_norm_q8_1(d_handoff_input_, r_, fp(L.attn_norm), xn_, xq_, n_embd_, n,
+                                              rms_eps_, sum_threads(n_embd_), st_);
+        else if (quick || carried)
+            kernels::native_add_rms_norm_q8_1(r_, carried ? fo_ : nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, n,
+                                               rms_eps_, sum_threads(n_embd_), st_);
+        else {
+            rms_norm(r_, fp(L.attn_norm), xn_, n_embd_, n, rms_eps_, st_);
+            kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+        }
     }
     dbg("attn_in", il, xn_, n_embd_);
     if (B.gdn) gdn(B, n);
@@ -689,6 +707,22 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
 void Qwen35::layer_tail(Layer&, int il, int n) {
     if (tail_next_norm_on() && partial_capture_ && n <= 8 && !opt_.dump && il + 1 < hi_) return;
     axpy(fo_, 1.f, r_, n * n_embd_, true, st_);
+}
+
+bool Qwen35::partial_join_norm(Layer&, int il, int n, const void* const* slots, bool runahead) {
+    partial_norm_layer_ = -1;
+    partial_norm_rows_ = 0;
+    if (!partial_join_norm_on() || !partial_capture_ || n < 1 || n > 8 || opt_.dump ||
+        il + 1 >= hi_ || n_embd_ % 32 != 0)
+        return false;
+    kernels::native_partial_join_rms_norm_q8_1(
+        partial_device_words_, partial_device_words_ + 1, partial_device_words_ + 2,
+        runahead ? slots : nullptr, d_ids_, n * n_used_, n_expert_, d_partial_cpu_, fo_, r_,
+        fp(layers_[(size_t) il + 1].attn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+        sum_threads(n_embd_), st_);
+    partial_norm_layer_ = il + 1;
+    partial_norm_rows_ = n;
+    return true;
 }
 
 void Qwen35::output_rows(int first, int rows, float* h) {

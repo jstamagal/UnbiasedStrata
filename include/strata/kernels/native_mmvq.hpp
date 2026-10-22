@@ -51,6 +51,14 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 /// keeps the sum.  n is a multiple of 32.
 void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
                               float eps, int threads, void* stream);
+// Partial-graph CPU join, residual add, and next-layer RMS/Q8 preparation. Null slots uses the plain join;
+// otherwise scan every routed id as partial_graph_add_cached does and skip CPU work when all are resident.
+// On a miss wait for done == ready or abort; abort skips CPU addition. fo keeps its joined sum, then r += fo.
+// n is a multiple of 32, rows is 1..8, and threads is the original norm's sum_threads(n).
+void native_partial_join_rms_norm_q8_1(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                      const void* const* slots, const int32_t* ids, int route_count, int n_expert,
+                                      const float* cpu, float* fo, float* r, const float* w, float* xn, void* xq,
+                                      int n, int rows, float eps, int threads, void* stream);
 /// Copy a mapped input to the device residual x, then the same RMS/Q8 preparation as above. Each input
 /// value crosses PCIe once; both the residual and the normalized float/Q8 outputs remain on the device.
 void native_copy_rms_norm_q8_1(const float* input, float* x, const float* w, float* y, void* y_q8_1,
