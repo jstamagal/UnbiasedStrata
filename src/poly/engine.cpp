@@ -29,6 +29,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <new>
 #include <numeric>
 #include <stdexcept>
@@ -1191,6 +1192,10 @@ void Engine::pin_experts() {
     for (const Layer& L : layers_)
         if (L.moe) bytes += (size_t) n_expert_ * ((2 * L.gu_bytes + L.d_bytes + kTail + 255) & ~(size_t) 255);
     if (!bytes) return;
+    // Earlier cards' pinned experts already occupy RAM. Measure before adding this card's arena.
+    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
+    const size_t still_file = files > prior_pinned_expert_bytes_ ? files - prior_pinned_expert_bytes_ : 0;
+    ram_tight_ = ram > 0 && (still_file > ram || (4ULL << 30) > ram - still_file);
     void* arena = nullptr;
 #if defined(STRATA_USE_HIP)
     ck(hipHostMalloc(&arena, bytes, hipHostMallocMapped | hipHostMallocPortable), "full pinned expert arena");
@@ -1297,6 +1302,7 @@ std::unique_ptr<Engine> Engine::open(const Options& requested) {
     // a card after another, each with the next run of layers; the last one has the output and the draft block
     std::unique_ptr<Engine> first;
     Engine* prev = nullptr;
+    size_t pinned_before = 0;
     for (size_t k = 0; k < starts.size(); ++k) {
         std::unique_ptr<Engine> e = make();
         const bool last = k + 1 == starts.size();
@@ -1322,6 +1328,7 @@ std::unique_ptr<Engine> Engine::open(const Options& requested) {
         e->mtp_stage0_ = stage0 && so.draft && so.window != 1;
         e->mtp_stage0_last_ = last && starts.size() == 2 && mtp && std::strcmp(mtp, "1") == 0 &&
                               std::strcmp(name.c_str(), "qwen35moe") == 0 && so.draft && so.window > 1;
+        e->prior_pinned_expert_bytes_ = pinned_before;
         e->split_ = true;
         ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
         try {
@@ -1329,6 +1336,9 @@ std::unique_ptr<Engine> Engine::open(const Options& requested) {
         } catch (const std::runtime_error& err) {
             throw std::runtime_error("card " + std::to_string(k) + ": " + err.what());
         }
+        if (e->pinned_expert_bytes_ > std::numeric_limits<size_t>::max() - pinned_before)
+            throw std::runtime_error("the pinned expert arenas exceed addressable memory");
+        pinned_before += e->pinned_expert_bytes_;
         Engine* at = e.get();
         if (prev) prev->next_ = std::move(e);
         else first = std::move(e);
@@ -1479,8 +1489,10 @@ void Engine::fill_expert_cache() {
     if (!opt_.gpu_experts || n_moe_ == 0) return;
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
-    ram_tight_ = ram > 0 && files + (4ULL << 30) > ram;
+    if (!pinned_experts_) {
+        const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
+        ram_tight_ = ram > 0 && files + (4ULL << 30) > ram;
+    }
     // 256 MiB at least, whatever was asked: the launches recorded later take theirs out of the reserve (mind_vram())
     reserve_mib_ = opt_.vram_reserve_mib >= 0 ? std::max(opt_.vram_reserve_mib, 256)
                                              : default_reserve_mib(total_b, ram_tight_);
@@ -3351,8 +3363,15 @@ void Engine::run(const int32_t* tokens, int n) {
     tok_ = tokens;
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row;
     const float scale = embed_scale();
+    static const bool direct_handoff = [] {
+        const char* v = std::getenv("STRATA_POLY_DIRECT_HANDOFF");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    const float* input_rows = h_r_;
     if (pass_) {   // a later card: the card before it left the rows
-        std::memcpy(h_r_, pass_ + (size_t) (pos_ - pass_at_) * r_row, (size_t) n * r_row * sizeof(float));
+        const float* handed = pass_ + (size_t) (pos_ - pass_at_) * r_row;
+        if (direct_handoff) input_rows = handed;
+        else std::memcpy(h_r_, handed, (size_t) n * r_row * sizeof(float));
     } else {
         for (int t = 0; t < n; ++t) {
             float* r = h_r_ + (size_t) t * r_row;
@@ -3361,8 +3380,8 @@ void Engine::run(const int32_t* tokens, int n) {
             for (int h = 1; h < streams(); ++h) std::memcpy(r + (size_t) h * e_row, r, e_row * sizeof(float));
         }
     }
-    if (n < kStageRows) copy2(h_r_, r_, n * (int) r_row, nullptr, nullptr, 0, st_);
-    else ck(cudaMemcpyAsync(r_, h_r_, (size_t) n * r_row * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
+    if (n < kStageRows && input_rows == h_r_) copy2(h_r_, r_, n * (int) r_row, nullptr, nullptr, 0, st_);
+    else ck(cudaMemcpyAsync(r_, input_rows, (size_t) n * r_row * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
 
     // A token alone, or a window of guessed ones, hands the card the same launches every time, some thirty a
     // layer up to the router, and they cost this thread more than the card.  They are recorded once, a graph a
@@ -4415,11 +4434,6 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     }
     std::copy(tokens, tokens + t, win_tok_);
     win_ = t;
-    if (seed_draft) {
-        if (!mtp_stage0_ || !prepare) throw std::logic_error("pipeline draft seed needs stage0 MTP");
-        sync_mtp_stage0();  // before the last card starts B: its hn/source and committed MTP rows are stable
-        mtp_seed_pos_ = pos_;
-    }
     const int next_slot = 1 - current_slot;
     Behind back;
     const auto verify_back = [this, tokens, t, start, current_slot] {
@@ -4429,22 +4443,33 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     };
     // The front-card drafter must use this card's scratch only after its A run. The last card can already
     // verify A while the front card drafts and runs the guessed B window.
-    if (mtp_stage0_) back.go(verify_back);
     try {
         if (mtp_stage0_) {
+            if (seed_draft) {
+                if (!prepare) throw std::logic_error("pipeline draft seed needs preparation");
+                sync_mtp_stage0();  // card 1's committed MTP rows and hn are stable before its B run
+                mtp_seed_pos_ = pos_;
+            }
+            back.go(verify_back);
             if (prepare) prepared_n = prepare();
         } else {
+            if (seed_draft) throw std::logic_error("pipeline draft seed needs stage0 MTP");
             draft_ahead.wait();  // the last card's draft chain ran while the first card evaluated this window
         }
         if (prepared_n < 0 || prepared_n > opt_.window)
             throw std::logic_error("pipeline preparation returned an invalid window size");
     } catch (...) {
-        if (mtp_stage0_) back.wait();
+        // Preserve the preparation failure even if the verifier also failed while it was in flight.
+        const std::exception_ptr failure = std::current_exception();
+        try { back.wait(); } catch (...) {}
         ck(cudaMemcpyAsync(state_, pipe_saved_[0], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
            "pipeline draft rollback");
         ck(cudaStreamSynchronize(cs(st_)), "pipeline draft rollback");
         win_ = 0;
-        throw;
+        pipe_ready_ = false;
+        pipe_n_ = 0;
+        mtp_seed_pos_ = -1;
+        std::rethrow_exception(failure);
     }
     if (!mtp_stage0_) back.go(verify_back);
     try {

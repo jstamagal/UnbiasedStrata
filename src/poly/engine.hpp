@@ -604,6 +604,7 @@ protected:
     std::vector<void*> dev_allocs_, host_allocs_;
     uint8_t* pinned_experts_ = nullptr;
     size_t pinned_expert_bytes_ = 0;
+    size_t prior_pinned_expert_bytes_ = 0; ///< expert bytes pinned by earlier cards of this split
     std::vector<void*> graphs_;   ///< every recorded graph, to destroy
     std::map<std::vector<int>, void*> passes_;   ///< a call's layers recorded as one (run()): by its tokens and
                                                  ///< every layer's head_key()

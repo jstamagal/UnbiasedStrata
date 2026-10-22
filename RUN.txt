@@ -97,3 +97,7 @@ STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_CHA
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_ADAPT_OVERLAP=1  # rebuilt: helper dispatches requested uploads earliest-layer first so arrivals serve the current pass (D)
 STRATA_POLY_GDN_STATE_NORM=1  # built opt-in: GDN state update and gated output norm in one launch for 128-wide heads, windows 1..8 (E)
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PCIE_FRAC=0.25,0  # rebuilt: fractional miss budget carries across layer plans rather than rounding every lone miss to DMA (A)
+STRATA_POLY_Q35_CONV_NORM_WINDOW=1  # built opt-in: convolution and Q/K normalization in one kernel for 2..8-token GDN windows; snapshots retained (E)
+STRATA_POLY_DIRECT_HANDOFF=1 --layer-split auto  # built opt-in: card1 uploads directly from pinned card0 handoff, removing the extra host memcpy (C)
+STRATA_POLY_PIN_EXPERTS=1  # rebuilt: reserve heuristic accounts for already-pinned split weights instead of charging model RAM twice (A/D)
+STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_CHAIN=1  # rebuilt: seed/preparation failures restore pre-window recurrent state and preserve the original error (C)

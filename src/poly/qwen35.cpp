@@ -350,7 +350,12 @@ void Qwen35::gdn(Block& B, int n) {
         const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
         return v && std::atoi(v) == 1;
     }();
-    const bool conv_normed = fuse && n == 1 && !opt_.dump;
+    static const bool conv_window_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_CONV_NORM_WINDOW");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const bool conv_window = conv_window_on && n >= 2 && n <= 8 && s_dim_ == 128 && !rows_of_ && !opt_.dump;
+    const bool conv_normed = (fuse && n == 1 && !opt_.dump) || conv_window;
     const bool gates_fused = fuse && n == 1 && !opt_.dump &&
                              B.alpha.type == kTypeF32 && B.beta.type == kTypeF32;
     if (gates_fused) {
@@ -377,7 +382,11 @@ void Qwen35::gdn(Block& B, int n) {
                      gates_fused);
         }
     } else {
-        if (conv_normed)
+        if (conv_window)
+            qwen35_conv_norm_window(proj_, B.past, fp(B.conv), qkv_, conv_dim_, k_heads_, n,
+                                     rms_eps_, snap_bits_ ? snap_at_ + (B.past - state_) : nullptr,
+                                     rec_n_, snap_bits_, st_);
+        else if (conv_normed)
             qwen35_conv_norm1(proj_, B.past, fp(B.conv), qkv_, conv_dim_, s_dim_, k_heads_, rms_eps_,
                                (snap_bits_ & 1u) ? snap_at_ + (B.past - state_) : nullptr, st_);
         else

@@ -3,6 +3,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "poly_q35_conv_norm_window.cuh"
 
 namespace strata::poly {
 namespace {
