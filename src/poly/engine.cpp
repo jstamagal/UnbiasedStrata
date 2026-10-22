@@ -90,6 +90,13 @@ bool graph_runahead_on() {
     }();
     return on;
 }
+bool dma_runahead_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_DMA_RUNAHEAD");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool adapt_overlap_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_ADAPT_OVERLAP");
@@ -2120,6 +2127,8 @@ void Engine::follow(int written) {
 
 void Engine::load(const Options& o) {
     opt_ = o;
+    if (dma_runahead_on() && !graph_runahead_on())
+        throw std::runtime_error("STRATA_POLY_DMA_RUNAHEAD requires STRATA_POLY_PARTIAL_GRAPH=1 and STRATA_POLY_GRAPH_RUNAHEAD=1");
     asked_reserve_mib_ = o.vram_reserve_mib;
     if (const char* v = std::getenv("STRATA_POLY_PROFILE_ACCUM"); v && *v)
         profile_accum_ = v;
@@ -2524,7 +2533,7 @@ void Engine::alloc() {
             h_partial_wts_ = (float*) ((uint8_t*) h_partial_ids_ + ids_bytes);
             d_partial_ids_ = (int32_t*) ((uint8_t*) d_partial_x_ + x_bytes);
             d_partial_wts_ = (float*) ((uint8_t*) d_partial_ids_ + ids_bytes);
-            if (graph_runahead_on() && pcie_frac_ == 0.f) {
+            if (graph_runahead_on() && (pcie_frac_ == 0.f || dma_runahead_on())) {
                 runahead_route_stride_ = (size_t) kCpuRows * n_used_;
                 const size_t entries = (size_t) n_layer_ * runahead_route_stride_;
 #if defined(STRATA_USE_HIP)
@@ -3630,7 +3639,8 @@ void Engine::run(const int32_t* tokens, int n) {
     partial &= any_partial_layer;
     if (partial) {
         const bool with_head = graph_head_on() && windowed_ && !next_ && opt_.batch == 0;
-        const bool runahead = h_runahead_ready_ && pcie_frac_ == 0.f;
+        const bool runahead = h_runahead_ready_ && (pcie_frac_ == 0.f || dma_runahead_on());
+        const bool dma_runahead = runahead && pcie_frac_ > 0.f;
         if (pcie_frac_ > 0.f && !dma_stage_synced_) {
             // A prompt may have left an upload on up_; the stage is now reserved for decode.
             ck(cudaStreamSynchronize(cs(up_)), "PCIe stage from prompt");
@@ -3683,10 +3693,15 @@ void Engine::run(const int32_t* tokens, int n) {
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 if (pcie_frac_ > 0.f) {
-                    // The copy stream publishes word 3 only after both the expert bytes and its pointer table land.
-                    partial_graph_wait_dma(partial_device_words_, partial_device_words_ + 3,
-                                           partial_device_words_ + 2, d_dma_slots_, d_dma_safe_slots_,
-                                           n_expert_, st_);
+                    // The copy stream publishes word 3 after expert bytes and table land; cached-only layers bypass it.
+                    if (dma_runahead)
+                        partial_graph_wait_dma_cached(partial_device_words_, partial_device_words_ + 3,
+                                                      partial_device_words_ + 2, d_dma_slots_, d_dma_safe_slots_,
+                                                      table, d_ids_, rr, n_expert_, st_);
+                    else
+                        partial_graph_wait_dma(partial_device_words_, partial_device_words_ + 3,
+                                               partial_device_words_ + 2, d_dma_slots_, d_dma_safe_slots_,
+                                               n_expert_, st_);
                     const kernels::MmvqIds dma_gu{(const void* const*) d_dma_safe_slots_, d_ids_, 0, xq_,
                                                   kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
                                                   2 * (size_t) n_ff_exp_};
@@ -3822,8 +3837,10 @@ void Engine::run(const int32_t* tokens, int n) {
                 stats_.gpu_experts += n_gpu;
                 stats_.pcie_experts += n_dma;
                 stats_.cpu_experts += n_host;
+                const bool skip_dma = dma_runahead && n_gpu == n * n_used_;
                 std::exception_ptr dma_failed;
                 const std::function<void()> dma_launch = [&] {
+                    if (skip_dma) return;
                     try {
                         if (split_) ck(cudaSetDevice(device_), "PCIe copy device");
                         if (pinned_experts_) {
@@ -3848,7 +3865,10 @@ void Engine::run(const int32_t* tokens, int n) {
                                                cudaMemcpyHostToDevice, cs(dma_st_)), "PCIe expert copy");
                         ck(cudaMemcpyAsync(d_dma_slots_, h_dma_slots_, (size_t) n_expert_ * sizeof(void*),
                                            cudaMemcpyHostToDevice, cs(dma_st_)), "PCIe expert table");
-                        partial_graph_ring(partial_device_words_ + 3, dma_st_);
+                        if (dma_runahead)
+                            router_doorbell_publish(partial_device_words_ + 3, expected, dma_st_);
+                        else
+                            partial_graph_ring(partial_device_words_ + 3, dma_st_);
                     } catch (...) { dma_failed = std::current_exception(); }
                 };
                 if (pcie_frac_ > 0.f && pinned_experts_) dma_launch();
@@ -3859,12 +3879,14 @@ void Engine::run(const int32_t* tokens, int n) {
                                 n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) il], gelu_, h_partial_cpu_,
                                 pcie_frac_ > 0.f && !pinned_experts_ ? &dma_launch : nullptr);
                 else {
-                    if (!runahead) std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
+                    if (!runahead || n_gpu != n * n_used_)
+                        std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
                     if (pcie_frac_ > 0.f && !pinned_experts_) dma_launch();
                 }
                 if (dma_failed) std::rethrow_exception(dma_failed);
                 stats_.cpu_ms += ms_since(cpu_start);
-                if (!runahead || n_host) __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
+                if (!runahead || n_gpu != n * n_used_)
+                    __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
             }
         } catch (...) {
             __atomic_store_n(partial_host_words_ + 2, 1u, __ATOMIC_RELEASE);

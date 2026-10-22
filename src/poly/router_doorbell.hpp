@@ -19,6 +19,9 @@ void partial_graph_wait_slots(const uint32_t* ready, const uint32_t* done, const
                               void** slots, int n_expert, void* stream);
 void partial_graph_wait_dma(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
                             void* const* incoming, void** safe, int n_expert, void* stream);
+void partial_graph_wait_dma_cached(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                   void* const* incoming, void** safe, const void* const* resident,
+                                   const int32_t* ids, int route_count, int n_expert, void* stream);
 void partial_graph_add(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
                        const float* cpu, float* sum, int count, void* stream);
 void partial_graph_add_cached(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,

@@ -342,7 +342,14 @@ void Qwen35::gdn(Block& B, int n) {
         {(int) B.wqkv.type, B.wqkv.p, proj_, (int) B.wqkv.n_out},
         {(int) B.wz.type, B.wz.p, z_, (int) B.wz.n_out},
     };
-    if (n != 1 || !kernels::native_mmvq_set(gdn_proj, 2, xq_, n_embd_, 1, st_)) {
+    static const bool gdn_set_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_GDN_SET");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const bool projected = n == 1 ? kernels::native_mmvq_set(gdn_proj, 2, xq_, n_embd_, 1, st_) :
+        (gdn_set_on && n >= 2 && n <= 8 && !opt_.dump &&
+         kernels::native_mmvq_set_explicit(gdn_proj, 2, xq_, n_embd_, n, st_));
+    if (!projected) {
         lin(B.wqkv, xn_, proj_, n, xq_);
         lin(B.wz, xn_, z_, n, xq_);
     }
@@ -534,9 +541,14 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
         const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
         return v && std::atoi(v) == 1;
     }();
-    if (fuse_attn_gate && n == 1 && !opt_.dump && head_dim_ % 32 == 0 &&
+    static const bool attn_gate_window_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_ATTN_GATE_WINDOW");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (((fuse_attn_gate && n == 1) || (attn_gate_window_on && n >= 2 && n <= 8)) &&
+        !opt_.dump && head_dim_ % 32 == 0 &&
         B.wo.type != kTypeF32 && B.wo.type != kTypeBF16) {
-        qwen35_attn_gate_q8(att_, qg_ + head_dim_, q8_, n_head_, head_dim_, st_);
+        qwen35_attn_gate_q8(att_, qg_ + head_dim_, q8_, n * n_head_, head_dim_, st_);
         lin(B.wo, att_, ao_, n, q8_);
     } else {
         mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);

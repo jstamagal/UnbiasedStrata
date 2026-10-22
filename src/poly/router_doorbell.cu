@@ -76,6 +76,34 @@ __global__ void partial_wait_dma_kernel(const uint32_t* ready, const uint32_t* d
     __threadfence_system();
 }
 
+__global__ void partial_wait_dma_cached_kernel(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                               void* const* incoming, void** safe,
+                                               const void* const* resident, const int32_t* ids,
+                                               int route_count, int n_expert) {
+    const auto* r = reinterpret_cast<const volatile uint32_t*>(ready);
+    const auto* d = reinterpret_cast<const volatile uint32_t*>(done);
+    const auto* a = reinterpret_cast<const volatile uint32_t*>(abort);
+    __shared__ int landed;
+    if (threadIdx.x == 0) {
+        bool cached = true;
+        for (int j = 0; j < route_count; ++j) {
+            const int e = ids[j];
+            if (e < 0 || e >= n_expert || !resident[e]) { cached = false; break; }
+        }
+        if (cached) landed = 0;
+        else {
+            const uint32_t need = *r;
+            while (*d != need && *a == 0) { }
+            landed = *a == 0;
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    for (int i = threadIdx.x; i < n_expert; i += blockDim.x)
+        safe[i] = landed ? incoming[i] : nullptr;
+    __threadfence_system();
+}
+
 
 __global__ void partial_add_kernel(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
                                    const float* cpu, float* sum, int count) {
@@ -161,6 +189,13 @@ void partial_graph_wait_dma(const uint32_t* ready, const uint32_t* done, const u
                             void* const* incoming, void** safe, int n_expert, void* stream) {
     partial_wait_dma_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
         ready, done, abort, incoming, safe, n_expert);
+}
+
+void partial_graph_wait_dma_cached(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                   void* const* incoming, void** safe, const void* const* resident,
+                                   const int32_t* ids, int route_count, int n_expert, void* stream) {
+    partial_wait_dma_cached_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
+        ready, done, abort, incoming, safe, resident, ids, route_count, n_expert);
 }
 
 
