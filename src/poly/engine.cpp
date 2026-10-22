@@ -3249,7 +3249,10 @@ void Engine::run(const int32_t* tokens, int n) {
     bool any_partial_layer = false;
     for (int il = lo_; il < hi_ && partial; ++il) {
         const Layer& L = layers_[(size_t) il];
-        partial = L.fixed && (!L.moe || ((int) L.gu_type == 2 && (int) L.d_type == 2));
+        partial = L.fixed && (!L.moe || ((int) L.gu_type == 2 &&
+                                              ((int) L.d_type == 2 || (int) L.d_type == 3) &&
+                                              kernels::native_mmvq_ids_supported((int) L.gu_type) &&
+                                              kernels::native_mmvq_ids_supported((int) L.d_type)));
         if (L.moe)
             any_partial_layer |= std::any_of(L.slot.begin(), L.slot.end(), [](const void* p) { return p == nullptr; });
     }
@@ -3282,7 +3285,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
                 const kernels::MmvqIds down{table, d_ids_, 2 * L.gu_bytes, q8_,
                                             kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
-                kernels::native_mmvq_ids_partial(2, down, rr, n_ff_exp_, n_embd_, st_);
+                kernels::native_mmvq_ids_partial((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 partial_graph_wait(partial_device_words_, partial_device_words_ + 1,
                                    partial_device_words_ + 2, st_);

@@ -108,6 +108,10 @@ struct Q40Block {
     half d;
     uint8_t qs[16];
 };
+struct Q41Block {
+    half2 dm;
+    uint8_t qs[16];
+};
 struct Q50Block {
     half d;
     uint8_t qh[4];
@@ -144,6 +148,7 @@ static_assert(sizeof(Q6KBlock) == 210 && alignof(Q6KBlock) == 2 &&
 static_assert(sizeof(Q2KBlock) == 84 && alignof(Q2KBlock) == 4 &&
               offsetof(Q2KBlock, qs) == 16 && offsetof(Q2KBlock, dm) == 80);
 static_assert(sizeof(Q40Block) == 18 && alignof(Q40Block) == 2 && offsetof(Q40Block, qs) == 2);
+static_assert(sizeof(Q41Block) == 20 && alignof(Q41Block) == 4 && offsetof(Q41Block, qs) == 4);
 static_assert(sizeof(Q50Block) == 22 && alignof(Q50Block) == 2 &&
               offsetof(Q50Block, qh) == 2 && offsetof(Q50Block, qs) == 6);
 static_assert(sizeof(Q80Block) == 34 && alignof(Q80Block) == 2 && offsetof(Q80Block, qs) == 2);
@@ -886,6 +891,26 @@ __device__ __forceinline__ float small_q8_dot(const Q40Block* __restrict__ w,
     return d * (sumi * ds.x - 4 * ds.y);
 }
 
+// Q4_1 is affine: each code q represents d*q + m. Q8_1's ds.x
+// scales its int8 codes; sumu is the sum of those codes for this lane's
+// 16 values. Using ds.y would sum the original F32 input instead.
+__device__ __forceinline__ float small_q8_dot(const Q41Block* __restrict__ w,
+                                             const Q81Block* __restrict__ x, int iqs) {
+    int sumi = 0, sumu = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = load_int_b2(w->qs, iqs + i);
+        const int u0 = reinterpret_cast<const int*>(x->qs)[iqs + i];
+        const int u1 = reinterpret_cast<const int*>(x->qs)[iqs + i + 4];
+        sumi = STRATA_DP4A((v >> 0) & 0x0f0f0f0f, u0, sumi);
+        sumi = STRATA_DP4A((v >> 4) & 0x0f0f0f0f, u1, sumi);
+        sumu = STRATA_DP4A(0x01010101, u1, STRATA_DP4A(0x01010101, u0, sumu));
+    }
+    const float2 dm = __half22float2(w->dm);
+    const float d8 = __low2float(x->ds);
+    return float(sumi) * (dm.x * d8) + float(sumu) * (dm.y * d8);
+}
+
 __device__ __forceinline__ float small_q8_dot(const Q50Block* __restrict__ w,
                                              const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
@@ -1240,6 +1265,40 @@ struct SmallTraits<Q40Block, 4> {
         }
         const float2 ds = __half22float2(x->ds);
         return r.d * (sumi * ds.x - 4 * ds.y);
+    }
+};
+
+template<>
+struct SmallTraits<Q41Block, 4> {
+    using Block = Q41Block;
+    static constexpr int DIV = 32, T = 2, KBY = 1, BPI = 2 * WARPS * WARP / 4;
+    __device__ static int kqs(int tid) { return 2 * (tid % 2); }
+    struct W { int vi0[2], vi1[2]; float d, m; };
+    __device__ static W load(const Block* __restrict__ w, int iqs) {
+        W r;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = load_int_b2(w->qs, iqs + i);
+            r.vi0[i] = (v >> 0) & 0x0f0f0f0f;
+            r.vi1[i] = (v >> 4) & 0x0f0f0f0f;
+        }
+        const float2 dm = __half22float2(w->dm);
+        r.d = dm.x;
+        r.m = dm.y;
+        return r;
+    }
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        int sumi = 0, sumu = 0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int u0 = reinterpret_cast<const int*>(x->qs)[iqs + i];
+            const int u1 = reinterpret_cast<const int*>(x->qs)[iqs + i + 4];
+            sumi = STRATA_DP4A(r.vi0[i], u0, sumi);
+            sumi = STRATA_DP4A(r.vi1[i], u1, sumi);
+            sumu = STRATA_DP4A(0x01010101, u1, STRATA_DP4A(0x01010101, u0, sumu));
+        }
+        const float d8 = __low2float(x->ds);
+        return float(sumi) * (r.d * d8) + float(sumu) * (r.m * d8);
     }
 };
 
@@ -3417,8 +3476,13 @@ void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 }
 
 void native_q4_0_mmvq(const void* weights, const void* x_q8_1, float* y,
-                       int n_in, int n_out, int ncols, void* stream) {
+                      int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<Q40Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_q4_1_mmvq(const void* weights, const void* x_q8_1, float* y,
+                      int n_in, int n_out, int ncols, void* stream) {
+    small_mmvq<Q41Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 void native_q4_0_f32(const void* weights, const float* x, void* scratch_q8_1,
@@ -3495,7 +3559,7 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 10 || ggml_type == 11 ||
+    return ggml_type == 2 || ggml_type == 3 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 10 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 39;
@@ -3505,6 +3569,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     int block_elems, block_bytes;
     switch (ggml_type) {
     case 2: block_elems = 32; block_bytes = 18; break;
+    case 3: block_elems = 32; block_bytes = 20; break;
     case 6: block_elems = 32; block_bytes = 22; break;
     case 7: block_elems = 32; block_bytes = 24; break;
     case 8: block_elems = 32; block_bytes = 34; break;
@@ -3543,6 +3608,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 3: native_q4_1_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
@@ -3571,7 +3637,7 @@ int slots_kind(int ggml_type) {
     return 0;   // the wave layout has no kernel for it
 #else
     switch (ggml_type) {
-    case 2: case 6: case 8: case 20: case 39: case 10: case 11: case 12: case 13: case 14: case 23: case 42: return 1;
+    case 2: case 3: case 6: case 8: case 20: case 39: case 10: case 11: case 12: case 13: case 14: case 23: case 42: return 1;
     case 7: case 16: case 17: case 18: case 21: case 22: case 29: return 2;   // the ones native_mmvq() hands to iq_mmvq()
     default: return 0;
     }
@@ -3580,7 +3646,7 @@ int slots_kind(int ggml_type) {
 
 template<typename S>
 void launch_slots_of(int ggml_type, const S& slots, int count, int n_in, int n_out, void* stream) {
-    const bool small = ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 20 || ggml_type == 39;
+    const bool small = ggml_type == 2 || ggml_type == 3 || ggml_type == 6 || ggml_type == 8 || ggml_type == 20 || ggml_type == 39;
     validate_shape(n_in, 1, small || ggml_type == 7 ? 32 : ggml_type == 42 ? 64 : 256);
     validate_stream(stream);
     if (slots_kind(ggml_type) == 2) {
@@ -3598,6 +3664,15 @@ void launch_slots_of(int ggml_type, const S& slots, int count, int n_in, int n_o
         }
 #endif
         launch_slots<SmallTraits<Q40Block, 4>>(slots, count, n_in, n_out, s);
+        break;
+    case 3:
+#if defined(__HIPCC__)
+        if (poly_q40_expert_enabled(n_in, n_out)) {
+            poly_q41_expert_slots(slots, count, n_in, n_out, s);
+            break;
+        }
+#endif
+        launch_slots<SmallTraits<Q41Block, 4>>(slots, count, n_in, n_out, s);
         break;
     case 6: launch_slots<SmallTraits<Q50Block, 4>>(slots, count, n_in, n_out, s); break;
     case 8: launch_slots<SmallTraits<Q80Block, 8>>(slots, count, n_in, n_out, s); break;
@@ -3644,7 +3719,7 @@ bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int
 }
 
 bool native_mmvq_ids_partial(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
-    if (ggml_type != 2) return false;
+    if (ggml_type != 2 && ggml_type != 3) return false;
     if (n_out <= 0 || count < 1 || count > 65535 || ids.x_every < 1)
         throw std::invalid_argument("native_mmvq_ids_partial requires valid rows and expert count");
     validate_pointer(ids.table);
@@ -3653,8 +3728,12 @@ bool native_mmvq_ids_partial(int ggml_type, const MmvqIds& ids, int count, int n
     validate_pointer(ids.y);
     validate_shape(n_in, 1, 32);
     validate_stream(stream);
-    launch_slots<SmallTraits<Q40Block, 4>, MmvqIds, true>(ids, count, n_in, n_out,
-                                                            static_cast<cudaStream_t>(stream));
+    if (ggml_type == 2)
+        launch_slots<SmallTraits<Q40Block, 4>, MmvqIds, true>(ids, count, n_in, n_out,
+                                                                static_cast<cudaStream_t>(stream));
+    else
+        launch_slots<SmallTraits<Q41Block, 4>, MmvqIds, true>(ids, count, n_in, n_out,
+                                                                static_cast<cudaStream_t>(stream));
     launch_check();
     return true;
 }
