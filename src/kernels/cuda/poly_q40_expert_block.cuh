@@ -1,5 +1,7 @@
 #pragma once
 
+#include "poly_q40_expert_weights.cuh"
+
 #if defined(__HIPCC__)
 inline bool poly_q40_expert_block_on() {
     static const bool on = [] {
@@ -9,7 +11,7 @@ inline bool poly_q40_expert_block_on() {
     return on;
 }
 
-template<typename Weight, typename S, bool PARTIAL, int ROWS>
+template<typename Weight, typename S, bool PARTIAL, int ROWS, bool VECTOR = false>
 __global__ void __launch_bounds__(128) poly_q40_expert_block_kernel(
         S slots, int n_in, int n_out) {
     const int j = int(blockIdx.y);
@@ -38,6 +40,11 @@ __global__ void __launch_bounds__(128) poly_q40_expert_block_kernel(
         wr[r] = w + size_t(row0 + r < n_out ? row0 + r : row0) * nblocks;
     for (int kb = lane; kb < nblocks; kb += 32) {
         const Q81Block& xb = x[kb];
+        PolyExpertQ4Codes codes[ROWS];
+        if constexpr (VECTOR) {
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) codes[r] = poly_expert_q4_codes(wr[r][kb].qs);
+        }
         int dots[ROWS] = {};
         int sumu = 0;
 #pragma unroll
@@ -48,7 +55,9 @@ __global__ void __launch_bounds__(128) poly_q40_expert_block_kernel(
                 sumu = STRATA_DP4A(0x01010101, qhi, STRATA_DP4A(0x01010101, qlo, sumu));
 #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
-                const int a = load_int_b2(wr[r][kb].qs, i);
+                int a;
+                if constexpr (VECTOR) a = codes[r].word[i];
+                else a = load_int_b2(wr[r][kb].qs, i);
                 dots[r] = STRATA_DP4A(a & 0x0f0f0f0f, qlo, dots[r]);
                 dots[r] = STRATA_DP4A((a >> 4) & 0x0f0f0f0f, qhi, dots[r]);
             }
@@ -71,20 +80,29 @@ __global__ void __launch_bounds__(128) poly_q40_expert_block_kernel(
     }
 }
 
-template<typename Weight, typename S, bool PARTIAL>
-inline void poly_q40_expert_block_slots(const S& slots, int count,
+template<typename Weight, typename S, bool PARTIAL, bool VECTOR>
+inline void poly_q40_expert_block_slots_impl(const S& slots, int count,
                                         int n_in, int n_out, int rows,
                                         cudaStream_t stream) {
     const dim3 threads(32, 4);
     if (rows == 4) {
         const dim3 blocks(unsigned((n_out + 15) / 16), unsigned(count));
-        poly_q40_expert_block_kernel<Weight, S, PARTIAL, 4><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
+        poly_q40_expert_block_kernel<Weight, S, PARTIAL, 4, VECTOR><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
     } else if (rows == 2) {
         const dim3 blocks(unsigned((n_out + 7) / 8), unsigned(count));
-        poly_q40_expert_block_kernel<Weight, S, PARTIAL, 2><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
+        poly_q40_expert_block_kernel<Weight, S, PARTIAL, 2, VECTOR><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
     } else {
         const dim3 blocks(unsigned((n_out + 3) / 4), unsigned(count));
-        poly_q40_expert_block_kernel<Weight, S, PARTIAL, 1><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
+        poly_q40_expert_block_kernel<Weight, S, PARTIAL, 1, VECTOR><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
     }
+}
+template<typename Weight, typename S, bool PARTIAL>
+inline void poly_q40_expert_block_slots(const S& slots, int count,
+                                        int n_in, int n_out, int rows,
+                                        cudaStream_t stream) {
+    if (poly_q40_expert_weight_vector_on())
+        poly_q40_expert_block_slots_impl<Weight, S, PARTIAL, true>(slots, count, n_in, n_out, rows, stream);
+    else
+        poly_q40_expert_block_slots_impl<Weight, S, PARTIAL, false>(slots, count, n_in, n_out, rows, stream);
 }
 #endif
