@@ -3,15 +3,22 @@
 #pragma once
 
 #if defined(__HIPCC__)
-template<typename Weight, typename S>
+template<typename Weight, typename S, bool PARTIAL = false>
 __global__ void __launch_bounds__(128) poly_q40_expert_wave_kernel(
         S slots, int n_in, int n_out) {
-    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
-    const auto* w = static_cast<const Weight*>(at.w);
-    const auto* x = static_cast<const Q81Block*>(at.x);
+    const int j = int(blockIdx.y);
     const int lane = int(threadIdx.x);
     const int row = 4 * int(blockIdx.x) + int(threadIdx.y);
+    if constexpr (PARTIAL) {
+        if (slots.table[slots.ids[j]] == nullptr) {
+            if (lane == 0 && row < n_out) slots.y[size_t(j) * slots.y_stride + row] = 0.f;
+            return;
+        }
+    }
     if (row >= n_out) return;
+    const SlotPtrs at = slot_ptrs(slots, j);
+    const auto* w = static_cast<const Weight*>(at.w);
+    const auto* x = static_cast<const Q81Block*>(at.x);
 
     // A wave owns one output row. The two 16-value parts of a Q4_0 block
     // retain small_q8_dot's affine correction from the Q8_1 input sum.
@@ -31,16 +38,27 @@ __global__ void __launch_bounds__(128) poly_q40_expert_wave_kernel(
 
 // Two rows share the same Q8_1 words and scales. This is especially useful
 // for the 1024-wide down matrix: each wave reads two complete output rows.
-template<typename Weight, typename S>
+template<typename Weight, typename S, bool PARTIAL = false>
 __global__ void __launch_bounds__(128) poly_q40_expert_pair_kernel(
         S slots, int n_in, int n_out) {
-    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
-    const auto* w = static_cast<const Weight*>(at.w);
-    const auto* x = static_cast<const Q81Block*>(at.x);
+    const int j = int(blockIdx.y);
     const int lane = int(threadIdx.x);
     const int row0 = 8 * int(blockIdx.x) + 2 * int(threadIdx.y);
-    if (row0 >= n_out) return;
     const int row1 = row0 + 1;
+    if constexpr (PARTIAL) {
+        if (slots.table[slots.ids[j]] == nullptr) {
+            if (lane == 0 && row0 < n_out) {
+                float* y = slots.y + size_t(j) * slots.y_stride;
+                y[row0] = 0.f;
+                if (row1 < n_out) y[row1] = 0.f;
+            }
+            return;
+        }
+    }
+    if (row0 >= n_out) return;
+    const SlotPtrs at = slot_ptrs(slots, j);
+    const auto* w = static_cast<const Weight*>(at.w);
+    const auto* x = static_cast<const Q81Block*>(at.x);
     const int nblocks = n_in / 32;
     const Weight* w0 = w + size_t(row0) * nblocks;
     const Weight* w1 = w + size_t(row1 < n_out ? row1 : row0) * nblocks;
@@ -99,16 +117,24 @@ inline bool poly_q40_expert_enabled(int n_in, int n_out) {
             (n_in == 1024 && n_out == 3072));
 }
 
-template<typename Weight, typename S>
+inline bool poly_q40_expert_ids_enabled(int n_in, int n_out) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_EXPERT_IDS");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on && poly_q40_expert_enabled(n_in, n_out);
+}
+
+template<typename Weight, typename S, bool PARTIAL = false>
 inline void poly_q4_expert_slots(const S& slots, int count,
                                  int n_in, int n_out, cudaStream_t stream) {
     const dim3 threads(32, 4);
     if (poly_q40_expert_pair_on()) {
         const dim3 blocks(unsigned((n_out + 7) / 8), unsigned(count));
-        poly_q40_expert_pair_kernel<Weight, S><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
+        poly_q40_expert_pair_kernel<Weight, S, PARTIAL><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
     } else {
         const dim3 blocks(unsigned((n_out + 3) / 4), unsigned(count));
-        poly_q40_expert_wave_kernel<Weight, S><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
+        poly_q40_expert_wave_kernel<Weight, S, PARTIAL><<<blocks, threads, 0, stream>>>(slots, n_in, n_out);
     }
 }
 template<typename S>
@@ -120,6 +146,14 @@ template<typename S>
 inline void poly_q41_expert_slots(const S& slots, int count,
                                   int n_in, int n_out, cudaStream_t stream) {
     poly_q4_expert_slots<Q41Block>(slots, count, n_in, n_out, stream);
+}
+inline void poly_q40_expert_ids_partial(const MmvqIds& ids, int count,
+                                         int n_in, int n_out, cudaStream_t stream) {
+    poly_q4_expert_slots<Q40Block, MmvqIds, true>(ids, count, n_in, n_out, stream);
+}
+inline void poly_q41_expert_ids_partial(const MmvqIds& ids, int count,
+                                         int n_in, int n_out, cudaStream_t stream) {
+    poly_q4_expert_slots<Q41Block, MmvqIds, true>(ids, count, n_in, n_out, stream);
 }
 #else
 inline bool poly_q40_expert_enabled(int, int) { return false; }

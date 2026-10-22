@@ -13,6 +13,9 @@ namespace strata::poly {
 
 class Qwen35 final : public Engine {
 public:
+    size_t mtp_row_bytes() const;
+    void mtp_download_rows(int64_t first, int n, uint8_t* dst);
+    void mtp_upload_rows(int64_t first, int n, const uint8_t* src);
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;

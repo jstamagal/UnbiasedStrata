@@ -48,6 +48,25 @@ __global__ void partial_wait_kernel(const uint32_t* ready, const uint32_t* done,
     __threadfence_system();
 }
 
+
+__global__ void partial_add_kernel(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                   const float* cpu, float* sum, int count) {
+    const auto* r = reinterpret_cast<const volatile uint32_t*>(ready);
+    const auto* d = reinterpret_cast<const volatile uint32_t*>(done);
+    const auto* a = reinterpret_cast<const volatile uint32_t*>(abort);
+    __shared__ int cancelled;
+    if (threadIdx.x == 0) {
+        const uint32_t need = *r;
+        while (*d != need && *a == 0) { }
+        cancelled = *a != 0;
+    }
+    __syncthreads();
+    if (cancelled) return;
+    __threadfence_system();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x)
+        sum[i] += cpu[i];
+}
+
 } // namespace
 
 void router_doorbell_publish(uint32_t* device_word, uint32_t value, void* stream) {
@@ -67,6 +86,14 @@ void partial_graph_ring(uint32_t* ready, void* stream) {
 
 void partial_graph_wait(const uint32_t* ready, const uint32_t* done, const uint32_t* abort, void* stream) {
     partial_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ready, done, abort);
+}
+
+
+void partial_graph_add(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                       const float* cpu, float* sum, int count, void* stream) {
+    const int blocks = (count + 255) / 256;
+    partial_add_kernel<<<blocks < 32 ? blocks : 32, 256, 0, (cudaStream_t) stream>>>(
+        ready, done, abort, cpu, sum, count);
 }
 
 } // namespace strata::poly

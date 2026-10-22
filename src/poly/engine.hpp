@@ -421,7 +421,7 @@ protected:
 
     // ---- what it builds on ----
     /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.
-    bool runs(int il) const { return il >= lo_ && (il < hi_ || hi_ == n_layer_); }
+    bool runs(int il) const { return il >= lo_ && (il < hi_ || hi_ == n_layer_ || (mtp_stage0_ && il == n_layer_)); }
     size_t card_state_bytes() const { return state_n_ * sizeof(float) + extra_bytes(); }
     /// Every expert of this engine's layers is in its cache.
     bool all_cached() const { return cached_ == n_moe_ * n_expert_; }
@@ -445,6 +445,7 @@ protected:
     void shared_scratch();
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
     void draft_rows(const int32_t* tokens, int first, int n);
+    void sync_mtp_stage0();
     const Image* image_at(int64_t row) const;
     bool input(int32_t token, int64_t row, float* dst) const;
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
@@ -536,6 +537,9 @@ protected:
     int end_ = -1;                        ///< what open() asked for hi_; -1: the model's end
     bool split_ = false;                  ///< one of several engines: a call sets its card first
     std::unique_ptr<Engine> next_;
+    bool mtp_stage0_ = false;             ///< opt-in duplicate drafter on the front card of a two-card split
+    int64_t mtp_synced_ = 0;             ///< committed draft-cache rows mirrored from the last card
+    uint8_t* h_mtp_rows_ = nullptr;      ///< bounded pinned row handoff for the front drafter
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
     const float* pass_ = nullptr;
     int64_t pass_at_ = 0;

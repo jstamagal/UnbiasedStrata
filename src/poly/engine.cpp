@@ -1254,7 +1254,10 @@ std::unique_ptr<Engine> Engine::open(const Options& requested) {
         std::unique_ptr<Engine> e = make();
         const bool last = k + 1 == starts.size();
         Options so = o;
-        if (!last) {
+        const char* mtp = std::getenv("STRATA_POLY_MTP_STAGE0");
+        const bool stage0 = starts.size() == 2 && k == 0 && mtp && std::strcmp(mtp, "1") == 0 &&
+                            std::strcmp(name.c_str(), "qwen35moe") == 0;
+        if (!last && !stage0) {
             so.draft = false;
             so.draft_model.clear();
         }
@@ -1269,6 +1272,7 @@ std::unique_ptr<Engine> Engine::open(const Options& requested) {
         }
         e->lo_ = starts[k];
         e->end_ = last ? -1 : starts[k + 1];
+        e->mtp_stage0_ = stage0 && so.draft && so.window != 1;
         e->split_ = true;
         ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
         try {
@@ -2090,7 +2094,7 @@ void Engine::load(const Options& o) {
         begin_pass();
         for (int il = 0; il < n_all; ++il)
             if (runs(il)) load_layer(il);
-        if (hi_ == n_layer_) {
+        if (hi_ == n_layer_ || mtp_stage0_) {
             const TensorInfo* norm = gg_->find("output_norm.weight");
             if (const Names* a = norm ? nullptr : tensor_alias("output_norm.weight"))
                 for (const char* other : a->other)
@@ -2431,6 +2435,7 @@ void Engine::reset() {
     OnCard here(device_, split_);
     pipe_ready_ = pipe_inflight_ = false;
     pipe_n_ = 0;
+    mtp_synced_ = 0;
     ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
     pos_ = 0;
     ahead_pos_ = -1;
@@ -2480,6 +2485,7 @@ void Engine::load_state(const uint8_t* src, int64_t pos) {
     OnCard here(device_, split_);
     pipe_ready_ = pipe_inflight_ = false;
     pipe_n_ = 0;
+    mtp_synced_ = 0;
     ck(cudaStreamSynchronize(cs(st_)), "load state");
     ck(cudaMemcpy(state_, src, state_n_ * sizeof(float), cudaMemcpyHostToDevice), "load state");
     load_extra(src + state_n_ * sizeof(float), pos);
@@ -3435,9 +3441,8 @@ void Engine::run(const int32_t* tokens, int n) {
                     kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
                     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 }
-                partial_graph_wait(partial_device_words_, partial_device_words_ + 1,
-                                   partial_device_words_ + 2, st_);
-                axpy(d_partial_cpu_, 1.f, fo_, n * n_embd_, true, st_);
+                partial_graph_add(partial_device_words_, partial_device_words_ + 1,
+                                  partial_device_words_ + 2, d_partial_cpu_, fo_, n * n_embd_, st_);
                 layer_tail(L, il, n);
             }
                 });
@@ -4011,7 +4016,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         fetch(1);
     }
     // a turn for each layer, and one for the model's output, which the draft block keeps a row of
-    const int turns = hi_ - lo_ + (draft_ ? 1 : 0);
+    const int turns = hi_ - lo_ + (draft_ && !next_ ? 1 : 0);
     shared_ahead_ = true;
     try {
         for (int k = 0; k < turns; ++k) {
@@ -4217,7 +4222,7 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     }
     Behind draft_ahead;
     int prepared_n = predicted_n;
-    if (prepare) draft_ahead.go([&] { prepared_n = prepare(); });
+    if (prepare && !mtp_stage0_) draft_ahead.go([&] { prepared_n = prepare(); });
     const int64_t start = pos_;
     const bool reuse = pipeline_match(tokens, t);
     if (pipe_ready_ && !reuse) {
@@ -4259,24 +4264,33 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     }
     std::copy(tokens, tokens + t, win_tok_);
     win_ = t;
+    const int next_slot = 1 - current_slot;
+    Behind back;
+    const auto verify_back = [this, tokens, t, start, current_slot] {
+        next_->pass_ = pipe_pass_[current_slot];
+        next_->pass_at_ = start;
+        next_->window(tokens, t);
+    };
+    // The front-card drafter must use this card's scratch only after its A run. The last card can already
+    // verify A while the front card drafts and runs the guessed B window.
+    if (mtp_stage0_) back.go(verify_back);
     try {
-        draft_ahead.wait();  // the last card's draft chain ran while the first card evaluated this window
+        if (mtp_stage0_) {
+            if (prepare) prepared_n = prepare();
+        } else {
+            draft_ahead.wait();  // the last card's draft chain ran while the first card evaluated this window
+        }
         if (prepared_n < 0 || prepared_n > opt_.window)
             throw std::logic_error("pipeline preparation returned an invalid window size");
     } catch (...) {
+        if (mtp_stage0_) back.wait();
         ck(cudaMemcpyAsync(state_, pipe_saved_[0], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
            "pipeline draft rollback");
         ck(cudaStreamSynchronize(cs(st_)), "pipeline draft rollback");
         win_ = 0;
         throw;
     }
-    const int next_slot = 1 - current_slot;
-    Behind back;
-    back.go([this, tokens, t, start, current_slot] {
-        next_->pass_ = pipe_pass_[current_slot];
-        next_->pass_at_ = start;
-        next_->window(tokens, t);
-    });
+    if (!mtp_stage0_) back.go(verify_back);
     try {
         if (prepared_n > 0 && start + t + prepared_n <= opt_.max_context) {
             ck(cudaMemcpyAsync(pipe_saved_[1], state_, rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
@@ -4379,7 +4393,7 @@ void Engine::keep(int n) {
             pos_ -= from;
         }
     }
-    if (draft_) draft_rows(win_tok_, ahead_pos_ == pos_ && win_tok_[0] == ahead_tok_ ? 1 : 0, n);
+    if (draft_ && !next_) draft_rows(win_tok_, ahead_pos_ == pos_ && win_tok_[0] == ahead_tok_ ? 1 : 0, n);
     if (next_) next_->keep(n);
     pos_ += n;
     stats_.tokens += n;
@@ -4454,12 +4468,59 @@ void Engine::draft_step(int32_t token, int i) {
     finish_logits(logits_, 1);
 }
 
+void Engine::sync_mtp_stage0() {
+    if (!mtp_stage0_ || !next_) return;
+    auto* front = dynamic_cast<Qwen35*>(this);
+    auto* last = dynamic_cast<Qwen35*>(next_.get());
+    if (!front || !last || !next_->draft_ || next_->pos_ != pos_)
+        throw std::logic_error("stage0 MTP needs two synchronized Qwen cards");
+    const size_t row = front->mtp_row_bytes();
+    if (row != last->mtp_row_bytes()) throw std::logic_error("stage0 MTP cache formats differ");
+    constexpr int kRows = 256;
+    const size_t bytes = std::max(row * kRows, (size_t) n_embd_ * sizeof(float));
+    if (!h_mtp_rows_) {
+        OnCard here(device_, split_);
+        h_mtp_rows_ = (uint8_t*) hmalloc(bytes, "stage0 MTP handoff");
+    }
+    if (mtp_synced_ > pos_) mtp_synced_ = 0;
+    {
+        OnCard here(device_, split_);
+        cover(pos_);
+    }
+    for (int64_t at = mtp_synced_; at < pos_;) {
+        const int n = (int) std::min<int64_t>(kRows, pos_ - at);
+        {
+            OnCard there(next_->device_, split_);
+            last->mtp_download_rows(at, n, h_mtp_rows_);
+        }
+        {
+            OnCard here(device_, split_);
+            front->mtp_upload_rows(at, n, h_mtp_rows_);
+        }
+        at += n;
+    }
+    mtp_synced_ = pos_;
+    {
+        OnCard there(next_->device_, split_);
+        ck(cudaMemcpyAsync(h_mtp_rows_, next_->hn_, (size_t) n_embd_ * sizeof(float),
+                           cudaMemcpyDeviceToHost, cs(next_->st_)), "stage0 MTP source");
+        ck(cudaStreamSynchronize(cs(next_->st_)), "stage0 MTP source");
+    }
+    {
+        OnCard here(device_, split_);
+        ck(cudaMemcpyAsync(hn_, h_mtp_rows_, (size_t) n_embd_ * sizeof(float),
+                           cudaMemcpyHostToDevice, cs(st_)), "stage0 MTP source");
+        ck(cudaStreamSynchronize(cs(st_)), "stage0 MTP source");
+    }
+}
+
 int32_t Engine::draft(int32_t token, int i, float* prob) {
-    if (next_) return next_->draft(token, i, prob);   // the last card has the draft block
+    if (next_ && !mtp_stage0_) return next_->draft(token, i, prob);   // the last card has the draft block
     OnCard here(device_, split_);
     if (!draft_) throw std::logic_error("draft: this model has no block that guesses ahead");
     if (token < 0 || token >= n_vocab_) throw std::runtime_error("a token id is outside the vocabulary");
     if (i < 0 || pos_ + i >= opt_.max_context) throw std::logic_error("draft: the position is outside the context");
+    if (mtp_stage0_ && i == 0) sync_mtp_stage0();
     cover(pos_ + i + 1);
     ck(cudaStreamSynchronize(cs(st_)), "draft");
     draft_step(token, i);

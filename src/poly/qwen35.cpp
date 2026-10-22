@@ -202,6 +202,54 @@ size_t Qwen35::card_row_bytes() const {
     return (size_t) n_attn_ * 2 * n_kv_ * head_dim_ * sizeof(uint16_t);
 }
 
+size_t Qwen35::mtp_row_bytes() const {
+    if (opt_.kv_format == KvFmt::kQ8_0)
+        return 2 * ((size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t));
+    return 2 * (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+}
+
+void Qwen35::mtp_download_rows(int64_t first, int n, uint8_t* dst) {
+    const Block& B = blocks_[(size_t) n_layer_];
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        const size_t c = (size_t) n_kv_ * head_dim_, s = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+        for (const auto& part : {std::pair<const void*, size_t>{B.k_codes, c}, {B.k_scales, s},
+                                 {B.v_codes, c}, {B.v_scales, s}}) {
+            ck(cudaMemcpyAsync(dst, (const uint8_t*) part.first + (size_t) first * part.second,
+                               (size_t) n * part.second, cudaMemcpyDeviceToHost, cs(st_)), "MTP row handoff");
+            dst += (size_t) n * part.second;
+        }
+    } else {
+        const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+        for (const void* cache : {B.keys, B.vals}) {
+            ck(cudaMemcpyAsync(dst, (const uint8_t*) cache + (size_t) first * row,
+                               (size_t) n * row, cudaMemcpyDeviceToHost, cs(st_)), "MTP row handoff");
+            dst += (size_t) n * row;
+        }
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
+}
+
+void Qwen35::mtp_upload_rows(int64_t first, int n, const uint8_t* src) {
+    Block& B = blocks_[(size_t) n_layer_];
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        const size_t c = (size_t) n_kv_ * head_dim_, s = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+        for (const auto& part : {std::pair<void*, size_t>{B.k_codes, c}, {B.k_scales, s},
+                                 {B.v_codes, c}, {B.v_scales, s}}) {
+            ck(cudaMemcpyAsync((uint8_t*) part.first + (size_t) first * part.second, src,
+                               (size_t) n * part.second, cudaMemcpyHostToDevice, cs(st_)), "MTP row handoff");
+            src += (size_t) n * part.second;
+        }
+    } else {
+        const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+        for (void* cache : {B.keys, B.vals}) {
+            ck(cudaMemcpyAsync((uint8_t*) cache + (size_t) first * row, src,
+                               (size_t) n * row, cudaMemcpyHostToDevice, cs(st_)), "MTP row handoff");
+            src += (size_t) n * row;
+        }
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
+}
+
 void Qwen35::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
