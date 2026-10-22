@@ -24,6 +24,14 @@ constexpr size_t kScoreFloats = size_t(16) << 20;  // the attention's scores of 
 // about 16/3 * head_dim rows, well under this, so real prompts take the same products the fp16 path takes.
 constexpr size_t kQ8WorkRows = 2048;
 
+bool router_topk_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_ROUTER_TOPK");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 // Within a whole-stage partial graph, carry an interior layer's routed sum into
 // the next layer's residual-add + input norm + Q8_1 launch.
 bool tail_next_norm_on() {
@@ -169,6 +177,10 @@ void Qwen35::alloc_caches() {
     }
     chunk_ = (int) std::clamp<size_t>(kScoreFloats / ((size_t) n_head_ * opt_.max_context), 1, (size_t) rows_);
     if (axes_) return;   // bind(): a call's scratch is every sequence's
+    if (router_topk_on()) {
+        router_ticket_ = (uint32_t*) dmalloc(sizeof(uint32_t), "fused router ticket");
+        ck(cudaMemsetAsync(router_ticket_, 0, sizeof(uint32_t), cs(st_)), "fused router ticket");
+    }
     axes_ = (int32_t*) dmalloc((size_t) rows_ * 3 * sizeof(int32_t), "a call's rotary positions");
     h_axes_.resize((size_t) rows_ * 3);
 }
@@ -366,9 +378,14 @@ void Qwen35::gdn(Block& B, int n) {
         const char* v = std::getenv("STRATA_POLY_Q35_GATES_WINDOW");
         return v && v[0] == '1' && v[1] == '\0';
     }();
+    static const bool alpha_beta_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_ALPHA_BETA");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
     const bool conv_window = conv_window_on && n >= 2 && n <= 8 && s_dim_ == 128 && !rows_of_ && !opt_.dump;
     const bool conv_normed = (fuse && n == 1 && !opt_.dump) || conv_window;
     const bool gates_fused = !opt_.dump && ((fuse && n == 1) ||
+                             (alpha_beta_on && n >= 1 && n <= 8) ||
                              (gates_window_on && n >= 2 && n <= 8)) &&
                              B.alpha.type == kTypeF32 && B.beta.type == kTypeF32;
     if (gates_fused) {
@@ -673,20 +690,39 @@ void Qwen35::route(int, const float* logits, int32_t, int* ids, float* w, float*
     for (int k = 0; k < n_used_; ++k) w[k] /= denom;
 }
 
+bool Qwen35::fused_router(const Layer& L, int n) const {
+    return router_topk_on() && router_ticket_ && partial_capture_ && !opt_.dump &&
+           n >= 1 && n <= 8 && n_embd_ >= 128 && sum_threads(n_embd_) >= n * 32 &&
+           n_expert_ >= 1 && n_expert_ <= 512 && n_used_ >= 1 && n_used_ <= 32 &&
+           n_used_ <= n_expert_ && L.gate_inp.type == kTypeF32;
+}
+
+void Qwen35::router_scores(const Layer& L, int n) {
+    if (!fused_router(L, n)) Engine::router_scores(L, n);
+}
+
 bool Qwen35::route_card(int, int n, int32_t* ids, float* w) {
     route_rows(rl_, n_expert_, n_used_, n, 0, 1.f, nullptr, nullptr, true, 0.f, ids, w, st_);
     return true;
 }
 
-bool Qwen35::route_card_publish(int, int n, int32_t* ids, float* w, float* host_x,
+bool Qwen35::route_card_publish(int il, int n, int32_t* ids, float* w, float* host_x,
                                 int32_t* host_ids, float* host_wts, uint32_t* ready,
                                 uint32_t* layer_ready) {
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_POLY_ROUTE_PUBLISH");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    if (!enabled) return false;
     const RoutePublish publish{xn_, host_x, host_ids, host_wts, n * n_embd_, ready, layer_ready};
+    const Layer& L = layers_[(size_t) il];
+    if (fused_router(L, n)) {
+        if (router_f32_publish(fp(L.gate_inp), xn_, rl_, n_embd_, n_expert_, n_used_, n,
+                                router_ticket_, ids, w, publish, st_))
+            return true;
+        // The publisher can reject missing destinations; materialize the deferred scores before fallback.
+        Engine::router_scores(L, n);
+    }
+    if (!enabled) return false;
     return route_rows_publish(rl_, n_expert_, n_used_, n, 0, 1.f, nullptr, nullptr, true, 0.f,
                               ids, w, publish, st_);
 }

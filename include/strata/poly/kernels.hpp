@@ -157,6 +157,9 @@ struct RoutePublish {
 bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
                         const float* bias, const float* escale, bool norm, float w_scale,
                         int32_t* ids, float* w, const RoutePublish& publish, void* stream);
+bool router_f32_publish(const float* weights, const float* x, float* logits, int n_in, int n_expert,
+                         int n_used, int rows, uint32_t* ticket, int32_t* ids, float* w,
+                         const RoutePublish& publish, void* stream);
 /// acc[t] += sum over k < n_used of w[t * n_used + k] * x[t * n_used + k], for rows of n values: a token's
 /// weighted experts added to its row.
 void moe_sum(const float* x, const float* w, float* acc, int n, int n_used, int rows, void* stream);

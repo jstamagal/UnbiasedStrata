@@ -138,3 +138,7 @@ STRATA_POLY_HEAD_VERIFY=1 STRATA_POLY_HEAD_VERIFY_GRID=2048  # persistent verify
 STRATA_POLY_Q40_DENSE_WAVE=1 STRATA_POLY_Q40_DENSE_ROWS=4  # Q4_0 activation reuse over 1/2/4 rows, default 2
 STRATA_POLY_DENSE_WEIGHT_VEC=1  # aligned dword Q4_0/Q8_0 loads; combine with dense wave selectors
 STRATA_POLY_HEAD_PRELOAD=1 STRATA_POLY_HEAD_VERIFY=1 STRATA_POLY_HEAD_ALIGNED=1  # aligned Q6_K code loads on even blocks
+STRATA_POLY_ROUTER_TOPK=1  # F32 router projection, top-k and doorbell in one partial-graph launch
+STRATA_POLY_ROUTER_TOPK=1 STRATA_POLY_ROUTER_TOPK_PACK=1  # packed physical CTAs preserve logical reduction
+STRATA_POLY_ROUTER_TOPK=1 STRATA_POLY_ROUTER_TOPK_WINDOW=1  # reuse router weights across 2-8 window rows
+STRATA_POLY_Q35_ALPHA_BETA=1  # fused F32 projections and gate transforms for windows 1-8

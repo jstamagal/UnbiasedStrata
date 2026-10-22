@@ -1010,12 +1010,12 @@ __global__ void route_kernel(const float* __restrict__ logits, int n_expert, int
 // input and selected experts to mapped host memory after the exact route math.
 template<int PER>
 
-__global__ void route_publish_kernel(const float* __restrict__ logits, int n_expert, int n_used, int rows, int gate,
+__device__ __forceinline__ void route_publish_body(const volatile float* logits, int n_expert, int n_used, int rows, int gate,
                              float in_scale, const float* __restrict__ bias, const float* __restrict__ escale,
                              bool norm, float w_scale, int32_t* __restrict__ ids, float* __restrict__ w, RoutePublish publish) {
-    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP, lane = threadIdx.x % WARP;
+    const int row = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     if (row < rows) {
-    const float* lg = logits + size_t(row) * n_expert;
+    const volatile float* lg = logits + size_t(row) * n_expert;
     float p[PER], pick[PER];
     float mx = -INFINITY;
 #pragma unroll
@@ -1098,6 +1098,120 @@ __global__ void route_publish_kernel(const float* __restrict__ logits, int n_exp
             *reinterpret_cast<volatile uint32_t*>(publish.layer_ready) = value;
         __threadfence_system();
     }
+}
+
+template<int PER>
+__global__ void route_publish_kernel(const float* logits, int n_expert, int n_used, int rows, int gate,
+                                     float in_scale, const float* bias, const float* escale,
+                                     bool norm, float w_scale, int32_t* ids, float* w, RoutePublish publish) {
+    route_publish_body<PER>(logits, n_expert, n_used, rows, gate, in_scale, bias, escale,
+                             norm, w_scale, ids, w, publish);
+}
+
+// Preserve gemv_kernel's dot-product reduction. Every expert CTA publishes its score before taking a ticket;
+// the last CTA routes the complete window and rings its doorbell without another launch. The stream orders
+// kernels, and atomicInc wraps the ticket to zero for the next layer or graph replay.
+template<int PER>
+__global__ void router_f32_publish_kernel(const float* __restrict__ weights, const float* __restrict__ x,
+                                          volatile float* logits, int n_in, int n_expert, int n_used, int rows,
+                                          uint32_t* ticket, int32_t* ids, float* w, RoutePublish publish) {
+    __shared__ float part[32];
+    __shared__ bool last;
+    const int expert = blockIdx.x, row = blockIdx.y;
+    const float* wr = weights + size_t(expert) * n_in;
+    const float* xr = x + size_t(row) * n_in;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) acc += wr[i] * xr[i];
+    acc = block_sum(acc, part);
+    if (threadIdx.x == 0) {
+        logits[size_t(row) * n_expert + expert] = acc;
+        __threadfence();
+        const unsigned limit = unsigned(n_expert * rows - 1);
+        last = atomicInc(reinterpret_cast<unsigned*>(ticket), limit) == limit;
+    }
+    __syncthreads();
+    if (!last) return;
+    route_publish_body<PER>(logits, n_expert, n_used, rows, 0, 1.0f, nullptr, nullptr,
+                             true, 0.0f, ids, w, publish);
+}
+
+// Pack the reference logical lanes into a smaller CTA. Each logical lane still accumulates with the original
+// stride, each wave reduces the same 32 values, and thread zero adds all wave partials in the original order.
+template<int PER>
+__global__ void router_f32_publish_packed_kernel(const float* __restrict__ weights, const float* __restrict__ x,
+                                                 volatile float* logits, int n_in, int n_expert, int n_used,
+                                                 int rows, int logical_threads, uint32_t* ticket,
+                                                 int32_t* ids, float* w, RoutePublish publish) {
+    __shared__ float part[32];
+    __shared__ bool last;
+    const int expert = blockIdx.x, row = blockIdx.y;
+    const float* wr = weights + size_t(expert) * n_in;
+    const float* xr = x + size_t(row) * n_in;
+    for (int first = 0; first < logical_threads; first += blockDim.x) {
+        const int lane = first + int(threadIdx.x);
+        float acc = 0.0f;
+        for (int i = lane; i < n_in; i += logical_threads) acc += wr[i] * xr[i];
+        acc = warp_sum(acc);
+        if ((threadIdx.x & 31) == 0) part[lane / WARP] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int wave = 0; wave < logical_threads / WARP; ++wave) sum += part[wave];
+        logits[size_t(row) * n_expert + expert] = sum;
+        __threadfence();
+        const unsigned limit = unsigned(n_expert * rows - 1);
+        last = atomicInc(reinterpret_cast<unsigned*>(ticket), limit) == limit;
+    }
+    __syncthreads();
+    if (!last) return;
+    route_publish_body<PER>(logits, n_expert, n_used, rows, 0, 1.0f, nullptr, nullptr,
+                             true, 0.0f, ids, w, publish);
+}
+
+// A CTA reads an expert's F32 weights once for the entire window. Logical lanes and the wave-partial order
+// are the single-token gemv's, even when four reference waves share each physical wave in this CTA.
+template<int PER, int TOKENS>
+__global__ void router_f32_publish_window_kernel(const float* __restrict__ weights, const float* __restrict__ x,
+                                                 volatile float* logits, int n_in, int n_expert, int n_used,
+                                                 int rows, int logical_threads, uint32_t* ticket,
+                                                 int32_t* ids, float* w, RoutePublish publish) {
+    __shared__ float part[TOKENS][32];
+    __shared__ bool last;
+    const int expert = blockIdx.x;
+    const float* wr = weights + size_t(expert) * n_in;
+    for (int first = 0; first < logical_threads; first += blockDim.x) {
+        const int lane = first + int(threadIdx.x);
+        float acc[TOKENS] = {};
+        for (int i = lane; i < n_in; i += logical_threads) {
+            const float weight = wr[i];
+#pragma unroll
+            for (int row = 0; row < TOKENS; ++row)
+                if (row < rows) acc[row] += weight * x[size_t(row) * n_in + i];
+        }
+#pragma unroll
+        for (int row = 0; row < TOKENS; ++row) {
+            if (row < rows) {
+                const float sum = warp_sum(acc[row]);
+                if ((threadIdx.x & 31) == 0) part[row][lane / WARP] = sum;
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int row = 0; row < rows; ++row) {
+            float sum = 0.0f;
+            for (int wave = 0; wave < logical_threads / WARP; ++wave) sum += part[row][wave];
+            logits[size_t(row) * n_expert + expert] = sum;
+        }
+        __threadfence();
+        const unsigned limit = unsigned(n_expert - 1);
+        last = atomicInc(reinterpret_cast<unsigned*>(ticket), limit) == limit;
+    }
+    __syncthreads();
+    if (!last) return;
+    route_publish_body<PER>(logits, n_expert, n_used, rows, 0, 1.0f, nullptr, nullptr,
+                             true, 0.0f, ids, w, publish);
 }
 
 
@@ -2593,6 +2707,66 @@ bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows,
     else if (n_expert <= 4 * WARP) launch(route_publish_kernel<4>);
     else if (n_expert <= 8 * WARP) launch(route_publish_kernel<8>);
     else launch(route_publish_kernel<ROUTE_PER>);
+    return true;
+}
+
+bool router_f32_publish(const float* weights, const float* x, float* logits, int n_in, int n_expert,
+                         int n_used, int rows, uint32_t* ticket, int32_t* ids, float* w,
+                         const RoutePublish& publish, void* stream) {
+    if (rows < 1 || rows > 8 || n_in < 128 || n_expert < 1 || n_expert > ROUTE_PER * WARP ||
+        n_used < 1 || n_used > WARP || n_used > n_expert || !weights || !x || !logits || !ticket ||
+        !ids || !w || !publish.x || !publish.host_x || !publish.host_ids || !publish.host_wts ||
+        !publish.ready || publish.x_count != rows * n_in)
+        return false;
+    const int threads = sum_threads(n_in);
+    // The last block needs a warp per row for routing; all supported router widths provide at least eight.
+    if (threads < rows * WARP) return false;
+    static const bool window_on = [] {
+        const char* value = std::getenv("STRATA_POLY_ROUTER_TOPK_WINDOW");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (window_on && rows >= 2) {
+        const int physical_threads = std::min(threads, 256);
+        const auto launch_window = [&](auto kernel) {
+            kernel<<<n_expert, physical_threads, 0, cs(stream)>>>(weights, x, logits, n_in, n_expert,
+                                                                   n_used, rows, threads, ticket, ids, w, publish);
+        };
+        if (rows <= 4) {
+            if (n_expert <= 2 * WARP) launch_window(router_f32_publish_window_kernel<2, 4>);
+            else if (n_expert <= 4 * WARP) launch_window(router_f32_publish_window_kernel<4, 4>);
+            else if (n_expert <= 8 * WARP) launch_window(router_f32_publish_window_kernel<8, 4>);
+            else launch_window(router_f32_publish_window_kernel<ROUTE_PER, 4>);
+        } else {
+            if (n_expert <= 2 * WARP) launch_window(router_f32_publish_window_kernel<2, 8>);
+            else if (n_expert <= 4 * WARP) launch_window(router_f32_publish_window_kernel<4, 8>);
+            else if (n_expert <= 8 * WARP) launch_window(router_f32_publish_window_kernel<8, 8>);
+            else launch_window(router_f32_publish_window_kernel<ROUTE_PER, 8>);
+        }
+        return true;
+    }
+    static const bool packed_on = [] {
+        const char* value = std::getenv("STRATA_POLY_ROUTER_TOPK_PACK");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (packed_on && threads > 256) {
+        const auto launch_packed = [&](auto kernel) {
+            kernel<<<dim3(n_expert, rows), 256, 0, cs(stream)>>>(weights, x, logits, n_in, n_expert,
+                                                                 n_used, rows, threads, ticket, ids, w, publish);
+        };
+        if (n_expert <= 2 * WARP) launch_packed(router_f32_publish_packed_kernel<2>);
+        else if (n_expert <= 4 * WARP) launch_packed(router_f32_publish_packed_kernel<4>);
+        else if (n_expert <= 8 * WARP) launch_packed(router_f32_publish_packed_kernel<8>);
+        else launch_packed(router_f32_publish_packed_kernel<ROUTE_PER>);
+        return true;
+    }
+    const auto launch = [&](auto kernel) {
+        kernel<<<dim3(n_expert, rows), threads, 0, cs(stream)>>>(weights, x, logits, n_in, n_expert,
+                                                                n_used, rows, ticket, ids, w, publish);
+    };
+    if (n_expert <= 2 * WARP) launch(router_f32_publish_kernel<2>);
+    else if (n_expert <= 4 * WARP) launch(router_f32_publish_kernel<4>);
+    else if (n_expert <= 8 * WARP) launch(router_f32_publish_kernel<8>);
+    else launch(router_f32_publish_kernel<ROUTE_PER>);
     return true;
 }
 

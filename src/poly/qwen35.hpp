@@ -40,6 +40,7 @@ protected:
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+    void router_scores(const Layer& L, int n) override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     bool route_card_publish(int il, int n, int32_t* ids, float* w, float* host_x,
                             int32_t* host_ids, float* host_wts, uint32_t* ready,
@@ -73,6 +74,7 @@ private:
         Dev sh_gate_inp;   ///< the shared expert's gate
     };
 
+    bool fused_router(const Layer& L, int n) const;
     void gdn(Block& B, int n);
     void attn(Block& B, int64_t pos, int n);
     void attn_rows(Block& B, int n);
@@ -100,6 +102,7 @@ private:
     float* awork_ = nullptr;   ///< a prompt batch's attention (attend_batch)
     float* q8w_ = nullptr;             ///< a q8 prompt batch's K and V blocks, dequantized to fp16 (kwork | vwork)
     size_t work_halves_ = 0;           ///< the halves of each of q8w_'s two halves (kQ8WorkRows rows at most)
+    uint32_t* router_ticket_ = nullptr;
     uint8_t* mtp_pack_ = nullptr;      ///< one bounded card-local staging buffer for packed MTP rows/source
 
 };
