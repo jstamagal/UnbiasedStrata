@@ -111,3 +111,9 @@ STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_ADAPT_OVERL
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_MTP_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_ADAPT_OVERLAP=1 STRATA_POLY_PCIE_FRAC=0 STRATA_POLY_PIPELINE_WINDOWS=2  # rebuilt: MTP graph accepts adaptive overlap and bypasses CPU-result waits on cached drafts, area C
 STRATA_POLY_Q35_ATTN_SET=1  # combine Q/K/V projections for 1-8-row attention windows, area E
 STRATA_POLY_Q35_KV_STORE_PAIR=1  # combine Q8_0 K/V stores using existing quantization arithmetic, area E
+
+STRATA_POLY_EXPERT_ACT_Q8=1  # fused routed activation and Q8_1 quantization in cached, partial/DMA, and MTP paths, area E
+STRATA_POLY_Q35_SHARED_SET=1  # combine shared gate/up projections for 2-8-row windows, area E
+STRATA_POLY_ADAPT_HEAP=1  # partial-sort adaptive swap candidates with the original stable ranking, area D
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PCIE_FRAC=0.25,0  # rebuilt: graph-owned DMA slot table prevents stale pointer use during abort, area A
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_ROLLBACK_GRAPH=1  # replay accepted pipeline prefixes as graphs; graph keys distinguish recurrent snapshot masks, areas B/C

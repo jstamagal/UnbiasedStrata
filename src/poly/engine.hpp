@@ -604,7 +604,8 @@ protected:
     uint8_t* h_dma_stage_ = nullptr;        ///< bounded pinned expert copies
     uint8_t* d_dma_stage_ = nullptr;
     void** h_dma_slots_ = nullptr;          ///< null except for copied experts
-    void** d_dma_slots_ = nullptr;
+    void** d_dma_slots_ = nullptr;          ///< incoming table, written on the DMA stream
+    void** d_dma_safe_slots_ = nullptr;     ///< graph-owned table, zeroed if DMA aborts
     size_t dma_slot_bytes_ = 0;
     static constexpr int kDmaSlots = 4;
     int dma_slots_cap_ = 0;
@@ -808,6 +809,7 @@ protected:
     float adapt_decay_ = -1.f;          ///< opt-in per-window decay; negative keeps the old token half-life
     std::vector<uint8_t> coming_;    ///< per (layer, expert): on its way into the cache
     std::vector<Pick> in_, out_;     ///< per trade number: the experts to bring in, and the ones to give up
+    std::vector<std::vector<Pick>> heap_in_, heap_out_;  ///< reusable opt-in candidate storage
     std::vector<size_t> trade_at_;   ///< per trade number: how many of its pairs follow() has taken
 
     int64_t pos_ = 0;

@@ -61,6 +61,14 @@ bool cache_layers_on() {
     return on;
 }
 
+bool expert_act_q8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_EXPERT_ACT_Q8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 bool partial_graph_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_PARTIAL_GRAPH");
@@ -86,6 +94,14 @@ bool adapt_overlap_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_ADAPT_OVERLAP");
         return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
+bool adapt_heap_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_ADAPT_HEAP");
+        return v && v[0] == '1' && v[1] == '\0';
     }();
     return on;
 }
@@ -1998,6 +2014,15 @@ void Engine::follow(int written) {
     const size_t most = (size_t) n_free;
     in_.assign((size_t) n_trade_ * most, Pick{});
     out_.assign((size_t) n_trade_ * most, Pick{});
+    const bool heap = adapt_heap_on();
+    if (heap) {
+        heap_in_.resize((size_t) n_trade_);
+        heap_out_.resize((size_t) n_trade_);
+        for (int c = 0; c < n_trade_; ++c) {
+            heap_in_[(size_t) c].clear();
+            heap_out_[(size_t) c].clear();
+        }
+    }
     // p to its place in a list, whose last one drops out; equals stay in the order they came
     const auto put = [most](Pick* list, const Pick& p, bool (*before)(const Pick&, const Pick&)) {
         if (list[most - 1].il >= 0 && !before(p, list[most - 1])) return;
@@ -2020,8 +2045,36 @@ void Engine::follow(int written) {
             const size_t i = (size_t) il * ne + (size_t) e;
             const float r = recent_[i];
             const int64_t p = prior_.empty() ? 0 : prior_[i];
-            if (L.slot[(size_t) e]) put(out, {il, e, r, p}, less);
-            else if (r >= kSwapMin && !coming_[i]) put(in, {il, e, r, p}, more);
+            if (L.slot[(size_t) e]) {
+                if (heap) heap_out_[(size_t) L.trade].push_back({il, e, r, p});
+                else put(out, {il, e, r, p}, less);
+            } else if (r >= kSwapMin && !coming_[i]) {
+                if (heap) heap_in_[(size_t) L.trade].push_back({il, e, r, p});
+                else put(in, {il, e, r, p}, more);
+            }
+        }
+    }
+    if (heap) {
+        // The old insertion keeps equals in traversal order.  il/e make that order explicit for partial_sort.
+        const auto ordered_more = [more](const Pick& a, const Pick& b) {
+            if (more(a, b)) return true;
+            if (more(b, a)) return false;
+            return a.il != b.il ? a.il < b.il : a.e < b.e;
+        };
+        const auto ordered_less = [less](const Pick& a, const Pick& b) {
+            if (less(a, b)) return true;
+            if (less(b, a)) return false;
+            return a.il != b.il ? a.il < b.il : a.e < b.e;
+        };
+        for (int c = 0; c < n_trade_; ++c) {
+            auto& incoming = heap_in_[(size_t) c];
+            auto& outgoing = heap_out_[(size_t) c];
+            const size_t ni = std::min(most, incoming.size());
+            const size_t no = std::min(most, outgoing.size());
+            std::partial_sort(incoming.begin(), incoming.begin() + ni, incoming.end(), ordered_more);
+            std::partial_sort(outgoing.begin(), outgoing.begin() + no, outgoing.end(), ordered_less);
+            std::copy_n(incoming.begin(), ni, in_.begin() + (size_t) c * most);
+            std::copy_n(outgoing.begin(), no, out_.begin() + (size_t) c * most);
         }
     }
 
@@ -2533,7 +2586,9 @@ void Engine::alloc() {
             h_dma_stage_ = (uint8_t*) hmalloc((size_t) dma_slots_cap_ * dma_slot_bytes_, "PCIe expert stage");
             h_dma_slots_ = (void**) hmalloc((size_t) n_expert_ * sizeof(void*), "PCIe expert slots");
             d_dma_slots_ = (void**) dmalloc((size_t) n_expert_ * sizeof(void*), "PCIe expert slots");
+            d_dma_safe_slots_ = (void**) dmalloc((size_t) n_expert_ * sizeof(void*), "PCIe graph expert slots");
             ck(cudaMemset(d_dma_slots_, 0, (size_t) n_expert_ * sizeof(void*)), "PCIe expert slots");
+            ck(cudaMemset(d_dma_safe_slots_, 0, (size_t) n_expert_ * sizeof(void*)), "PCIe graph expert slots");
             cudaStream_t dma = nullptr;
             ck(cudaStreamCreateWithFlags(&dma, cudaStreamNonBlocking), "PCIe copy stream");
             dma_st_ = dma;
@@ -2906,9 +2961,13 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 for (int j = 0; j < m && !one; ++j)
                     kernels::native_mmvq((int) L.gu_type, gate_up.w[j], gate_up.x[j], gate_up.y[j], n_embd_,
                                          2 * n_ff_exp_, 1, st_);
-                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
-                else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
-                kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
+                if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
+                    expert_activation_q8(g_, q8_, n_ff_exp_, m, limit, gelu_, st_);
+                else {
+                    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
+                    else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
+                    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
+                }
                 if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
                     for (int j = 0; j < m; ++j)
                         kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, n_embd_, 1,
@@ -2999,9 +3058,13 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
                                    2 * (size_t) n_ff_exp_};
     kernels::native_mmvq_ids((int) L.gu_type, gate_up, rr, n_embd_, 2 * n_ff_exp_, st_);
-    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
-    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
-    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
+    if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
+        expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
+    else {
+        if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
+        else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
+        kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
+    }
     const kernels::MmvqIds down{table, d_ids_, 2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
                                 (size_t) n_embd_};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
@@ -3426,6 +3489,12 @@ void Engine::run(const int32_t* tokens, int n) {
     // leave no snapshots of the recurrent state, so their launches are others.
     bool replay = opt_.graphs && n <= opt_.window && (windowed_ || n == 1) && !opt_.dump;
     for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
+    // A rollback's accepted prefix has no need to save intermediate GDN state. Keep it out of per-layer
+    // recordings made for ordinary windows, whose same-sized calls do need those snapshot writes.
+    const bool layer_replay = replay && (!windowed_ || snap_bits_ == snap_tokens(n));
+    const int snap_key = (int) snap_bits_;
+    const int snap_offset_key = snap_bits_ && snap_ && snap_at_ && rec_n_
+        ? (int) ((snap_at_ - snap_) / (ptrdiff_t) rec_n_) : 0;
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
@@ -3446,17 +3515,17 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto up = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         const size_t head = (size_t) head_key(il, m) * recs + rec;
-        if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
+        if (layer_replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
         else layer_head(L, il, m);
         if (!L.moe || batched(L, m)) return;
         router_record();
-        if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
+        if (layer_replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
     };
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         dbg("ffn", il, fo_, n_embd_);
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
+        if (layer_replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
 
@@ -3569,7 +3638,7 @@ void Engine::run(const int32_t* tokens, int n) {
             staged_.clear();
             dma_stage_synced_ = true;
         }
-        std::vector<int> key{-2, n, (int) with_head, (int) runahead};
+        std::vector<int> key{-2, n, (int) with_head, (int) runahead, snap_key, snap_offset_key};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
         if (!pass) {
@@ -3602,25 +3671,34 @@ void Engine::run(const int32_t* tokens, int n) {
                 const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_),
                                                n_used_, g_, 2 * (size_t) n_ff_exp_};
                 kernels::native_mmvq_ids_partial(2, gate_up, rr, n_embd_, 2 * n_ff_exp_, st_);
-                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
-                else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
-                kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
+                if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
+                    expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
+                else {
+                    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
+                    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
+                    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
+                }
                 const kernels::MmvqIds down{table, d_ids_, 2 * L.gu_bytes, q8_,
                                             kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 if (pcie_frac_ > 0.f) {
                     // The copy stream publishes word 3 only after both the expert bytes and its pointer table land.
-                    partial_graph_wait(partial_device_words_, partial_device_words_ + 3,
-                                       partial_device_words_ + 2, st_);
-                    const kernels::MmvqIds dma_gu{(const void* const*) d_dma_slots_, d_ids_, 0, xq_,
+                    partial_graph_wait_dma(partial_device_words_, partial_device_words_ + 3,
+                                           partial_device_words_ + 2, d_dma_slots_, d_dma_safe_slots_,
+                                           n_expert_, st_);
+                    const kernels::MmvqIds dma_gu{(const void* const*) d_dma_safe_slots_, d_ids_, 0, xq_,
                                                   kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
                                                   2 * (size_t) n_ff_exp_};
                     kernels::native_mmvq_ids_partial(2, dma_gu, rr, n_embd_, 2 * n_ff_exp_, st_);
-                    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
-                    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
-                    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
-                    const kernels::MmvqIds dma_down{(const void* const*) d_dma_slots_, d_ids_,
+                    if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
+                        expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
+                    else {
+                        if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
+                        else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
+                        kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
+                    }
+                    const kernels::MmvqIds dma_down{(const void* const*) d_dma_safe_slots_, d_ids_,
                         2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
                     kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
                     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
@@ -3815,7 +3893,7 @@ void Engine::run(const int32_t* tokens, int n) {
         whole = L.fixed && (!L.moe || L.card == 1);
     }
     if (whole) {
-        std::vector<int> key{n};
+        std::vector<int> key{n, snap_key, snap_offset_key};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
         if (!pass)
@@ -3844,7 +3922,7 @@ void Engine::run(const int32_t* tokens, int n) {
             int end = il + 1;
             while (end < hi_ && stage_ready(end)) ++end;
             if (end - il >= 2) {
-                std::vector<int> key{-1, n, il, end};
+                std::vector<int> key{-1, n, il, end, snap_key, snap_offset_key};
                 for (int j = il; j < end; ++j) key.push_back(head_key(j, n));
                 void*& pass = passes_[key];
                 if (!pass) pass = record([&] {
@@ -4591,7 +4669,17 @@ void Engine::keep(int n) {
             ck(cudaMemcpyAsync(state_, pipe_saved_[0], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
                "pipeline rollback");
             ck(cudaStreamSynchronize(cs(st_)), "pipeline rollback");
-            run(win_tok_, n);   // replay only the verified prefix from its original state
+            // The accepted prefix is a window-sized decode call, but needs no further recurrent snapshots.
+            // Let its graph run when asked; the canonical last card still keeps its own accepted rows below.
+            static const bool rollback_graph = [] {
+                const char* v = std::getenv("STRATA_POLY_ROLLBACK_GRAPH");
+                return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+            }();
+            const bool prior_windowed = windowed_;
+            if (rollback_graph) windowed_ = true;
+            try { run(win_tok_, n); }   // replay only the verified prefix from its original state
+            catch (...) { windowed_ = prior_windowed; throw; }
+            windowed_ = prior_windowed;
             pipe_ready_ = false;
             pipe_n_ = 0;
             ++pipe_rollbacks_;
@@ -4768,9 +4856,13 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 const kernels::MmvqIds gate_up{(const void* const*) d_mtp_slots_, d_ids_, 0, xq_,
                     kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_};
                 kernels::native_mmvq_ids_partial((int) L.gu_type, gate_up, n_used_, n_embd_, 2 * n_ff_exp_, st_);
-                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, n_used_, st_);
-                else swiglu_clamp_rows(g_, h_, n_ff_exp_, n_used_, clamp_exp_[(size_t) n_layer_], st_);
-                kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * n_used_, 1, st_);
+                if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
+                    expert_activation_q8(g_, q8_, n_ff_exp_, n_used_, clamp_exp_[(size_t) n_layer_], gelu_, st_);
+                else {
+                    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, n_used_, st_);
+                    else swiglu_clamp_rows(g_, h_, n_ff_exp_, n_used_, clamp_exp_[(size_t) n_layer_], st_);
+                    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * n_used_, 1, st_);
+                }
                 const kernels::MmvqIds down{(const void* const*) d_mtp_slots_, d_ids_, 2 * L.gu_bytes, q8_,
                     kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, n_used_, n_ff_exp_, n_embd_, st_);

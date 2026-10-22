@@ -671,7 +671,14 @@ void Qwen35::moe_shared(const Layer& L, int il, int n) {
         {(int) L.sh_gate.type, L.sh_gate.p, g_, (int) L.sh_gate.n_out},
         {(int) L.sh_up.type, L.sh_up.p, u_, (int) L.sh_up.n_out},
     };
-    if (n != 1 || !kernels::native_mmvq_set(shared_proj, 2, xq_, n_embd_, 1, st_)) {
+    static const bool shared_set_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_SHARED_SET");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const bool projected = n == 1 ? kernels::native_mmvq_set(shared_proj, 2, xq_, n_embd_, 1, st_) :
+        (shared_set_on && n >= 2 && n <= 8 && !opt_.dump &&
+         kernels::native_mmvq_set_explicit(shared_proj, 2, xq_, n_embd_, n, st_));
+    if (!projected) {
         lin(L.sh_gate, xn_, g_, n, xq_);
         lin(L.sh_up, xn_, u_, n, xq_);
     }
