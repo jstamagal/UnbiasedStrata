@@ -144,3 +144,4 @@ STRATA_POLY_ROUTER_TOPK=1 STRATA_POLY_ROUTER_TOPK_WINDOW=1  # reuse router weigh
 STRATA_POLY_Q35_ALPHA_BETA=1  # fused F32 projections and gate transforms for windows 1-8
 STRATA_POLY_EXPERT_ACT_Q8=1 STRATA_POLY_EXPERT_ACT_Q8_VEC4=1  # vectorized activation loads and packed Q8 stores
 STRATA_POLY_EXPERT_ACT_Q8=1 STRATA_POLY_EXPERT_ACT_Q8_SCALAR_THREADS=64  # scalar launch width 64/128/256, default 256
+STRATA_POLY_Q35_ALPHA_BETA=1 STRATA_POLY_Q35_ALPHA_BETA_PAIR=1  # share activation loads between both F32 projections

@@ -3,6 +3,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <stdexcept>
 #include "poly_q35_conv_norm_window.cuh"
 
@@ -64,6 +65,53 @@ __global__ void alpha_beta_kernel(const float* aw, const float* bw, const float*
         }
         (beta ? b : a)[(size_t) row * n_out + out] = sum;
     }
+}
+
+// Both projections share each activation load. Keep each dot product's lane stride, wave reduction,
+// and wave-partial summation identical to alpha_beta_kernel at the caller's thread count.
+template <bool Gates>
+__global__ void alpha_beta_pair_kernel(const float* aw, const float* bw, const float* x, const float* dt,
+                                       const float* ssm_a, float* a, float* b, int n_in, int n_out) {
+    __shared__ float part_a[32], part_b[32];
+    const int out = blockIdx.x, row = blockIdx.y;
+    const float* ar = aw + size_t(out) * n_in;
+    const float* br = bw + size_t(out) * n_in;
+    const float* xr = x + size_t(row) * n_in;
+    float alpha = 0.0f, beta = 0.0f;
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {
+        const float xi = xr[i];
+        alpha += ar[i] * xi;
+        beta += br[i] * xi;
+    }
+    alpha = q35_warp_sum(alpha);
+    beta = q35_warp_sum(beta);
+    if ((threadIdx.x & 31) == 0) {
+        part_a[threadIdx.x >> 5] = alpha;
+        part_b[threadIdx.x >> 5] = beta;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        alpha = beta = 0.0f;
+        for (int wave = 0; wave < int(blockDim.x) / 32; ++wave) {
+            alpha += part_a[wave];
+            beta += part_b[wave];
+        }
+        if constexpr (Gates) {
+            const float g = alpha + dt[out];
+            alpha = expf((g > 20.0f ? g : logf(1.0f + expf(g))) * ssm_a[out]);
+            beta = 1.0f / (1.0f + expf(-beta));
+        }
+        a[size_t(row) * n_out + out] = alpha;
+        b[size_t(row) * n_out + out] = beta;
+    }
+}
+
+bool alpha_beta_pair_on() {
+    static const bool on = [] {
+        const char* value = std::getenv("STRATA_POLY_Q35_ALPHA_BETA_PAIR");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return on;
 }
 
 __global__ void kv_store_pair_kernel(const float* __restrict__ key, const float* __restrict__ value,
@@ -153,15 +201,23 @@ __global__ void conv_norm1_kernel(const float* x, float* state, const float* w, 
 
 void qwen35_alpha_beta(const float* alpha_w, const float* beta_w, const float* x,
                        float* alpha, float* beta, int n_in, int n_out, int rows, int threads, void* stream) {
-    alpha_beta_kernel<false><<<dim3(n_out, rows, 2), threads, 0, (cudaStream_t) stream>>>(
-        alpha_w, beta_w, x, nullptr, nullptr, alpha, beta, n_in, n_out);
+    if (alpha_beta_pair_on())
+        alpha_beta_pair_kernel<false><<<dim3(n_out, rows), threads, 0, (cudaStream_t) stream>>>(
+            alpha_w, beta_w, x, nullptr, nullptr, alpha, beta, n_in, n_out);
+    else
+        alpha_beta_kernel<false><<<dim3(n_out, rows, 2), threads, 0, (cudaStream_t) stream>>>(
+            alpha_w, beta_w, x, nullptr, nullptr, alpha, beta, n_in, n_out);
 }
 
 void qwen35_alpha_beta_gates(const float* alpha_w, const float* beta_w, const float* x,
                              const float* dt, const float* a, float* alpha, float* beta,
                              int n_in, int n_out, int rows, int threads, void* stream) {
-    alpha_beta_kernel<true><<<dim3(n_out, rows, 2), threads, 0, (cudaStream_t) stream>>>(
-        alpha_w, beta_w, x, dt, a, alpha, beta, n_in, n_out);
+    if (alpha_beta_pair_on())
+        alpha_beta_pair_kernel<true><<<dim3(n_out, rows), threads, 0, (cudaStream_t) stream>>>(
+            alpha_w, beta_w, x, dt, a, alpha, beta, n_in, n_out);
+    else
+        alpha_beta_kernel<true><<<dim3(n_out, rows, 2), threads, 0, (cudaStream_t) stream>>>(
+            alpha_w, beta_w, x, dt, a, alpha, beta, n_in, n_out);
 }
 
 void qwen35_conv_norm1(const float* x, float* state, const float* w, float* out, int channels,
