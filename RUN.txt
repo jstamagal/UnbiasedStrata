@@ -101,3 +101,8 @@ STRATA_POLY_Q35_CONV_NORM_WINDOW=1  # built opt-in: convolution and Q/K normaliz
 STRATA_POLY_DIRECT_HANDOFF=1 --layer-split auto  # built opt-in: card1 uploads directly from pinned card0 handoff, removing the extra host memcpy (C)
 STRATA_POLY_PIN_EXPERTS=1  # rebuilt: reserve heuristic accounts for already-pinned split weights instead of charging model RAM twice (A/D)
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_CHAIN=1  # rebuilt: seed/preparation failures restore pre-window recurrent state and preserve the original error (C)
+
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_PCIE_FRAC=0 STRATA_POLY_ADAPT_OVERLAP=0  # skip CPU-result wait for fully cached layers; per-layer routing mailboxes, area B
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_MTP_GRAPH=1 STRATA_POLY_PCIE_FRAC=0 STRATA_POLY_ADAPT_OVERLAP=0 STRATA_POLY_PIPELINE_WINDOWS=2  # front-card MTP graph with CPU misses via doorbell, area C
+STRATA_POLY_Q35_GATES_WINDOW=1  # fused alpha/beta projection and gates for 2-8-row windows, area E
+STRATA_POLY_Q35_SHARED_GATE=1  # fused F32 shared gate dot and expert output scaling for 1-8 rows, area E

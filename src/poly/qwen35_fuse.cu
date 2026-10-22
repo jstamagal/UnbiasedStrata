@@ -65,6 +65,28 @@ __global__ void alpha_beta_kernel(const float* aw, const float* bw, const float*
     }
 }
 
+__global__ void shared_gate_kernel(const float* w, const float* x, float* gate_out,
+                                   float* expert_out, int n) {
+    __shared__ float part[32];
+    __shared__ float scale;
+    const int row = blockIdx.x;
+    const float* xr = x + (size_t) row * n;
+    float* yr = expert_out + (size_t) row * n;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += w[i] * xr[i];
+    acc = q35_warp_sum(acc);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.f;
+        for (int k = 0; k < blockDim.x / 32; ++k) sum += part[k];
+        gate_out[row] = sum;
+        scale = 1.f / (1.f + expf(-sum));
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] *= scale;
+}
+
 __global__ void conv_norm1_kernel(const float* x, float* state, const float* w, float* out, int dim,
                                   int k_heads, float eps, float* snap) {
     __shared__ float part[8];
@@ -114,6 +136,11 @@ void qwen35_conv_norm1(const float* x, float* state, const float* w, float* out,
                        int dim, int k_heads, float eps, float* snap, void* stream) {
     conv_norm1_kernel<<<channels / dim, dim, 0, (cudaStream_t) stream>>>(
         x, state, w, out, dim, k_heads, eps, snap);
+}
+
+void qwen35_shared_gate(const float* w, const float* x, float* gate, float* expert_out,
+                        int n, int rows, int threads, void* stream) {
+    shared_gate_kernel<<<rows, threads, 0, (cudaStream_t) stream>>>(w, x, gate, expert_out, n);
 }
 
 void qwen35_attn_gate_q8(float* att, const float* gate, void* q8, int heads, int dim, void* stream) {

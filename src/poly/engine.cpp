@@ -75,6 +75,13 @@ bool graph_head_on() {
     }();
     return on;
 }
+bool graph_runahead_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_GRAPH_RUNAHEAD");
+        return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool adapt_overlap_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_ADAPT_OVERLAP");
@@ -430,6 +437,8 @@ Engine::~Engine() {
     if (partial_host_words_) cudaFreeHost(partial_host_words_);
     if (h_partial_x_) cudaFreeHost(h_partial_x_);
     if (h_partial_cpu_) cudaFreeHost(h_partial_cpu_);
+    if (h_runahead_ready_) cudaFreeHost(h_runahead_ready_);
+    if (h_runahead_routes_) cudaFreeHost(h_runahead_routes_);
     if (h_partial_slots_) cudaFreeHost(h_partial_slots_);
     for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
@@ -2462,6 +2471,32 @@ void Engine::alloc() {
             h_partial_wts_ = (float*) ((uint8_t*) h_partial_ids_ + ids_bytes);
             d_partial_ids_ = (int32_t*) ((uint8_t*) d_partial_x_ + x_bytes);
             d_partial_wts_ = (float*) ((uint8_t*) d_partial_ids_ + ids_bytes);
+            if (graph_runahead_on() && pcie_frac_ == 0.f && !adapt_overlap_on()) {
+                runahead_route_stride_ = (size_t) kCpuRows * n_used_;
+                const size_t entries = (size_t) n_layer_ * runahead_route_stride_;
+#if defined(STRATA_USE_HIP)
+                constexpr unsigned flags = hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable;
+                ck(hipHostMalloc((void**) &h_runahead_ready_, (size_t) n_layer_ * sizeof(uint32_t), flags),
+                   "runahead route words");
+                ck(hipHostMalloc(&h_runahead_routes_, entries * (sizeof(int32_t) + sizeof(float)), flags),
+                   "runahead routes");
+#else
+                constexpr unsigned flags = cudaHostAllocMapped | cudaHostAllocPortable;
+                ck(cudaHostAlloc((void**) &h_runahead_ready_, (size_t) n_layer_ * sizeof(uint32_t), flags),
+                   "runahead route words");
+                ck(cudaHostAlloc(&h_runahead_routes_, entries * (sizeof(int32_t) + sizeof(float)), flags),
+                   "runahead routes");
+#endif
+                std::memset(h_runahead_ready_, 0, (size_t) n_layer_ * sizeof(uint32_t));
+                ck(cudaHostGetDevicePointer((void**) &d_runahead_ready_, h_runahead_ready_, 0),
+                   "runahead route words");
+                void* device_routes = nullptr;
+                ck(cudaHostGetDevicePointer(&device_routes, h_runahead_routes_, 0), "runahead routes");
+                h_runahead_ids_ = (int32_t*) h_runahead_routes_;
+                d_runahead_ids_ = (int32_t*) device_routes;
+                h_runahead_wts_ = (float*) (h_runahead_ids_ + entries);
+                d_runahead_wts_ = (float*) (d_runahead_ids_ + entries);
+            }
             if (adapt_overlap_on()) {
 #if defined(STRATA_USE_HIP)
                 ck(hipHostMalloc((void**) &h_partial_slots_, (size_t) n_expert_ * sizeof(void*),
@@ -3526,6 +3561,7 @@ void Engine::run(const int32_t* tokens, int n) {
     partial &= any_partial_layer;
     if (partial) {
         const bool with_head = graph_head_on() && windowed_ && !next_ && opt_.batch == 0;
+        const bool runahead = h_runahead_ready_ && pcie_frac_ == 0.f && !adapt_overlap_on();
         if (pcie_frac_ > 0.f && !dma_stage_synced_) {
             // A prompt may have left an upload on up_; the stage is now reserved for decode.
             ck(cudaStreamSynchronize(cs(up_)), "PCIe stage from prompt");
@@ -3533,7 +3569,7 @@ void Engine::run(const int32_t* tokens, int n) {
             staged_.clear();
             dma_stage_synced_ = true;
         }
-        std::vector<int> key{-2, n, (int) with_head};
+        std::vector<int> key{-2, n, (int) with_head, (int) runahead};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
         if (!pass) {
@@ -3547,8 +3583,16 @@ void Engine::run(const int32_t* tokens, int n) {
                 if (!route_card(il, n, d_ids_, d_wts_))
                     throw std::logic_error("partial graph needs device routing");
                 const int rr = n * n_used_;
-                partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
-                                      n * n_embd_, rr, partial_device_words_, st_);
+                if (runahead) {
+                    const size_t at = (size_t) il * runahead_route_stride_;
+                    partial_graph_publish_runahead(xn_, d_ids_, d_wts_, d_partial_x_,
+                                                   d_runahead_ids_ + at, d_runahead_wts_ + at,
+                                                   n * n_embd_, rr, partial_device_words_,
+                                                   d_runahead_ready_ + il, st_);
+                } else {
+                    partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
+                                          n * n_embd_, rr, partial_device_words_, st_);
+                }
                 moe_shared(L, il, n);
                 if (adapt_overlap_on())
                     partial_graph_wait(partial_device_words_, partial_device_words_ + 4,
@@ -3581,8 +3625,13 @@ void Engine::run(const int32_t* tokens, int n) {
                     kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
                     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 }
-                partial_graph_add(partial_device_words_, partial_device_words_ + 1,
-                                  partial_device_words_ + 2, d_partial_cpu_, fo_, n * n_embd_, st_);
+                if (runahead)
+                    partial_graph_add_cached(partial_device_words_, partial_device_words_ + 1,
+                                             partial_device_words_ + 2, table, d_ids_, rr, n_expert_,
+                                             d_partial_cpu_, fo_, n * n_embd_, st_);
+                else
+                    partial_graph_add(partial_device_words_, partial_device_words_ + 1,
+                                      partial_device_words_ + 2, d_partial_cpu_, fo_, n * n_embd_, st_);
                 layer_tail(L, il, n);
             }
             if (with_head) {
@@ -3614,10 +3663,15 @@ void Engine::run(const int32_t* tokens, int n) {
                 Layer& L = layers_[(size_t) il];
                 if (!L.moe) continue;
                 const uint32_t expected = ++partial_expected_;
+                const uint32_t* ready = runahead ? h_runahead_ready_ + il : partial_host_words_;
+                const int32_t* route_ids = runahead ? h_runahead_ids_ + (size_t) il * runahead_route_stride_
+                                                    : h_partial_ids_;
+                const float* route_wts = runahead ? h_runahead_wts_ + (size_t) il * runahead_route_stride_
+                                                   : h_partial_wts_;
                 const Clock::time_point wait_start = Clock::now();
                 auto next_driver_check = wait_start + std::chrono::milliseconds(50);
                 uint32_t spins = 0;
-                while (__atomic_load_n(partial_host_words_, __ATOMIC_ACQUIRE) != expected) {
+                while (__atomic_load_n(ready, __ATOMIC_ACQUIRE) != expected) {
 #if defined(__x86_64__) || defined(__i386__)
                     __builtin_ia32_pause();
 #else
@@ -3655,7 +3709,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     std::vector<int> missing;
                     missing.reserve((size_t) n * n_used_);
                     for (int j = 0; j < n * n_used_; ++j) {
-                        const int e = h_partial_ids_[j];
+                        const int e = route_ids[j];
                         if (e < 0 || e >= n_expert_) throw std::runtime_error("partial graph router invalid expert");
                         if (!L.slot[(size_t) e] && !seen[(size_t) e]) {
                             seen[(size_t) e] = 1;
@@ -3677,7 +3731,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 for (int row = 0; row < n; ++row)
                     for (int k = 0; k < n_used_; ++k) {
                         const int j = row * n_used_ + k;
-                        const int e = h_partial_ids_[j];
+                        const int e = route_ids[j];
                         if (e < 0 || e >= n_expert_) throw std::runtime_error("partial graph router invalid expert");
                         ++use_[(size_t) il * n_expert_ + (size_t) e];
                         if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + (size_t) e] += 1.f;
@@ -3685,7 +3739,7 @@ void Engine::run(const int32_t* tokens, int n) {
                         if (pcie_frac_ > 0.f && h_dma_slots_[(size_t) e]) { ++n_dma; continue; }
                         const size_t ie = (size_t) e;
                         host[n_host++] = {L.exp_gate + ie * L.gu_stride, L.exp_up + ie * L.gu_stride,
-                                          L.exp_down + ie * L.d_stride, h_partial_wts_[j], row};
+                                          L.exp_down + ie * L.d_stride, route_wts[j], row};
                     }
                 stats_.gpu_experts += n_gpu;
                 stats_.pcie_experts += n_dma;
@@ -3727,12 +3781,12 @@ void Engine::run(const int32_t* tokens, int n) {
                                 n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) il], gelu_, h_partial_cpu_,
                                 pcie_frac_ > 0.f && !pinned_experts_ ? &dma_launch : nullptr);
                 else {
-                    std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
+                    if (!runahead) std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
                     if (pcie_frac_ > 0.f && !pinned_experts_) dma_launch();
                 }
                 if (dma_failed) std::rethrow_exception(dma_failed);
                 stats_.cpu_ms += ms_since(cpu_start);
-                __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
+                if (!runahead || n_host) __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
             }
         } catch (...) {
             __atomic_store_n(partial_host_words_ + 2, 1u, __ATOMIC_RELEASE);
@@ -4649,6 +4703,146 @@ void Engine::draft_step(int32_t token, int i) {
     finish_logits(logits_, 1);
 }
 
+// One front-card MTP guess as a graph. Its single router uses the same mapped payload and CPU sum doorbell as a
+// partial verifier pass. The front card never runs a verifier window and this draft concurrently, so those buffers
+// and their sequence number can be shared without another allocation per guess.
+bool Engine::mtp_graph_draft(int32_t token, int i) {
+    static const bool asked = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_GRAPH");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!asked || !mtp_stage0_ || !partial_graph_on() || pcie_frac_ != 0.f || adapt_overlap_on() || opt_.dump ||
+        !partial_host_words_ || !h_partial_x_ || !h_partial_cpu_ || !d_ids_ || !d_wts_ ||
+        image_at(pos_ + i)) return false;
+    Layer& L = layers_[(size_t) n_layer_];
+    if (!L.moe || (int) L.gu_type != 2 || ((int) L.d_type != 2 && (int) L.d_type != 3) ||
+        !kernels::native_mmvq_ids_supported((int) L.gu_type) ||
+        !kernels::native_mmvq_ids_supported((int) L.d_type)) return false;
+
+    if (!h_mtp_slots_) {
+        h_mtp_slots_ = (void**) hmalloc((size_t) n_expert_ * sizeof(void*), "MTP graph expert slots");
+        d_mtp_slots_ = (void**) dmalloc((size_t) n_expert_ * sizeof(void*), "MTP graph expert slots");
+    }
+    std::copy(L.slot.begin(), L.slot.end(), h_mtp_slots_);
+    ck(cudaMemcpyAsync(d_mtp_slots_, h_mtp_slots_, (size_t) n_expert_ * sizeof(void*),
+                       cudaMemcpyHostToDevice, cs(st_)), "MTP graph expert slots");
+
+    // Only the token embedding upload is outside the graph. This path synchronizes at its end, so h_r_ is
+    // already free before the next guess and needs no per-guess host event wait.
+    const int64_t row = pos_ + i;
+    input(token, row, h_r_);
+    copy2(h_r_, cur_, n_embd_, nullptr, nullptr, 0, st_);
+    h_at_[0] = row;
+    h_at_[1] = turn(row);
+    copy2(h_at_, at_, 2 * (int) (sizeof(long long) / sizeof(float)), nullptr, nullptr, 0, st_);
+
+    std::vector<int> key{-3, room_key(i + 1), i == 0 ? 0 : 1};
+    void*& graph = passes_[key];
+    if (!graph) {
+        const int64_t original_pos = pos_;
+        pos_ = row;  // attention's captured room must include this guessed position
+        partial_capture_ = true;
+        try {
+            graph = record([&] {
+                const size_t e = (size_t) n_embd_;
+                float* own = hn_ + e;
+                const float* source = i == 0 ? hn_ : own;
+                rms_norm(cur_, fp(d_enorm_), r_, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
+                rms_norm(source, fp(d_hnorm_), r_ + e, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
+                float* x = r_ + 2 * e;
+                lin(d_proj_, r_, x, 1);
+                rms_norm(x, fp(L.attn_norm), xn_, n_embd_, 1, rms_eps_, st_);
+                kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+                block_attend(row, 1);
+                axpy(ao_, 1.f, x, n_embd_, true, st_);
+                rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
+                kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+                moe_router(L, 1);
+                if (!route_card(n_layer_, 1, d_ids_, d_wts_))
+                    throw std::logic_error("MTP graph needs device routing");
+                partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
+                                      n_embd_, n_used_, partial_device_words_, st_);
+                moe_shared(L, n_layer_, 1);
+                const kernels::MmvqIds gate_up{(const void* const*) d_mtp_slots_, d_ids_, 0, xq_,
+                    kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_};
+                kernels::native_mmvq_ids_partial((int) L.gu_type, gate_up, n_used_, n_embd_, 2 * n_ff_exp_, st_);
+                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, n_used_, st_);
+                else swiglu_clamp_rows(g_, h_, n_ff_exp_, n_used_, clamp_exp_[(size_t) n_layer_], st_);
+                kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * n_used_, 1, st_);
+                const kernels::MmvqIds down{(const void* const*) d_mtp_slots_, d_ids_, 2 * L.gu_bytes, q8_,
+                    kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
+                kernels::native_mmvq_ids_partial((int) L.d_type, down, n_used_, n_ff_exp_, n_embd_, st_);
+                moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, 1, st_);
+                partial_graph_add(partial_device_words_, partial_device_words_ + 1,
+                                  partial_device_words_ + 2, d_partial_cpu_, fo_, n_embd_, st_);
+                axpy(fo_, 1.f, x, n_embd_, true, st_);
+                rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
+                Dev head = output_;
+                head.n_out = draft_rows();
+                lin(head, own, logits_, 1);
+                finish_logits(logits_, 1);
+                likeliest(logits_, draft_rows(), h_guess_, st_);
+            });
+        } catch (...) {
+            partial_capture_ = false;
+            pos_ = original_pos;
+            throw;
+        }
+        partial_capture_ = false;
+        pos_ = original_pos;
+    }
+    tok_ = nullptr;
+    __atomic_store_n(partial_host_words_ + 2, 0u, __ATOMIC_RELEASE);
+    ck(cudaGraphLaunch((cudaGraphExec_t) graph, cs(st_)), "MTP graph");
+    try {
+        const uint32_t expected = ++partial_expected_;
+        const Clock::time_point start = Clock::now();
+        uint32_t spins = 0;
+        while (__atomic_load_n(partial_host_words_, __ATOMIC_ACQUIRE) != expected) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#else
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+            if ((++spins & 16383u) == 0 && Clock::now() - start > std::chrono::seconds(5))
+                throw std::runtime_error("MTP graph router timed out");
+        }
+        stats_.route_wait_ms += ms_since(start);
+        CpuExpert host[kMaxUsed];
+        int n_host = 0;
+        for (int k = 0; k < n_used_; ++k) {
+            const int e = h_partial_ids_[k];
+            if (e < 0 || e >= n_expert_) throw std::runtime_error("MTP graph router invalid expert");
+            ++use_[(size_t) n_layer_ * n_expert_ + (size_t) e];
+            if (n_swap_ > 0) recent_[(size_t) n_layer_ * n_expert_ + (size_t) e] += 1.f;
+            if (L.slot[(size_t) e]) {
+                ++stats_.gpu_experts;
+            } else {
+                const size_t ie = (size_t) e;
+                host[n_host++] = {L.exp_gate + ie * L.gu_stride, L.exp_up + ie * L.gu_stride,
+                                  L.exp_down + ie * L.d_stride, h_partial_wts_[k], 0};
+            }
+        }
+        stats_.cpu_experts += n_host;
+        const Clock::time_point cpu_start = Clock::now();
+        if (n_host)
+            cpu_experts(*workers_, host, n_host, 1, (int) L.gu_type, (int) L.d_type,
+                        n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) n_layer_], gelu_, h_partial_cpu_);
+        else std::fill_n(h_partial_cpu_, n_embd_, 0.f);
+        stats_.cpu_ms += ms_since(cpu_start);
+        __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
+        ck(cudaStreamSynchronize(cs(st_)), "MTP graph");
+    } catch (...) {
+        __atomic_store_n(partial_host_words_ + 2, 1u, __ATOMIC_RELEASE);
+        cudaStreamSynchronize(cs(st_));
+        partial_expected_ = __atomic_load_n(partial_host_words_, __ATOMIC_ACQUIRE);
+        __atomic_store_n(partial_host_words_ + 3, partial_expected_, __ATOMIC_RELEASE);
+        __atomic_store_n(partial_host_words_ + 4, partial_expected_, __ATOMIC_RELEASE);
+        throw;
+    }
+    return true;
+}
+
 void Engine::sync_mtp_stage0() {
     if (!mtp_stage0_ || !next_) return;
     auto* front = dynamic_cast<Qwen35*>(this);
@@ -4708,6 +4902,14 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     }
     cover(pos_ + i + 1);
     ck(cudaStreamSynchronize(cs(st_)), "draft");
+    if (mtp_graph_draft(token, i)) {
+        if (i == 0) {
+            ahead_pos_ = pos_;
+            ahead_tok_ = token;
+        }
+        *prob = h_guess_->prob;
+        return h_guess_->token;
+    }
     draft_step(token, i);
     // The guess and its probability are found on the card.  On the host a vocabulary's softmax takes up to 2 ms
     // where the block is unsure, four times what the block takes.

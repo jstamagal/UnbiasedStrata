@@ -449,6 +449,7 @@ protected:
     void shared_scratch();
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
     void draft_rows(const int32_t* tokens, int first, int n);
+    bool mtp_graph_draft(int32_t token, int i);
     void sync_mtp_stage0();
     const Image* image_at(int64_t row) const;
     bool input(int32_t token, int64_t row, float* dst) const;
@@ -565,6 +566,8 @@ protected:
     void* ev_row_[8] = {}; ///< one for each token a window can have
     float* pipe_saved_[2] = {};   ///< front card's recurrent state before current and predicted windows
     float* pipe_pass_[2] = {};    ///< distinct pinned handoffs while both cards run
+    void** h_mtp_slots_ = nullptr; ///< pinned expert pointers for the optional front-card MTP graph
+    void** d_mtp_slots_ = nullptr;
     std::vector<int32_t> pipe_tokens_;
     int pipe_n_ = 0, pipe_slot_ = 0;
     bool pipe_ready_ = false, pipe_inflight_ = false;
@@ -585,6 +588,14 @@ protected:
     float* d_partial_wts_ = nullptr;
     float* h_partial_cpu_ = nullptr;
     float* d_partial_cpu_ = nullptr;
+    uint32_t* h_runahead_ready_ = nullptr;       ///< one coherent route-ready word per layer
+    uint32_t* d_runahead_ready_ = nullptr;
+    void* h_runahead_routes_ = nullptr;          ///< stable per-layer IDs and weights while the GPU runs ahead
+    int32_t* h_runahead_ids_ = nullptr;
+    int32_t* d_runahead_ids_ = nullptr;
+    float* h_runahead_wts_ = nullptr;
+    float* d_runahead_wts_ = nullptr;
+    size_t runahead_route_stride_ = 0;
     void** h_partial_slots_ = nullptr;        ///< one coherent host slot row, published before cached MMVQ
     void** d_partial_slots_ = nullptr;
     double pcie_credit_ = 0.;               ///< fractional miss budget carried between layer plans

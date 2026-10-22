@@ -354,9 +354,14 @@ void Qwen35::gdn(Block& B, int n) {
         const char* v = std::getenv("STRATA_POLY_Q35_CONV_NORM_WINDOW");
         return v && v[0] == '1' && v[1] == '\0';
     }();
+    static const bool gates_window_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_GATES_WINDOW");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
     const bool conv_window = conv_window_on && n >= 2 && n <= 8 && s_dim_ == 128 && !rows_of_ && !opt_.dump;
     const bool conv_normed = (fuse && n == 1 && !opt_.dump) || conv_window;
-    const bool gates_fused = fuse && n == 1 && !opt_.dump &&
+    const bool gates_fused = !opt_.dump && ((fuse && n == 1) ||
+                             (gates_window_on && n >= 2 && n <= 8)) &&
                              B.alpha.type == kTypeF32 && B.beta.type == kTypeF32;
     if (gates_fused) {
         qwen35_alpha_beta_gates(fp(B.alpha), fp(B.beta), xn_, fp(B.dt), fp(B.a), alpha_, beta_, n_embd_,
@@ -662,8 +667,17 @@ void Qwen35::moe_shared(const Layer& L, int il, int n) {
         swiglu_clamp(g_, u_, h_, n * n_ff_shexp_, clamp_shexp_[(size_t) il], st_);
         lin(L.sh_down, h_, fo_, n);
     }
-    lin(blocks_[(size_t) il].sh_gate_inp, xn_, sg_, n);
-    mul_sigmoid(fo_, sg_, n_embd_, n, 1, true, st_);
+    static const bool shared_gate_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_SHARED_GATE");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (shared_gate_on && n <= 8 && !opt_.dump)
+        qwen35_shared_gate(fp(blocks_[(size_t) il].sh_gate_inp), xn_, sg_, fo_,
+                           n_embd_, n, sum_threads(n_embd_), st_);
+    else {
+        lin(blocks_[(size_t) il].sh_gate_inp, xn_, sg_, n);
+        mul_sigmoid(fo_, sg_, n_embd_, n, 1, true, st_);
+    }
 }
 
 // The draft block is one more attention layer.

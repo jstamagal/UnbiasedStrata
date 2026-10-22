@@ -19,6 +19,10 @@ void qwen35_conv_norm_window(const float* x, float* state, const float* w, float
                              int channels, int k_heads, int rows, float eps,
                              float* snap, size_t snap_stride, unsigned snaps, void* stream);
 
+// Dot the F32 shared-expert gate with each row, then apply its sigmoid to that row's output.
+void qwen35_shared_gate(const float* w, const float* x, float* gate, float* expert_out,
+                        int n, int rows, int threads, void* stream);
+
 // Apply the attention output gate and write its Q8_1 image in one launch.
 void qwen35_attn_gate_q8(float* att, const float* gate, void* q8, int heads, int dim, void* stream);
 
