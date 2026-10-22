@@ -94,6 +94,7 @@ __global__ void poly_dense_wave_kernel(const typename F::Block* __restrict__ w,
 }
 
 #include "poly_dense_q80_rows.cuh"
+#include "poly_dense_q40_rows.cuh"
 
 template<typename F>
 bool poly_dense_wave(const void* weights, const void* x, float* y,
@@ -115,6 +116,9 @@ bool poly_dense_wave(const void* weights, const void* x, float* y,
         if (!(ncols <= 4 ? enabled : wide)) return false;
         if constexpr (q80) {
             if (poly_dense_q80_rows(weights, x, y, n_in, n_out, ncols, stream)) return true;
+        }
+        if constexpr (q40) {
+            if (poly_dense_q40_rows(weights, x, y, n_in, n_out, ncols, stream)) return true;
         }
         const auto* w = static_cast<const typename F::Block*>(weights);
         const auto* q = static_cast<const Q81Block*>(x);
