@@ -84,3 +84,11 @@ STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_TRACE=1 --max-context 262144
 STRATA_POLY_PARTIAL_GRAPH=1 --max-context 262144  # rebuilt: GPU CPU-ready wait plus mapped-result accumulation fused into one kernel, one fewer launch/layer
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_TRACE=1 --max-context 262144  # built opt-in: card0 drafts while card1 verifies; canonical MTP KV mirrored incrementally; duplicate head/MTP storage consumes VRAM
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 --max-context 262144  # rebuilt: card1 retains canonical MTP KV/projection only; unused draft MoE experts and dense weights no longer consume its VRAM cache
+STRATA_POLY_PIN_EXPERTS=1 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PCIE_FRAC=0.25,0 --max-context 262144  # built: full mapped pinned expert records per card; CPU reads in place, selected DMA issued immediately, swaps upload directly (A)
+STRATA_POLY_PROFILE_ACCUM=/home/admin/work/lanes/ub/ornith-swe.profile  # built: accumulate routing from coordinator SWE/coding runs without changing cache seeding; later use --expert-profile with this file (D)
+STRATA_POLY_ADAPT_EVERY=1  # built: select adaptive swaps every decode window (D)
+STRATA_POLY_ADAPT_DECAY=0.97  # built: per-window decay for conversation routing counts (D)
+STRATA_POLY_ADAPT_SWAPS=160  # built: in-flight swap capacity override, supported range 0..256 (D)
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_TAIL_NEXT_NORM=1 --max-context 262144  # built: fold interior layer residual add into next input norm/Q8 quantization, one fewer launch/interior layer (B/E)
+STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 --max-context 262144  # rebuilt: draft-only head prefix on card0; packed canonical MTP KV plus hidden row transfer, one copy per direction (C)
+STRATA_POLY_HEAD_WIDE=1 STRATA_POLY_HEAD_WIDE_GRID=8192  # built opt-in: more Q6_K head workgroups and no unused final-row prefetch; default grid unchanged (E)

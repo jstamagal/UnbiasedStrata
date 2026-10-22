@@ -23,6 +23,16 @@ constexpr size_t kScoreFloats = size_t(16) << 20;  // the attention's scores of 
 // about 16/3 * head_dim rows, well under this, so real prompts take the same products the fp16 path takes.
 constexpr size_t kQ8WorkRows = 2048;
 
+// Within a whole-stage partial graph, carry an interior layer's routed sum into
+// the next layer's residual-add + input norm + Q8_1 launch.
+bool tail_next_norm_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_TAIL_NEXT_NORM");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 }  // namespace
 
 void Qwen35::begin_pass() {
@@ -213,42 +223,42 @@ size_t Qwen35::mtp_row_bytes() const {
 
 void Qwen35::mtp_download_rows(int64_t first, int n, uint8_t* dst) {
     const Block& B = blocks_[(size_t) n_layer_];
+    if (n < 0 || n > 256) throw std::logic_error("MTP handoff takes at most 256 rows");
+    const size_t bytes = (size_t) n * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float);
+    if (!mtp_pack_) mtp_pack_ = (uint8_t*) dmalloc(256 * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float),
+                                                   "MTP packed handoff");
     if (opt_.kv_format == KvFmt::kQ8_0) {
         const size_t c = (size_t) n_kv_ * head_dim_, s = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
-        for (const auto& part : {std::pair<const void*, size_t>{B.k_codes, c}, {B.k_scales, s},
-                                 {B.v_codes, c}, {B.v_scales, s}}) {
-            ck(cudaMemcpyAsync(dst, (const uint8_t*) part.first + (size_t) first * part.second,
-                               (size_t) n * part.second, cudaMemcpyDeviceToHost, cs(st_)), "MTP row handoff");
-            dst += (size_t) n * part.second;
-        }
+        mtp_pack_rows(B.k_codes + (size_t) first * c, (const uint8_t*) B.k_scales + (size_t) first * s,
+                      B.v_codes + (size_t) first * c, (const uint8_t*) B.v_scales + (size_t) first * s,
+                      hn_, mtp_pack_, (size_t) n * c, (size_t) n * s, (size_t) n_embd_ * sizeof(float), st_);
     } else {
         const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
-        for (const void* cache : {B.keys, B.vals}) {
-            ck(cudaMemcpyAsync(dst, (const uint8_t*) cache + (size_t) first * row,
-                               (size_t) n * row, cudaMemcpyDeviceToHost, cs(st_)), "MTP row handoff");
-            dst += (size_t) n * row;
-        }
+        mtp_pack_rows((const uint8_t*) B.keys + (size_t) first * row, nullptr,
+                      (const uint8_t*) B.vals + (size_t) first * row, nullptr,
+                      hn_, mtp_pack_, (size_t) n * row, 0, (size_t) n_embd_ * sizeof(float), st_);
     }
+    ck(cudaMemcpyAsync(dst, mtp_pack_, bytes, cudaMemcpyDeviceToHost, cs(st_)), "MTP row handoff");
     ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
 }
 
 void Qwen35::mtp_upload_rows(int64_t first, int n, const uint8_t* src) {
     Block& B = blocks_[(size_t) n_layer_];
+    if (n < 0 || n > 256) throw std::logic_error("MTP handoff takes at most 256 rows");
+    const size_t bytes = (size_t) n * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float);
+    if (!mtp_pack_) mtp_pack_ = (uint8_t*) dmalloc(256 * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float),
+                                                   "MTP packed handoff");
+    ck(cudaMemcpyAsync(mtp_pack_, src, bytes, cudaMemcpyHostToDevice, cs(st_)), "MTP row handoff");
     if (opt_.kv_format == KvFmt::kQ8_0) {
         const size_t c = (size_t) n_kv_ * head_dim_, s = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
-        for (const auto& part : {std::pair<void*, size_t>{B.k_codes, c}, {B.k_scales, s},
-                                 {B.v_codes, c}, {B.v_scales, s}}) {
-            ck(cudaMemcpyAsync((uint8_t*) part.first + (size_t) first * part.second, src,
-                               (size_t) n * part.second, cudaMemcpyHostToDevice, cs(st_)), "MTP row handoff");
-            src += (size_t) n * part.second;
-        }
+        mtp_unpack_rows(mtp_pack_, B.k_codes + (size_t) first * c, (uint8_t*) B.k_scales + (size_t) first * s,
+                        B.v_codes + (size_t) first * c, (uint8_t*) B.v_scales + (size_t) first * s,
+                        hn_, (size_t) n * c, (size_t) n * s, (size_t) n_embd_ * sizeof(float), st_);
     } else {
         const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
-        for (void* cache : {B.keys, B.vals}) {
-            ck(cudaMemcpyAsync((uint8_t*) cache + (size_t) first * row, src,
-                               (size_t) n * row, cudaMemcpyHostToDevice, cs(st_)), "MTP row handoff");
-            src += (size_t) n * row;
-        }
+        mtp_unpack_rows(mtp_pack_, (uint8_t*) B.keys + (size_t) first * row, nullptr,
+                        (uint8_t*) B.vals + (size_t) first * row, nullptr,
+                        hn_, (size_t) n * row, 0, (size_t) n_embd_ * sizeof(float), st_);
     }
     ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
 }
@@ -560,9 +570,11 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
         return v && std::atoi(v) == 1;
     }();
     const bool quick = fuse && n <= 8 && !opt_.dump;
-    if (quick)
-        kernels::native_add_rms_norm_q8_1(r_, nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, n, rms_eps_,
-                                           sum_threads(n_embd_), st_);
+    const bool carried = tail_next_norm_on() && partial_capture_ && n <= 8 && !opt_.dump &&
+                         il > lo_ && layers_[(size_t) il - 1].moe;
+    if (quick || carried)
+        kernels::native_add_rms_norm_q8_1(r_, carried ? fo_ : nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, n,
+                                           rms_eps_, sum_threads(n_embd_), st_);
     else {
         rms_norm(r_, fp(L.attn_norm), xn_, n_embd_, n, rms_eps_, st_);
         kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
@@ -583,7 +595,10 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
     if (!batched(L, n)) moe_router(L, n);
 }
 
-void Qwen35::layer_tail(Layer&, int, int n) { axpy(fo_, 1.f, r_, n * n_embd_, true, st_); }
+void Qwen35::layer_tail(Layer&, int il, int n) {
+    if (tail_next_norm_on() && partial_capture_ && n <= 8 && !opt_.dump && il + 1 < hi_) return;
+    axpy(fo_, 1.f, r_, n * n_embd_, true, st_);
+}
 
 void Qwen35::output_rows(int first, int rows, float* h) {
     rms_norm(r_ + (size_t) first * n_embd_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);

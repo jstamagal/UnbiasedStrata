@@ -115,6 +115,7 @@ struct Layer {
     size_t gu_bytes = 0, d_bytes = 0;  ///< one expert's gate (or up), and its down
     size_t gu_stride = 0;              ///< from an expert's gate to the next one's: twice gu_bytes in a file that
                                        ///< keeps an expert's gate and up in one tensor
+    size_t d_stride = 0;              ///< source stride; differs from d_bytes in a pinned expert arena
     std::vector<uint8_t*> slot;        ///< per expert: gate | up | down in VRAM, or null
     size_t slot_bytes = 0;             ///< from a slot of the layer to the one behind it: whole blocks of both types
     std::vector<int32_t> ahead;        ///< experts a full prompt batch stages before it routes
@@ -433,6 +434,7 @@ protected:
     enum Want { kF32, kFloatMat, kAnyMat, kGuessMat };
     Dev upload(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                float (*fix)(float) = nullptr);
+    Dev upload_head_prefix(const TensorInfo* t, const std::string& name);
     const TensorInfo* tensor(int il, const char* name) const;
     const Shards& home(const TensorInfo& t) const;
     const MetaValue* meta_in(const Shards& g, const char* key) const;
@@ -441,6 +443,7 @@ protected:
     float shape_f(const char* key) const;
     void load_shape();
     void load_moe(int il, bool shared = true);
+    void pin_experts();
     void alloc();
     void shared_scratch();
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
@@ -596,6 +599,8 @@ protected:
     void router_record();
     void router_wait();
     std::vector<void*> dev_allocs_, host_allocs_;
+    uint8_t* pinned_experts_ = nullptr;
+    size_t pinned_expert_bytes_ = 0;
     std::vector<void*> graphs_;   ///< every recorded graph, to destroy
     std::map<std::vector<int>, void*> passes_;   ///< a call's layers recorded as one (run()): by its tokens and
                                                  ///< every layer's head_key()
@@ -783,6 +788,8 @@ protected:
     bool swap_quit_ = false;
     std::string swap_error_;         ///< why the thread stopped; follow() throws it
     std::vector<float> recent_;      ///< per (layer, expert): its uses by written tokens, halved every kSwapHalf
+    int adapt_every_ = 1, adapt_rounds_ = 0;  ///< opt-in swap-selection cadence, in decode windows
+    float adapt_decay_ = -1.f;          ///< opt-in per-window decay; negative keeps the old token half-life
     std::vector<uint8_t> coming_;    ///< per (layer, expert): on its way into the cache
     std::vector<Pick> in_, out_;     ///< per trade number: the experts to bring in, and the ones to give up
     std::vector<size_t> trade_at_;   ///< per trade number: how many of its pairs follow() has taken
@@ -792,6 +799,8 @@ protected:
     std::vector<Image> images_;          ///< the sequence's pictures, by row
     uint64_t images_set_ = 0;            ///< counts images(): what was derived from an earlier list is stale
     std::vector<int64_t> use_, prior_;   ///< routed count per (layer, expert): this run, and the profile's
+    std::string profile_accum_;          ///< optional separate workload profile, never used to seed this run
+    std::vector<int64_t> profile_accum_prior_;
     Stats stats_;
 };
 

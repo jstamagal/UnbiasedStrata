@@ -14,6 +14,13 @@
 
 namespace strata::poly {
 
+// Pack/unpack one draft attention layer's Q8_0 K/V rows (or FP16 rows with scale_bytes=0) and the
+// preceding full-model output into one bounded cross-card transfer. All pointers are on the current card.
+void mtp_pack_rows(const void* kc, const void* ks, const void* vc, const void* vs, const float* source,
+                   uint8_t* packed, size_t code_bytes, size_t scale_bytes, size_t source_bytes, void* stream);
+void mtp_unpack_rows(const uint8_t* packed, void* kc, void* ks, void* vc, void* vs, float* source,
+                     size_t code_bytes, size_t scale_bytes, size_t source_bytes, void* stream);
+
 /// y[o] = sum_i w[o * n_in + i] * x[(o / rows_per_x) * n_in + i], o in [0, n_out).  With rows_per_x == n_out it is
 /// a plain matrix-vector product; a smaller value gives each group of rows its own input (the per-head MLA
 /// projections), so a token's x is n_in * n_out / rows_per_x long.

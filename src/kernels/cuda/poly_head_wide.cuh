@@ -116,7 +116,7 @@ __device__ __forceinline__ int poly_head_load_i32(const uint8_t* p) {
     __builtin_memcpy(&v, p, 4);
     return v;
 }
-template <int NC>
+template <int NC, bool GUARD_FINAL_PREFETCH = false>
 __launch_bounds__(128)
 __global__ void poly_head_q6k_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
                                       int n_out, int row_step) {
@@ -167,7 +167,8 @@ __global__ void poly_head_q6k_kernel(const uint8_t* __restrict__ w, const Q81Blo
     }
     int buf = 0;
     for (; row < n_out; row += row_step, buf ^= 1) {
-        const int next = row + row_step < n_out ? row + row_step : row;
+        const bool has_next = row + row_step < n_out;
+        const int next = has_next ? row + row_step : row;
         const uint8_t* wn = w + std::size_t(next) * (kPolyHeadBlocks * kPolyHeadBlockBytes) + wave * kPolyHeadBlockBytes;
         float tmp[NC];
 #pragma unroll
@@ -181,7 +182,7 @@ __global__ void poly_head_q6k_kernel(const uint8_t* __restrict__ w, const Q81Blo
                 const float d = __half2float(rd[s]);
                 const int vi0 = int((uint32_t((vl & 0x0f0f0f0f) | ((vh << 4) & 0x30303030)) + 0x60606060u) ^ 0x80808080u);
                 const int vi1 = int((uint32_t(((vl >> 4) & 0x0f0f0f0f) | (vh & 0x30303030)) + 0x60606060u) ^ 0x80808080u);
-                {
+                if (!GUARD_FINAL_PREFETCH || has_next) {
                     const uint8_t* wb = wn + s * (4 * kPolyHeadBlockBytes);
                     rl[s] = poly_head_load_i32(wb + lane_ql);
                     rh[s] = poly_head_load_i32(wb + lane_qh);
@@ -231,9 +232,18 @@ inline bool poly_head_wide_enabled(int n_in, int n_out, int ncols) {
     return on && n_in == kPolyHeadIn && n_out >= 65536 && ncols == 1;
 }
 inline void poly_head_wide(const void* weights, const void* x, float* y, int n_out, cudaStream_t stream) {
-    constexpr int grid = 4096;
-    poly_head_q6k_kernel<1><<<grid, dim3(32, 4), 0, stream>>>(
-        static_cast<const uint8_t*>(weights), static_cast<const Q81Block*>(x), y, n_out, grid);
+    static const int requested_grid = [] {
+        const char* v = std::getenv("STRATA_POLY_HEAD_WIDE_GRID");
+        const int parsed = v ? std::atoi(v) : 0;
+        return parsed > 0 ? std::max(256, std::min(16384, parsed)) : 0;
+    }();
+    const int grid = requested_grid ? std::min(n_out, requested_grid) : 4096;
+    const auto* w = static_cast<const uint8_t*>(weights);
+    const auto* q = static_cast<const Q81Block*>(x);
+    if (requested_grid)
+        poly_head_q6k_kernel<1, true><<<grid, dim3(32, 4), 0, stream>>>(w, q, y, n_out, grid);
+    else
+        poly_head_q6k_kernel<1><<<grid, dim3(32, 4), 0, stream>>>(w, q, y, n_out, grid);
 }
 #else
 inline bool poly_head_wide_enabled(int, int, int) { return false; }

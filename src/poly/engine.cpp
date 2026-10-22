@@ -1148,6 +1148,7 @@ void Engine::load_moe(int il, bool shared) {
     const TensorInfo& td = exps("ffn_down_exps.weight", n_ff_exp_, n_embd_);
     L.d_type = td.type;
     L.d_bytes = home(td).payload(td) / (size_t) n_expert_;
+    L.d_stride = L.d_bytes;
     L.exp_down = home(td).data(td);
     if (tensor(il, "ffn_gate_up_exps.weight")) {
         const TensorInfo& gu = exps("ffn_gate_up_exps.weight", n_embd_, 2 * n_ff_exp_);
@@ -1173,6 +1174,45 @@ void Engine::load_moe(int il, bool shared) {
         throw std::runtime_error(blk(il, "ffn_*_exps.weight: ") + err);
     L.slot.assign((size_t) n_expert_, nullptr);
     ++n_moe_;
+}
+
+// Pack every expert once. CPU kernels and the copy engine then read the same pinned records.
+void Engine::pin_experts() {
+    const char* enabled = std::getenv("STRATA_POLY_PIN_EXPERTS");
+    if (!enabled || std::strcmp(enabled, "1") != 0) return;
+    size_t bytes = 0;
+    for (const Layer& L : layers_)
+        if (L.moe) bytes += (size_t) n_expert_ * ((2 * L.gu_bytes + L.d_bytes + kTail + 255) & ~(size_t) 255);
+    if (!bytes) return;
+    void* arena = nullptr;
+#if defined(STRATA_USE_HIP)
+    ck(hipHostMalloc(&arena, bytes, hipHostMallocMapped | hipHostMallocPortable), "full pinned expert arena");
+#else
+    ck(cudaHostAlloc(&arena, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "full pinned expert arena");
+#endif
+    host_allocs_.push_back(arena);
+    pinned_experts_ = (uint8_t*) arena;
+    pinned_expert_bytes_ = bytes;
+    uint8_t* at = pinned_experts_;
+    for (Layer& L : layers_) {
+        if (!L.moe) continue;
+        const size_t payload = 2 * L.gu_bytes + L.d_bytes;
+        const size_t stride = (payload + kTail + 255) & ~(size_t) 255;
+        for (int e = 0; e < n_expert_; ++e) {
+            uint8_t* record = at + (size_t) e * stride;
+            std::memcpy(record, L.exp_gate + (size_t) e * L.gu_stride, L.gu_bytes);
+            std::memcpy(record + L.gu_bytes, L.exp_up + (size_t) e * L.gu_stride, L.gu_bytes);
+            std::memcpy(record + 2 * L.gu_bytes, L.exp_down + (size_t) e * L.d_stride, L.d_bytes);
+            std::memset(record + payload, 0, stride - payload);
+        }
+        L.exp_gate = at;
+        L.exp_up = at + L.gu_bytes;
+        L.exp_down = at + 2 * L.gu_bytes;
+        L.gu_stride = L.d_stride = stride;
+        at += (size_t) n_expert_ * stride;
+    }
+    std::fprintf(stderr, "strata-poly: card %d full pinned expert arena %.3f GiB\n",
+                 device_, double(bytes) / (1ull << 30));
 }
 
 // The engine for a model file: its general.architecture says which.
@@ -1392,6 +1432,25 @@ Dev Engine::upload(const TensorInfo* t, const std::string& name, int64_t n_in, i
     return d;
 }
 
+// A front-stage drafter scores only the vocabulary's configured prefix. GGUF matrix rows are contiguous for
+// native formats, so keep that prefix beside the drafter and leave the full target head on the last card.
+Dev Engine::upload_head_prefix(const TensorInfo* t, const std::string& name) {
+    const int rows = draft_rows();
+    if (!t || rows >= n_vocab_ || t->shape.size() != 2 || (int64_t) t->shape[0] != n_embd_ ||
+        (int64_t) t->shape[1] != n_vocab_ || !kernels::native_mmvq_supported((int) t->type))
+        return upload(t, name, n_embd_, n_vocab_, kAnyMat);
+    const size_t row = ggml_row_size((ggml_type) t->type, n_embd_);
+    if (home(*t).payload(*t) != row * (size_t) n_vocab_)
+        return upload(t, name, n_embd_, n_vocab_, kAnyMat);
+    const size_t bytes = row * (size_t) rows;
+    const Dev d{dense_ ? dense_ + dense_at_ : nullptr, t->type, n_embd_, rows};
+    dense_at_ += pad(bytes) + kTail;
+    if (!dense_) return d;
+    if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for " + t->name);
+    h2d(d.p, home(*t).data(*t), bytes);
+    return d;
+}
+
 int64_t Engine::vram_free_mib() const {
     OnCard here(device_, split_);
     size_t free_b = 0, total_b = 0;
@@ -1539,7 +1598,7 @@ void Engine::fill_expert_cache() {
         const size_t e = (size_t) c.e;
         h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
         h2d(s + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-        h2d(s + 2 * L.gu_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+        h2d(s + 2 * L.gu_bytes, L.exp_down + e * L.d_stride, L.d_bytes);
         L.slot[e] = s;
         ++cached_;
     }
@@ -1576,7 +1635,7 @@ void Engine::start_swaps() {
     swap_st_ = up;
     for (; n_swap_ < opt_.expert_swaps; ++n_swap_) {
         Swap& s = swap_[(size_t) n_swap_];
-        s.pinned = (uint8_t*) hmalloc(slot_max_, "pinned memory");
+        if (!pinned_experts_) s.pinned = (uint8_t*) hmalloc(slot_max_, "pinned memory");
         ck(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming), "cudaEventCreate");
     }
     recent_.assign(use_.size(), 0.f);
@@ -1753,7 +1812,7 @@ int Engine::grow_cache(size_t bytes) {
         const size_t e = (size_t) c.e;
         h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
         h2d(s + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-        h2d(s + 2 * L.gu_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+        h2d(s + 2 * L.gu_bytes, L.exp_down + e * L.d_stride, L.d_bytes);
         L.slot[e] = s;
         ++cached_;
     }
@@ -1775,7 +1834,7 @@ void Engine::plan_ahead(Layer& L, int il) {
     L.ahead.resize(std::min(L.ahead.size(), stage_bytes_ / (2 * L.gu_bytes + L.d_bytes)));
 }
 
-// The follower: an asked-for expert goes from the mapped file to its pinned buffer, and from there to its slot.
+// The follower: an asked-for expert goes from the pinned arena (or a mapped file via a pinned buffer) to its slot.
 // The file may have to be read for it, which is why this is not the engine's thread.
 void Engine::follow_loop() {
     cudaSetDevice(device_);   // a thread starts on card 0
@@ -1826,10 +1885,14 @@ void Engine::follow_loop() {
         lk.unlock();
         const Layer& L = layers_[(size_t) s->il];
         const size_t e = (size_t) s->e, gu = L.gu_bytes;
-        std::memcpy(s->pinned, L.exp_gate + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + gu, L.exp_up + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + 2 * gu, L.exp_down + e * L.d_bytes, L.d_bytes);
-        cudaError_t err = cudaMemcpyAsync(s->slot, s->pinned, 2 * gu + L.d_bytes, cudaMemcpyHostToDevice, cs(swap_st_));
+        const uint8_t* src = L.exp_gate + e * L.gu_stride;
+        if (!pinned_experts_) {
+            std::memcpy(s->pinned, src, gu);
+            std::memcpy(s->pinned + gu, L.exp_up + e * L.gu_stride, gu);
+            std::memcpy(s->pinned + 2 * gu, L.exp_down + e * L.d_stride, L.d_bytes);
+            src = s->pinned;
+        }
+        cudaError_t err = cudaMemcpyAsync(s->slot, src, 2 * gu + L.d_bytes, cudaMemcpyHostToDevice, cs(swap_st_));
         if (err == cudaSuccess) err = cudaEventRecord(s->done, cs(swap_st_));
         lk.lock();
         if (err != cudaSuccess) {
@@ -1889,8 +1952,11 @@ void Engine::follow(int written) {
     int n_free = 0;
     for (int j = 0; j < n_swap_; ++j) n_free += swap_[(size_t) j].at.load() == Swap::kFree;
     if (written <= 0) return;
-    const float keep = std::exp2(-(float) written / (float) kSwapHalf);
+    const float keep = adapt_decay_ >= 0.f ? adapt_decay_ :
+                       std::exp2(-(float) written / (float) kSwapHalf);
     for (float& r : recent_) r *= keep;
+    if (++adapt_rounds_ < adapt_every_) return;
+    adapt_rounds_ = 0;
     if (n_free == 0) return;
 
     // One pass over the experts lists, for each slot size, the ones that may come in, the most used first, and
@@ -1969,13 +2035,38 @@ void Engine::follow(int written) {
 void Engine::load(const Options& o) {
     opt_ = o;
     asked_reserve_mib_ = o.vram_reserve_mib;
+    if (const char* v = std::getenv("STRATA_POLY_PROFILE_ACCUM"); v && *v)
+        profile_accum_ = v;
+    int swap_limit = 64;
+    if (const char* v = std::getenv("STRATA_POLY_ADAPT_SWAPS"); v && *v) {
+        char* end = nullptr;
+        const long value = std::strtol(v, &end, 10);
+        if (end == v || *end != '\0' || value < 0 || value > 256)
+            throw std::runtime_error("STRATA_POLY_ADAPT_SWAPS must be 0 to 256");
+        opt_.expert_swaps = (int) value;
+        swap_limit = 256;
+    }
+    if (const char* v = std::getenv("STRATA_POLY_ADAPT_EVERY"); v && *v) {
+        char* end = nullptr;
+        const long value = std::strtol(v, &end, 10);
+        if (end == v || *end != '\0' || value < 1 || value > 1024)
+            throw std::runtime_error("STRATA_POLY_ADAPT_EVERY must be 1 to 1024");
+        adapt_every_ = (int) value;
+    }
+    if (const char* v = std::getenv("STRATA_POLY_ADAPT_DECAY"); v && *v) {
+        char* end = nullptr;
+        const float value = std::strtof(v, &end);
+        if (end == v || *end != '\0' || !std::isfinite(value) || value <= 0.f || value > 1.f)
+            throw std::runtime_error("STRATA_POLY_ADAPT_DECAY must be above 0 and at most 1");
+        adapt_decay_ = value;
+    }
     if (opt_.max_context < 16) throw std::runtime_error("the context must be at least 16 tokens");
     if (opt_.prompt_batch < 1 || opt_.prompt_batch > 4096)
         throw std::runtime_error("a prompt batch is 1 to 4096 tokens");
     if (opt_.stage_mib < 1) throw std::runtime_error("the staging buffer must be at least 1 MiB");
     if (opt_.stage_ahead < 0) throw std::runtime_error("the batch size to stage ahead from cannot be negative");
-    if (opt_.expert_swaps < 0 || opt_.expert_swaps > 64)
-        throw std::runtime_error("0 to 64 experts can be on their way into the cache at a time");
+    if (opt_.expert_swaps < 0 || opt_.expert_swaps > swap_limit)
+        throw std::runtime_error("too many experts on their way into the cache at a time");
     if (opt_.window < 0 || opt_.window > 8)
         throw std::runtime_error("a window is 1 to 8 tokens, or 0 for the model's own");
     if (opt_.tail_skip < 0) throw std::runtime_error("--tail-skip (STRATA_ROUTE_TAIL_SKIP) cannot be negative");
@@ -2104,8 +2195,9 @@ void Engine::load(const Options& o) {
             out_norm_ = upload(norm, "output_norm.weight", n_embd_, 1, kF32);
             // a file without an output matrix ties the output to the token table
             const TensorInfo* head = gg_->find("output.weight");
-            output_ = upload(head ? head : gg_->find("token_embd.weight"), "output.weight", n_embd_, n_vocab_,
-                             kAnyMat);
+            const TensorInfo* out = head ? head : gg_->find("token_embd.weight");
+            output_ = mtp_stage0_ ? upload_head_prefix(out, "output.weight")
+                                  : upload(out, "output.weight", n_embd_, n_vocab_, kAnyMat);
         }
         if (draft_) load_drafter();
         if (pass == 0) {
@@ -2123,7 +2215,10 @@ void Engine::load(const Options& o) {
     if (opt_.window == 0) opt_.window = recurrent_floats() == 0 || snaps_spread() ? 8 : 4;
     opt_.window = std::min({opt_.window, opt_.prompt_batch, opt_.max_context});
     alloc();
+    pin_experts();
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
+    if (!profile_accum_.empty() && profile_accum_ != opt_.profile)
+        read_profile(profile_accum_, (int) layers_.size(), n_expert_, profile_accum_prior_);
     fill_expert_cache();
     // The weights and the expert cache are written on st_ now (h2d(), zero_vram()): the load is not over until
     // those are done, so that everything after it - a read of what the cache holds, the first request's cover()
@@ -2165,13 +2260,13 @@ void Engine::load(const Options& o) {
     mind_memory();
     std::vector<std::pair<const uint8_t*, size_t>> spans;   // the routed experts in the mapped files
     for (const Layer& L : layers_) {
-        if (!L.moe) continue;
+        if (!L.moe || pinned_experts_) continue;
         spans.emplace_back(L.exp_gate, (size_t) n_expert_ * L.gu_stride);
         if (L.gu_stride == L.gu_bytes) spans.emplace_back(L.exp_up, (size_t) n_expert_ * L.gu_bytes);
         spans.emplace_back(L.exp_down, (size_t) n_expert_ * L.d_bytes);
     }
     if (!workers_) {   // a later card's engine has the first one's
-        if (opt_.stay_near) {   // before any thread that reads the experts is started
+        if (opt_.stay_near && !pinned_experts_) {   // before any thread that reads the experts is started
             std::vector<std::string> files = gg_->paths();
             if (dg_) files.insert(files.end(), dg_->paths().begin(), dg_->paths().end());
             node_ = stay_near(spans, files, threads, node_share_);
@@ -2182,7 +2277,7 @@ void Engine::load(const Options& o) {
     start_swaps();
     reset();
     // nothing is read from the files when every expert is in VRAM
-    if (!all_cached())
+    if (!all_cached() && !pinned_experts_)
         mapper_ = std::thread([this, spans = std::move(spans)] {
             cpu_placement::pin_aux();
             map_pages(spans, map_quit_);
@@ -2409,28 +2504,36 @@ void Engine::alloc() {
 }
 
 void Engine::save_profile() const {
-    if (opt_.profile.empty()) return;
-    const std::string tmp = opt_.profile + ".tmp";
-    // every card's engine counts its own layers' experts, and the last one's profile has the draft block's too
+    if (opt_.profile.empty() && profile_accum_.empty()) return;
+    // Every card counts only its own layers. The last card also counts the draft block.
     const Engine* last = this;
     while (last->next_) last = last->next_.get();
-    std::vector<int64_t> all = last->prior_;
-    for (const Engine* e = this; e; e = e->next_.get()) {
-        if (all.size() < e->use_.size()) all.resize(e->use_.size(), 0);
-        for (size_t i = 0; i < e->use_.size(); ++i) all[i] += e->use_[i];
-    }
-    FILE* f = std::fopen(tmp.c_str(), "w");
-    if (!f) throw std::runtime_error("cannot write " + tmp);
-    for (size_t i = 0; i < all.size(); ++i) {
-        const int64_t n = all[i];
-        if (n > 0)
-            std::fprintf(f, "%d %d %lld\n", (int) (i / (size_t) n_expert_), (int) (i % (size_t) n_expert_),
-                         (long long) n);
-    }
-    const bool written = std::fclose(f) == 0;
-    std::error_code ec;
-    if (written) std::filesystem::rename(tmp, opt_.profile, ec);   // std::rename replaces no file on Windows
-    if (!written || ec) throw std::runtime_error("cannot write " + opt_.profile);
+    const auto write = [&](const std::string& path, const std::vector<int64_t>& base) {
+        std::vector<int64_t> all = base;
+        for (const Engine* e = this; e; e = e->next_.get()) {
+            if (all.size() < e->use_.size()) all.resize(e->use_.size(), 0);
+            for (size_t i = 0; i < e->use_.size(); ++i) all[i] += e->use_[i];
+        }
+        const std::string tmp = path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "w");
+        if (!f) throw std::runtime_error("cannot write " + tmp);
+        for (size_t i = 0; i < all.size(); ++i) {
+            const int64_t n = all[i];
+            if (n > 0)
+                std::fprintf(f, "%d %d %lld\n", (int) (i / (size_t) n_expert_),
+                             (int) (i % (size_t) n_expert_), (long long) n);
+        }
+        const bool written = std::fclose(f) == 0;
+        std::error_code ec;
+        if (written) std::filesystem::rename(tmp, path, ec);
+        if (!written || ec) throw std::runtime_error("cannot write " + path);
+    };
+    if (!opt_.profile.empty()) write(opt_.profile, last->prior_);
+    // A separate workload accumulator records this run without changing the
+    // profile that selected its cache. Repeated server saves replace a total,
+    // rather than adding already-saved counts a second time.
+    if (!profile_accum_.empty() && profile_accum_ != opt_.profile)
+        write(profile_accum_, profile_accum_prior_);
 }
 
 void Engine::reset() {
@@ -2696,7 +2799,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 host_e[n_host] = (int32_t) e;
                 host_k[n_host] = k;
                 host[n_host++] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride,
-                                  L.exp_down + e * L.d_bytes, w[k], t};
+                                  L.exp_down + e * L.d_stride, w[k], t};
             }
         }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
@@ -2865,7 +2968,7 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
             const size_t j = (size_t) i / 3, e = (size_t) experts[(size_t) j0 + j];
             if (i % 3 == 0) std::memcpy(h + j * gu2, L.exp_gate + e * L.gu_stride, L.gu_bytes);
             else if (i % 3 == 1) std::memcpy(h + j * gu2 + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-            else std::memcpy(h + c * gu2 + j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+            else std::memcpy(h + c * gu2 + j * L.d_bytes, L.exp_down + e * L.d_stride, L.d_bytes);
         };
         (alone ? *stagers_ : *workers_).run((int) (3 * c), copy);
         ck(cudaMemcpyAsync(stage_ + (size_t) j0 * gu2, h, c * gu2, cudaMemcpyHostToDevice, cs(stream)),
@@ -3024,7 +3127,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     for (int i = 0; i < rr; ++i) {
         const size_t e = (size_t) ids_[(size_t) i];
         if (on_cpu_[e]) {   // by token, as cpu_experts() takes them, and nothing of it in the card's sum
-            host_.push_back({L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride, L.exp_down + e * L.d_bytes,
+            host_.push_back({L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride, L.exp_down + e * L.d_stride,
                              w[i], i / n_used_});
             w[i] = 0.f;
             continue;
@@ -3534,7 +3637,7 @@ void Engine::run(const int32_t* tokens, int n) {
                         if (pcie_frac_ > 0.f && h_dma_slots_[(size_t) e]) { ++n_dma; continue; }
                         const size_t ie = (size_t) e;
                         host[n_host++] = {L.exp_gate + ie * L.gu_stride, L.exp_up + ie * L.gu_stride,
-                                          L.exp_down + ie * L.d_bytes, h_partial_wts_[j], row};
+                                          L.exp_down + ie * L.d_stride, h_partial_wts_[j], row};
                     }
                 stats_.gpu_experts += n_gpu;
                 stats_.pcie_experts += n_dma;
@@ -3543,16 +3646,24 @@ void Engine::run(const int32_t* tokens, int n) {
                 const std::function<void()> dma_launch = [&] {
                     try {
                         if (split_) ck(cudaSetDevice(device_), "PCIe copy device");
-                        for (size_t k = 0; k < dma_ids.size(); ++k) {
+                        if (pinned_experts_) {
+                            for (size_t k = 0; k < dma_ids.size(); ++k) {
+                                const size_t e = (size_t) dma_ids[k];
+                                ck(cudaMemcpyAsync(d_dma_stage_ + k * dma_slot_bytes_,
+                                                   L.exp_gate + e * L.gu_stride,
+                                                   2 * L.gu_bytes + L.d_bytes + kTail,
+                                                   cudaMemcpyHostToDevice, cs(dma_st_)), "pinned expert copy");
+                            }
+                        } else for (size_t k = 0; k < dma_ids.size(); ++k) {
                             const size_t e = (size_t) dma_ids[k];
                             uint8_t* slot = h_dma_stage_ + k * dma_slot_bytes_;
                             std::memcpy(slot, L.exp_gate + e * L.gu_stride, L.gu_bytes);
                             std::memcpy(slot + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-                            std::memcpy(slot + 2 * L.gu_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+                            std::memcpy(slot + 2 * L.gu_bytes, L.exp_down + e * L.d_stride, L.d_bytes);
                             std::memset(slot + 2 * L.gu_bytes + L.d_bytes, 0,
                                         dma_slot_bytes_ - 2 * L.gu_bytes - L.d_bytes);
                         }
-                        if (!dma_ids.empty())
+                        if (!pinned_experts_ && !dma_ids.empty())
                             ck(cudaMemcpyAsync(d_dma_stage_, h_dma_stage_, dma_ids.size() * dma_slot_bytes_,
                                                cudaMemcpyHostToDevice, cs(dma_st_)), "PCIe expert copy");
                         ck(cudaMemcpyAsync(d_dma_slots_, h_dma_slots_, (size_t) n_expert_ * sizeof(void*),
@@ -3560,14 +3671,16 @@ void Engine::run(const int32_t* tokens, int n) {
                         partial_graph_ring(partial_device_words_ + 3, dma_st_);
                     } catch (...) { dma_failed = std::current_exception(); }
                 };
+                if (pcie_frac_ > 0.f && pinned_experts_) dma_launch();
+                if (dma_failed) std::rethrow_exception(dma_failed);
                 const Clock::time_point cpu_start = Clock::now();
                 if (n_host)
                     cpu_experts(*workers_, host, n_host, n, (int) L.gu_type, (int) L.d_type,
                                 n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) il], gelu_, h_partial_cpu_,
-                                pcie_frac_ > 0.f ? &dma_launch : nullptr);
+                                pcie_frac_ > 0.f && !pinned_experts_ ? &dma_launch : nullptr);
                 else {
                     std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
-                    if (pcie_frac_ > 0.f) dma_launch();
+                    if (pcie_frac_ > 0.f && !pinned_experts_) dma_launch();
                 }
                 if (dma_failed) std::rethrow_exception(dma_failed);
                 stats_.cpu_ms += ms_since(cpu_start);
@@ -4479,7 +4592,7 @@ void Engine::sync_mtp_stage0() {
     const size_t row = front->mtp_row_bytes();
     if (row != last->mtp_row_bytes()) throw std::logic_error("stage0 MTP cache formats differ");
     constexpr int kRows = 256;
-    const size_t bytes = std::max(row * kRows, (size_t) n_embd_ * sizeof(float));
+    const size_t bytes = row * kRows + (size_t) n_embd_ * sizeof(float);
     if (!h_mtp_rows_) {
         OnCard here(device_, split_);
         h_mtp_rows_ = (uint8_t*) hmalloc(bytes, "stage0 MTP handoff");
@@ -4489,6 +4602,7 @@ void Engine::sync_mtp_stage0() {
         OnCard here(device_, split_);
         cover(pos_);
     }
+    bool copied = false;
     for (int64_t at = mtp_synced_; at < pos_;) {
         const int n = (int) std::min<int64_t>(kRows, pos_ - at);
         {
@@ -4500,20 +4614,20 @@ void Engine::sync_mtp_stage0() {
             front->mtp_upload_rows(at, n, h_mtp_rows_);
         }
         at += n;
+        copied = true;
+    }
+    // A repeated i=0 draft at the same position still needs the current full-model source row.
+    if (!copied) {
+        {
+            OnCard there(next_->device_, split_);
+            last->mtp_download_rows(pos_, 0, h_mtp_rows_);
+        }
+        {
+            OnCard here(device_, split_);
+            front->mtp_upload_rows(pos_, 0, h_mtp_rows_);
+        }
     }
     mtp_synced_ = pos_;
-    {
-        OnCard there(next_->device_, split_);
-        ck(cudaMemcpyAsync(h_mtp_rows_, next_->hn_, (size_t) n_embd_ * sizeof(float),
-                           cudaMemcpyDeviceToHost, cs(next_->st_)), "stage0 MTP source");
-        ck(cudaStreamSynchronize(cs(next_->st_)), "stage0 MTP source");
-    }
-    {
-        OnCard here(device_, split_);
-        ck(cudaMemcpyAsync(hn_, h_mtp_rows_, (size_t) n_embd_ * sizeof(float),
-                           cudaMemcpyHostToDevice, cs(st_)), "stage0 MTP source");
-        ck(cudaStreamSynchronize(cs(st_)), "stage0 MTP source");
-    }
 }
 
 int32_t Engine::draft(int32_t token, int i, float* prob) {

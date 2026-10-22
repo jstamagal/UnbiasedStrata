@@ -2775,4 +2775,38 @@ void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const floa
     gdn_out_kernel<<<rows * n_head, dim, 0, cs(stream)>>>(out, z, o_norm, dim, norm_eps);
 }
 
+template<bool PACK>
+__global__ void mtp_transfer_kernel(uint8_t* packed, uint8_t* kc, uint8_t* ks, uint8_t* vc, uint8_t* vs,
+                                    uint8_t* source, size_t code_bytes, size_t scale_bytes, size_t source_bytes) {
+    const size_t total = 2 * (code_bytes + scale_bytes) + source_bytes;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += size_t(gridDim.x) * blockDim.x) {
+        uint8_t* part;
+        size_t at;
+        if (i < code_bytes) { part = kc; at = i; }
+        else if (i < code_bytes + scale_bytes) { part = ks; at = i - code_bytes; }
+        else if (i < 2 * code_bytes + scale_bytes) { part = vc; at = i - code_bytes - scale_bytes; }
+        else if (i < 2 * (code_bytes + scale_bytes)) { part = vs; at = i - 2 * code_bytes - scale_bytes; }
+        else { part = source; at = i - 2 * (code_bytes + scale_bytes); }
+        if constexpr (PACK) packed[i] = part[at];
+        else part[at] = packed[i];
+    }
+}
+
+void mtp_pack_rows(const void* kc, const void* ks, const void* vc, const void* vs, const float* source,
+                   uint8_t* packed, size_t code_bytes, size_t scale_bytes, size_t source_bytes, void* stream) {
+    const size_t total = 2 * (code_bytes + scale_bytes) + source_bytes;
+    mtp_transfer_kernel<true><<<grid((int) total, 256), 256, 0, cs(stream)>>>(
+        packed, (uint8_t*) kc, (uint8_t*) ks, (uint8_t*) vc, (uint8_t*) vs, (uint8_t*) source,
+        code_bytes, scale_bytes, source_bytes);
+}
+
+void mtp_unpack_rows(const uint8_t* packed, void* kc, void* ks, void* vc, void* vs, float* source,
+                     size_t code_bytes, size_t scale_bytes, size_t source_bytes, void* stream) {
+    const size_t total = 2 * (code_bytes + scale_bytes) + source_bytes;
+    mtp_transfer_kernel<false><<<grid((int) total, 256), 256, 0, cs(stream)>>>(
+        (uint8_t*) packed, (uint8_t*) kc, (uint8_t*) ks, (uint8_t*) vc, (uint8_t*) vs, (uint8_t*) source,
+        code_bytes, scale_bytes, source_bytes);
+}
+
 }  // namespace strata::poly
