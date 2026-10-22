@@ -164,3 +164,4 @@ STRATA_POLY_MTP_FFN_NORM_Q8=1  # fuse draft FFN residual add, RMS norm and Q8 qu
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_EXPERT_REUSE_PAIR=1 STRATA_POLY_EXPERT_REUSE_BALLOT=1  # wave-parallel repeated-ID matching
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_EXPERT_REUSE_META=1  # routing prepares pair metadata once for gate/up and down
 STRATA_POLY_MTP_INPUT_NORM_PAIR=1  # combine draft embedding and source RMS norms into one launch
+STRATA_POLY_DENSE_PREFETCH=1  # overlap next dense K-group loads with current dot products, 1-4 columns
