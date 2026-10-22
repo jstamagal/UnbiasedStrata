@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strata::poly {
@@ -675,6 +676,19 @@ void Qwen35::route(int, const float* logits, int32_t, int* ids, float* w, float*
 bool Qwen35::route_card(int, int n, int32_t* ids, float* w) {
     route_rows(rl_, n_expert_, n_used_, n, 0, 1.f, nullptr, nullptr, true, 0.f, ids, w, st_);
     return true;
+}
+
+bool Qwen35::route_card_publish(int, int n, int32_t* ids, float* w, float* host_x,
+                                int32_t* host_ids, float* host_wts, uint32_t* ready,
+                                uint32_t* layer_ready) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_POLY_ROUTE_PUBLISH");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!enabled) return false;
+    const RoutePublish publish{xn_, host_x, host_ids, host_wts, n * n_embd_, ready, layer_ready};
+    return route_rows_publish(rl_, n_expert_, n_used_, n, 0, 1.f, nullptr, nullptr, true, 0.f,
+                              ids, w, publish, st_);
 }
 
 // The shared expert, times the sigmoid of its own gate.  It runs on the GPU while the host routes.

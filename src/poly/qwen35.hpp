@@ -41,6 +41,9 @@ protected:
     void output_rows(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
+    bool route_card_publish(int il, int n, int32_t* ids, float* w, float* host_x,
+                            int32_t* host_ids, float* host_wts, uint32_t* ready,
+                            uint32_t* layer_ready) override;
     void moe_shared(const Layer& L, int il, int n) override;
     void block_attend(int64_t pos, int n) override;
     void block_rows(int64_t pos, int n) override;

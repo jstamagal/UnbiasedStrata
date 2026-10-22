@@ -1006,6 +1006,101 @@ __global__ void route_kernel(const float* __restrict__ logits, int n_expert, int
     w[size_t(row) * n_used + lane] = v;
 }
 
+// A decode window routes in one 256-thread block; the same block publishes its
+// input and selected experts to mapped host memory after the exact route math.
+template<int PER>
+
+__global__ void route_publish_kernel(const float* __restrict__ logits, int n_expert, int n_used, int rows, int gate,
+                             float in_scale, const float* __restrict__ bias, const float* __restrict__ escale,
+                             bool norm, float w_scale, int32_t* __restrict__ ids, float* __restrict__ w, RoutePublish publish) {
+    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP, lane = threadIdx.x % WARP;
+    if (row < rows) {
+    const float* lg = logits + size_t(row) * n_expert;
+    float p[PER], pick[PER];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int e = lane + k * WARP;
+        p[k] = e < n_expert ? lg[e] * in_scale : -INFINITY;
+        mx = fmaxf(mx, p[k]);
+    }
+    if (gate == 0) {   // softmax
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o, WARP));
+        float sum = 0.0f;
+#pragma unroll
+        for (int k = 0; k < PER; ++k) {
+            p[k] = lane + k * WARP < n_expert ? expf(p[k] - mx) : 0.0f;
+            sum += p[k];
+        }
+        const float inv = 1.0f / warp_sum(sum);
+#pragma unroll
+        for (int k = 0; k < PER; ++k) p[k] *= inv;
+    } else {
+#pragma unroll
+        for (int k = 0; k < PER; ++k) {
+            const float x = p[k];
+            p[k] = gate == 1 ? 1.0f / (1.0f + expf(-x)) : sqrtf(x > 20.0f ? x : logf(1.0f + expf(x)));
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int e = lane + k * WARP;
+        pick[k] = e < n_expert ? p[k] + (bias ? bias[e] : 0.0f) : -INFINITY;
+    }
+    float sum = 0.0f, mine = 0.0f;
+    int my_id = 0;
+    for (int j = 0; j < n_used; ++j) {
+        float best = -INFINITY;
+        int at = n_expert;
+#pragma unroll
+        for (int k = 0; k < PER; ++k)
+            if (pick[k] > best) best = pick[k], at = lane + k * WARP;
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) {
+            const float b = __shfl_xor_sync(0xffffffff, best, o, WARP);
+            const int a = __shfl_xor_sync(0xffffffff, at, o, WARP);
+            if (b > best || (b == best && a < at)) best = b, at = a;
+        }
+        float pw = 0.0f;
+#pragma unroll
+        for (int k = 0; k < PER; ++k)
+            if (lane + k * WARP == at) pw = p[k], pick[k] = -INFINITY;
+        pw = __shfl_sync(0xffffffff, pw, at % WARP, WARP);
+        sum += pw;
+        if (lane == j) mine = pw, my_id = at;
+    }
+    if (lane < n_used) {
+    float v = mine;
+    if (norm) v /= fmaxf(sum, 6.103515625e-5f);   // the floor ggml's MoE graph puts under the gate sum
+    if (escale) v *= escale[my_id];
+    if (w_scale != 0.0f) v *= w_scale;
+    ids[size_t(row) * n_used + lane] = my_id;
+    w[size_t(row) * n_used + lane] = v;
+    }
+    }
+    // All eight warps, including inactive rows and lanes beyond n_used, reach this barrier.
+    __syncthreads();
+    const int t = int(threadIdx.x);
+    for (int i = t; i < publish.x_count; i += blockDim.x)
+        publish.host_x[i] = publish.x[i];
+    for (int i = t; i < rows * n_used; i += blockDim.x) {
+        publish.host_ids[i] = ids[i];
+        publish.host_wts[i] = w[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        volatile uint32_t* ready = reinterpret_cast<volatile uint32_t*>(publish.ready);
+        const uint32_t value = *ready + 1;
+        *ready = value;
+        if (publish.layer_ready)
+            *reinterpret_cast<volatile uint32_t*>(publish.layer_ready) = value;
+        __threadfence_system();
+    }
+}
+
+
 __global__ void moe_sum_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ acc,
                                int n, int n_used) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2480,6 +2575,25 @@ void route_rows(const float* logits, int n_expert, int n_used, int rows, int gat
     else if (n_expert <= 4 * WARP) launch(route_kernel<4>);
     else if (n_expert <= 8 * WARP) launch(route_kernel<8>);
     else launch(route_kernel<ROUTE_PER>);
+}
+
+bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
+                        const float* bias, const float* escale, bool norm, float w_scale,
+                        int32_t* ids, float* w, const RoutePublish& publish, void* stream) {
+    if (rows < 1 || rows > 8 || n_expert < 1 || n_expert > ROUTE_PER * WARP ||
+        n_used < 1 || n_used > WARP || n_used > n_expert || publish.x_count < 0 ||
+        !logits || !ids || !w || !publish.x || !publish.host_x || !publish.host_ids ||
+        !publish.host_wts || !publish.ready)
+        return false;
+    const auto launch = [&](auto kernel) {
+        kernel<<<1, 256, 0, cs(stream)>>>(logits, n_expert, n_used, rows, gate, in_scale, bias,
+                                          escale, norm, w_scale, ids, w, publish);
+    };
+    if (n_expert <= 2 * WARP) launch(route_publish_kernel<2>);
+    else if (n_expert <= 4 * WARP) launch(route_publish_kernel<4>);
+    else if (n_expert <= 8 * WARP) launch(route_publish_kernel<8>);
+    else launch(route_publish_kernel<ROUTE_PER>);
+    return true;
 }
 
 void moe_sum(const float* x, const float* w, float* acc, int n, int n_used, int rows, void* stream) {

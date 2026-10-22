@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <limits>
@@ -101,6 +102,13 @@ bool adapt_overlap_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_ADAPT_OVERLAP");
         return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+bool adapt_fifo_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_ADAPT_FIFO");
+        return adapt_overlap_on() && v && v[0] == '1' && v[1] == '\0';
     }();
     return on;
 }
@@ -420,6 +428,7 @@ struct Engine::Swap {
     uint8_t* slot = nullptr;       // where it goes in VRAM: the slot of the expert it replaces
     uint8_t* pinned = nullptr;
     cudaEvent_t done = nullptr;    // marks its upload
+    uint64_t upload_generation = 0; // follower-owned; rejects stale FIFO entries after slot reuse
 };
 
 Engine::Engine() = default;
@@ -1890,6 +1899,9 @@ void Engine::plan_ahead(Layer& L, int il) {
 void Engine::follow_loop() {
     cudaSetDevice(device_);   // a thread starts on card 0
     const bool poll = adapt_overlap_on();
+    const bool fifo = adapt_fifo_on();
+    struct Pending { int index; uint64_t generation; };
+    std::deque<Pending> pending_uploads;
     std::unique_lock<std::mutex> lk(swap_m_);
     const auto asked = [&]() -> Swap* {
         Swap* first = nullptr;
@@ -1910,15 +1922,33 @@ void Engine::follow_loop() {
             lk.unlock();
             bool pending = false;
             cudaError_t failed = cudaSuccess;
-            for (int j = 0; j < n_swap_; ++j) {
-                Swap& q = swap_[(size_t) j];
-                if (q.at.load() != Swap::kSent) continue;
-                const cudaError_t arrived = cudaEventQuery(q.done);
-                if (arrived == cudaErrorNotReady) pending = true;
-                else if (arrived == cudaSuccess) {
+            if (fifo) {
+                // One copy stream orders all events. A not-ready head implies every later event is pending.
+                while (!pending_uploads.empty()) {
+                    const Pending front = pending_uploads.front();
+                    Swap& q = swap_[(size_t) front.index];
+                    if (q.upload_generation != front.generation || q.at.load() != Swap::kSent) {
+                        pending_uploads.pop_front();
+                        continue;
+                    }
+                    const cudaError_t arrived = cudaEventQuery(q.done);
+                    if (arrived == cudaErrorNotReady) { pending = true; break; }
+                    if (arrived != cudaSuccess) { failed = arrived; break; }
                     int sent = Swap::kSent;
                     q.at.compare_exchange_strong(sent, Swap::kLanded);
-                } else { failed = arrived; break; }
+                    pending_uploads.pop_front();
+                }
+            } else {
+                for (int j = 0; j < n_swap_; ++j) {
+                    Swap& q = swap_[(size_t) j];
+                    if (q.at.load() != Swap::kSent) continue;
+                    const cudaError_t arrived = cudaEventQuery(q.done);
+                    if (arrived == cudaErrorNotReady) pending = true;
+                    else if (arrived == cudaSuccess) {
+                        int sent = Swap::kSent;
+                        q.at.compare_exchange_strong(sent, Swap::kLanded);
+                    } else { failed = arrived; break; }
+                }
             }
             lk.lock();
             if (failed != cudaSuccess) {
@@ -1955,6 +1985,8 @@ void Engine::follow_loop() {
             swap_error_ = cudaGetErrorString(err);
             return;
         }
+        if (fifo)
+            pending_uploads.push_back({int(s - swap_.get()), ++s->upload_generation});
         s->at.store(Swap::kSent);
     }
 }
@@ -3659,18 +3691,27 @@ void Engine::run(const int32_t* tokens, int n) {
                 Layer& L = layers_[(size_t) il];
                 layer_head(L, il, n);
                 if (!L.moe) continue;
-                if (!route_card(il, n, d_ids_, d_wts_))
-                    throw std::logic_error("partial graph needs device routing");
                 const int rr = n * n_used_;
                 if (runahead) {
                     const size_t at = (size_t) il * runahead_route_stride_;
-                    partial_graph_publish_runahead(xn_, d_ids_, d_wts_, d_partial_x_,
-                                                   d_runahead_ids_ + at, d_runahead_wts_ + at,
-                                                   n * n_embd_, rr, partial_device_words_,
-                                                   d_runahead_ready_ + il, st_);
+                    if (!route_card_publish(il, n, d_ids_, d_wts_, d_partial_x_,
+                                            d_runahead_ids_ + at, d_runahead_wts_ + at,
+                                            partial_device_words_, d_runahead_ready_ + il)) {
+                        if (!route_card(il, n, d_ids_, d_wts_))
+                            throw std::logic_error("partial graph needs device routing");
+                        partial_graph_publish_runahead(xn_, d_ids_, d_wts_, d_partial_x_,
+                                                       d_runahead_ids_ + at, d_runahead_wts_ + at,
+                                                       n * n_embd_, rr, partial_device_words_,
+                                                       d_runahead_ready_ + il, st_);
+                    }
                 } else {
-                    partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
-                                          n * n_embd_, rr, partial_device_words_, st_);
+                    if (!route_card_publish(il, n, d_ids_, d_wts_, d_partial_x_, d_partial_ids_,
+                                            d_partial_wts_, partial_device_words_, nullptr)) {
+                        if (!route_card(il, n, d_ids_, d_wts_))
+                            throw std::logic_error("partial graph needs device routing");
+                        partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
+                                              n * n_embd_, rr, partial_device_words_, st_);
+                    }
                 }
                 moe_shared(L, il, n);
                 if (adapt_overlap_on())
@@ -4870,10 +4911,13 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
                 kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
                 moe_router(L, 1);
-                if (!route_card(n_layer_, 1, d_ids_, d_wts_))
-                    throw std::logic_error("MTP graph needs device routing");
-                partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
-                                      n_embd_, n_used_, partial_device_words_, st_);
+                if (!route_card_publish(n_layer_, 1, d_ids_, d_wts_, d_partial_x_, d_partial_ids_,
+                                        d_partial_wts_, partial_device_words_, nullptr)) {
+                    if (!route_card(n_layer_, 1, d_ids_, d_wts_))
+                        throw std::logic_error("MTP graph needs device routing");
+                    partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
+                                          n_embd_, n_used_, partial_device_words_, st_);
+                }
                 moe_shared(L, n_layer_, 1);
                 const kernels::MmvqIds gate_up{(const void* const*) d_mtp_slots_, d_ids_, 0, xq_,
                     kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_};

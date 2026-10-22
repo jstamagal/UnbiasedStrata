@@ -143,6 +143,20 @@ void expert_activation_q8(const float* gate_up, void* out, int n, int rows, floa
 /// w_scale (0: not).  ids and w: n_used a token, on the card.  Throws std::invalid_argument past 512 experts.
 void route_rows(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale, const float* bias,
                 const float* escale, bool norm, float w_scale, int32_t* ids, float* w, void* stream);
+// Route and publish the same rows to mapped host memory in one launch. Returns false without
+// launching for shapes outside the single-block decode path. layer_ready may be null.
+struct RoutePublish {
+    const float* x;
+    float* host_x;
+    int32_t* host_ids;
+    float* host_wts;
+    int x_count;
+    uint32_t* ready;
+    uint32_t* layer_ready;
+};
+bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
+                        const float* bias, const float* escale, bool norm, float w_scale,
+                        int32_t* ids, float* w, const RoutePublish& publish, void* stream);
 /// acc[t] += sum over k < n_used of w[t * n_used + k] * x[t * n_used + k], for rows of n values: a token's
 /// weighted experts added to its row.
 void moe_sum(const float* x, const float* w, float* acc, int n, int n_used, int rows, void* stream);

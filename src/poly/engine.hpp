@@ -368,6 +368,14 @@ protected:
         (void) il, (void) n, (void) ids, (void) w;
         return false;
     }
+    /// Route and publish the mapped host payload in one launch when supported. False launches nothing.
+    virtual bool route_card_publish(int il, int n, int32_t* ids, float* w, float* host_x,
+                                    int32_t* host_ids, float* host_wts, uint32_t* ready,
+                                    uint32_t* layer_ready) {
+        (void) il, (void) n, (void) ids, (void) w, (void) host_x, (void) host_ids;
+        (void) host_wts, (void) ready, (void) layer_ready;
+        return false;
+    }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
