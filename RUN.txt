@@ -136,3 +136,4 @@ STRATA_POLY_HEAD_VERIFY=1  # Q6_K verify head reuses input and weights across 2-
 STRATA_POLY_HEAD_VERIFY=1 STRATA_POLY_HEAD_VERIFY_ROWS=2  # rows per persistent CTA, choose 1/2/4
 STRATA_POLY_HEAD_VERIFY=1 STRATA_POLY_HEAD_VERIFY_GRID=2048  # persistent verify grid, range 256-16384
 STRATA_POLY_Q40_DENSE_WAVE=1 STRATA_POLY_Q40_DENSE_ROWS=4  # Q4_0 activation reuse over 1/2/4 rows, default 2
+STRATA_POLY_DENSE_WEIGHT_VEC=1  # aligned dword Q4_0/Q8_0 loads; combine with dense wave selectors
