@@ -123,3 +123,5 @@ STRATA_POLY_Q35_GDN_SET=1  # combine GDN QKV and output-gate projections for 2-8
 STRATA_POLY_Q35_ATTN_GATE_WINDOW=1  # combine attention output gating and Q8_1 quantization for 2-8-row windows, area E
 STRATA_POLY_HEAD_WIDE=0  # stock Q6_K head is now the gfx103x default; HEAD_WIDE=1 restores wide candidate
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_PAIR=1  # fast partial-graph expert dispatch, grid uses real routed entry count
+STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=auto  # actual-count expert row grouping; ROWS=1/2/4 also selectable
+STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_Q40_EXPERT_BLOCK=1  # full Q4 block per lane with paired-row Q8 reuse
