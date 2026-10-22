@@ -63,7 +63,7 @@ void poly_dense_lds_n(const typename F::Block* w, const Q81Block* x, float* y,
                       int n_in, int n_out, cudaStream_t stream) {
     const dim3 grid(unsigned((size_t(n_out) + 4 * ROWS - 1) / (4 * ROWS)));
     poly_dense_lds_kernel<F, NC, ROWS><<<grid, dim3(32, 4), 0, stream>>>(
-        w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on());
+        w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(NC));
 }
 
 template<typename F, int ROWS>

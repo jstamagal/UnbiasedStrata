@@ -134,14 +134,14 @@ bool poly_dense_wave(const void* weights, const void* x, float* y,
         const dim3 grid(unsigned((size_t(n_out) + 7) / 8));
         const dim3 threads(32, 4);
         switch (ncols) {
-        case 1: poly_dense_wave_kernel<F, 1><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 2: poly_dense_wave_kernel<F, 2><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 3: poly_dense_wave_kernel<F, 3><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 4: poly_dense_wave_kernel<F, 4><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 5: poly_dense_wave_kernel<F, 5><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 6: poly_dense_wave_kernel<F, 6><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 7: poly_dense_wave_kernel<F, 7><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
-        case 8: poly_dense_wave_kernel<F, 8><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 1: poly_dense_wave_kernel<F, 1><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 2: poly_dense_wave_kernel<F, 2><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 3: poly_dense_wave_kernel<F, 3><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 4: poly_dense_wave_kernel<F, 4><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 5: poly_dense_wave_kernel<F, 5><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 6: poly_dense_wave_kernel<F, 6><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 7: poly_dense_wave_kernel<F, 7><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
+        case 8: poly_dense_wave_kernel<F, 8><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(ncols)); break;
         }
         return true;
     }

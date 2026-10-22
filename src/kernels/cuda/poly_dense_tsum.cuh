@@ -1,21 +1,25 @@
 #pragma once
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-inline bool poly_dense_tsum_on() {
+inline bool poly_dense_tsum_on(int ncols) {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_DENSE_TSUM");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    return on;
+    static const bool wide = [] {
+        const char* v = std::getenv("STRATA_POLY_DENSE_TSUM_WIDE");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return ncols <= 4 ? on : wide;
 }
 
 template<int NC, int ROWS>
 __device__ __forceinline__ bool poly_dense_tsum(float (&sum)[4][NC][ROWS], float* y,
                                                int n_out, int row0, int lane, bool enabled) {
-    if constexpr (NC < 2 || NC > 4) {
+    constexpr int VALUES = NC * ROWS;
+    if constexpr (NC < 2 || NC > 8 || VALUES > 32) {
         return false;
     } else {
         if (!enabled) return false;
-        constexpr int VALUES = NC * ROWS;
         constexpr int P = s26ts::pow2_ceil(VALUES);
         float values[P];
 #pragma unroll

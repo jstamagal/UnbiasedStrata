@@ -176,3 +176,4 @@ STRATA_POLY_DENSE_W_SCALE=1  # broadcast exact fp16 weight scales within dense b
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_EXPERT_REUSE_GROUP4_META=1 STRATA_POLY_EXPERT_REUSE_META_BALLOT=1  # parallel four-occurrence metadata inside routing
 STRATA_POLY_MTP_LIKELIEST_SPLIT=1  # distribute draft confidence reduction across CTAs with original logical-lane sums
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_EXPERT_REUSE_GROUP4_BLOCK=1  # full Q4 block per lane shared across up to four occurrences
+STRATA_POLY_DENSE_WAVE_WIDE=1 STRATA_POLY_DENSE_TSUM_WIDE=1  # combine dense wave output reductions for 5-8 columns

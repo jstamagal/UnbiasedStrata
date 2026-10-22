@@ -54,10 +54,10 @@ void poly_dense_q40_rows_n(const Q40Block* w, const Q81Block* x, float* y,
     const dim3 threads(32, 4);
     if (rows == 1) {
         const dim3 grid(unsigned((size_t(n_out) + 3) / 4));
-        poly_dense_q40_rows_kernel<NC, 1><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on());
+        poly_dense_q40_rows_kernel<NC, 1><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(NC));
     } else {
         const dim3 grid(unsigned((size_t(n_out) + 15) / 16));
-        poly_dense_q40_rows_kernel<NC, 4><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on());
+        poly_dense_q40_rows_kernel<NC, 4><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on(NC));
     }
 }
 
