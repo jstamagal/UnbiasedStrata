@@ -83,3 +83,4 @@ STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_ADAPT_OVERLAP=1 --max-context 262144  # 
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_TRACE=1 --max-context 262144  # rebuilt: reuse completed next-window proposals after matching sampled bonus instead of redrafting a different chain; verifier and sampler unchanged
 STRATA_POLY_PARTIAL_GRAPH=1 --max-context 262144  # rebuilt: GPU CPU-ready wait plus mapped-result accumulation fused into one kernel, one fewer launch/layer
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_TRACE=1 --max-context 262144  # built opt-in: card0 drafts while card1 verifies; canonical MTP KV mirrored incrementally; duplicate head/MTP storage consumes VRAM
+STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 --max-context 262144  # rebuilt: card1 retains canonical MTP KV/projection only; unused draft MoE experts and dense weights no longer consume its VRAM cache

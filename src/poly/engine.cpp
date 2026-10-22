@@ -1273,6 +1273,8 @@ std::unique_ptr<Engine> Engine::open(const Options& requested) {
         e->lo_ = starts[k];
         e->end_ = last ? -1 : starts[k + 1];
         e->mtp_stage0_ = stage0 && so.draft && so.window != 1;
+        e->mtp_stage0_last_ = last && starts.size() == 2 && mtp && std::strcmp(mtp, "1") == 0 &&
+                              std::strcmp(name.c_str(), "qwen35moe") == 0 && so.draft && so.window > 1;
         e->split_ = true;
         ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
         try {

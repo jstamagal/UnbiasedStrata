@@ -538,6 +538,7 @@ protected:
     bool split_ = false;                  ///< one of several engines: a call sets its card first
     std::unique_ptr<Engine> next_;
     bool mtp_stage0_ = false;             ///< opt-in duplicate drafter on the front card of a two-card split
+    bool mtp_stage0_last_ = false;        ///< last card keeps only canonical MTP rows, not its unused MoE
     int64_t mtp_synced_ = 0;             ///< committed draft-cache rows mirrored from the last card
     uint8_t* h_mtp_rows_ = nullptr;      ///< bounded pinned row handoff for the front drafter
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()

@@ -86,11 +86,12 @@ void Qwen35::load_geometry() {
 void Qwen35::load_layer(int il) {
     Layer& L = layers_[(size_t) il];
     Block& B = blocks_[(size_t) il];
+    const bool mtp_rows_only = mtp_stage0_last_ && il == n_layer_;
     auto f32 = [&](const char* n, int64_t a, int64_t b = 1) { return upload(tensor(il, n), blk(il, n), a, b, kF32); };
     auto mat = [&](const char* n, int64_t a, int64_t b) { return upload(tensor(il, n), blk(il, n), a, b, kAnyMat); };
 
     L.attn_norm = f32("attn_norm.weight", n_embd_);
-    L.ffn_norm = f32("post_attention_norm.weight", n_embd_);
+    if (!mtp_rows_only) L.ffn_norm = f32("post_attention_norm.weight", n_embd_);
     B.gdn = tensor(il, "attn_qkv.weight") != nullptr;
     L.fixed = true;   // the attention's launches read the position on the card when they are recorded
     if (B.gdn) {
@@ -106,16 +107,18 @@ void Qwen35::load_layer(int il) {
         ++n_gdn_;
     } else {
         // the query projection gives every head its query and then the gate of its output
-        B.wq = mat("attn_q.weight", n_embd_, (int64_t) 2 * n_head_ * head_dim_);
+        if (!mtp_rows_only) B.wq = mat("attn_q.weight", n_embd_, (int64_t) 2 * n_head_ * head_dim_);
         B.wk = mat("attn_k.weight", n_embd_, (int64_t) n_kv_ * head_dim_);
         B.wv = mat("attn_v.weight", n_embd_, (int64_t) n_kv_ * head_dim_);
-        B.q_norm = f32("attn_q_norm.weight", head_dim_);
+        if (!mtp_rows_only) B.q_norm = f32("attn_q_norm.weight", head_dim_);
         B.k_norm = f32("attn_k_norm.weight", head_dim_);
-        B.wo = mat("attn_output.weight", (int64_t) n_head_ * head_dim_, n_embd_);
+        if (!mtp_rows_only) B.wo = mat("attn_output.weight", (int64_t) n_head_ * head_dim_, n_embd_);
         ++n_attn_;
     }
-    load_moe(il);
-    B.sh_gate_inp = f32("ffn_gate_inp_shexp.weight", n_embd_);
+    if (!mtp_rows_only) {
+        load_moe(il);
+        B.sh_gate_inp = f32("ffn_gate_inp_shexp.weight", n_embd_);
+    }
 }
 
 size_t Qwen35::recurrent_floats() const {
