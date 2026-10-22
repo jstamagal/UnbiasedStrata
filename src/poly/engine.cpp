@@ -1,6 +1,7 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
+#include "behind_worker.hpp"
 #include "cpu_placement.hpp"
 
 #include "deepseek4.hpp"
@@ -81,6 +82,13 @@ bool graph_head_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_GRAPH_HEAD");
         return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+bool mtp_head_norm_q8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_HEAD_NORM_Q8");
+        return v && v[0] == '1' && v[1] == '\0';
     }();
     return on;
 }
@@ -304,13 +312,24 @@ private:
 // Work on a thread of its own, whose exception wait() throws.  Going out of scope it waits and drops the exception.
 class Behind {
 public:
-    Behind() = default;
+    explicit Behind(bool reuse = false) {
+        if (reuse) {
+            static thread_local detail::BehindWorker worker;
+            worker_ = &worker;
+        }
+    }
     Behind(const Behind&) = delete;
     Behind& operator=(const Behind&) = delete;
     ~Behind() {
-        if (th_.joinable()) th_.join();
+        if (worker_) {
+            try { worker_->wait(); } catch (...) {}
+        } else if (th_.joinable()) th_.join();
     }
     void go(std::function<void()> work) {
+        if (worker_) {
+            worker_->go(std::move(work));
+            return;
+        }
         th_ = std::thread([this, work = std::move(work)] {
             cpu_placement::pin_aux();
             try {
@@ -321,11 +340,16 @@ public:
         });
     }
     void wait() {
+        if (worker_) {
+            worker_->wait();
+            return;
+        }
         if (th_.joinable()) th_.join();
         if (err_) std::rethrow_exception(std::exchange(err_, nullptr));
     }
 
 private:
+    detail::BehindWorker* worker_ = nullptr;
     std::thread th_;
     std::exception_ptr err_;
 };
@@ -3770,8 +3794,8 @@ void Engine::run(const int32_t* tokens, int n) {
             }
             if (with_head) {
                 float* out = draft_ ? hn_ + n_embd_ : xn_;
-                output_rows(0, n, out);
-                lin(output_, out, wlogits_, n);
+                const void* out_q8 = output_rows_q8(0, n, out);
+                lin(output_, out, wlogits_, n, out_q8);
                 finish_logits(wlogits_, n);
                 ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) n * n_vocab_ * sizeof(float),
                                    cudaMemcpyDeviceToHost, cs(st_)), "logits");
@@ -4137,8 +4161,8 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
         next_->pass_ = h;
         next_->step(seqs, tokens, n);
     } else {
-        output_rows(0, n, xn_);
-        lin(output_, xn_, wlogits_, n);
+        const void* out_q8 = output_rows_q8(0, n, xn_);
+        lin(output_, xn_, wlogits_, n, out_q8);
         finish_logits(wlogits_, n);
         ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) n * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                            cs(st_)),
@@ -4209,10 +4233,14 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         const int m = draft_ ? n : 1;
         float* h = draft_ ? hn_ + n_embd_ : xn_;
         const auto tail = [&] {
-            output_rows(n - m, m, h);
+            const void* out_q8 = nullptr;
+            if (want_logits) out_q8 = output_rows_q8(n - m, m, h);
+            else output_rows(n - m, m, h);
             dbg("out_norm", n_layer_, h, n_embd_);
             if (!want_logits) return;
-            lin(output_, h + (size_t) (m - 1) * n_embd_, logits_, 1);
+            const void* last_q8 = out_q8 ? (const uint8_t*) out_q8 +
+                (size_t) (m - 1) * kernels::native_q8_1_bytes(n_embd_) : nullptr;
+            lin(output_, h + (size_t) (m - 1) * n_embd_, logits_, 1, last_q8);
             finish_logits(logits_, 1);
             ck(cudaMemcpyAsync(h_logits_, logits_, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                                cs(st_)),
@@ -4506,8 +4534,8 @@ void Engine::window(const int32_t* tokens, int t) {
     }
     if (!graph_head_done_) {
         float* h = draft_ ? hn_ + n_embd_ : xn_;
-        output_rows(0, t, h);
-        lin(output_, h, wlogits_, t);
+        const void* out_q8 = output_rows_q8(0, t, h);
+        lin(output_, h, wlogits_, t, out_q8);
         finish_logits(wlogits_, t);
         ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
            "logits");
@@ -4580,6 +4608,12 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
         throw std::logic_error("pipeline_window needs two Qwen cards and valid windows");
     OnCard here(device_, split_);
     end_read();
+    // Pipeline rejection restores pipe_saved_[0] and replays the accepted prefix; its per-token snapshots
+    // are never consumed. Partial graphs key the snapshot mask, so this records a pass without those stores.
+    static const bool no_snap = [] {
+        const char* v = std::getenv("STRATA_POLY_PIPELINE_NO_SNAP");
+        return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
     if (!pipe_saved_[0]) {
         for (float*& p : pipe_saved_) p = (float*) dmalloc(rec_n_ * sizeof(float), "pipeline GDN snapshot");
         const size_t bytes = (size_t) rows_ * streams() * n_embd_ * sizeof(float);
@@ -4610,14 +4644,22 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     if (reuse) ++pipe_hits_;
     const int current_slot = reuse ? pipe_slot_ : 0;
     if (reuse) {
-        ck(cudaMemcpyAsync(pipe_saved_[0], pipe_saved_[1], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-           "pipeline snapshot");
+        static const bool swap_snap = [] {
+            const char* v = std::getenv("STRATA_POLY_PIPELINE_SWAP_SNAP");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        // The preceding window was committed before this prediction could be reused. Its old rollback
+        // buffer is spare; retain the prediction's start state directly for a possible prefix replay.
+        if (swap_snap) std::swap(pipe_saved_[0], pipe_saved_[1]);
+        else
+            ck(cudaMemcpyAsync(pipe_saved_[0], pipe_saved_[1], rec_n_ * sizeof(float),
+                               cudaMemcpyDeviceToDevice, cs(st_)), "pipeline snapshot");
         pipe_ready_ = false;
     } else {
         ck(cudaMemcpyAsync(pipe_saved_[0], state_, rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
            "pipeline snapshot");
         windowed_ = true;
-        snap_bits_ = snap_tokens(t);
+        snap_bits_ = no_snap ? 0 : snap_tokens(t);
         snap_at_ = snap_;
         try { run(tokens, t); }
         catch (...) { windowed_ = false; snap_bits_ = 0; throw; }
@@ -4630,7 +4672,11 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     std::copy(tokens, tokens + t, win_tok_);
     win_ = t;
     const int next_slot = 1 - current_slot;
-    Behind back;
+    static const bool reuse_worker = [] {
+        const char* v = std::getenv("STRATA_POLY_PIPELINE_WORKER");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    Behind back(reuse_worker);
     const auto verify_back = [this, tokens, t, start, current_slot] {
         next_->pass_ = pipe_pass_[current_slot];
         next_->pass_at_ = start;
@@ -4642,11 +4688,13 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
         if (mtp_stage0_) {
             if (seed_draft) {
                 if (!prepare) throw std::logic_error("pipeline draft seed needs preparation");
+                prefetch_mtp_input(tokens[0]);
                 sync_mtp_stage0();  // card 1's committed MTP rows and hn are stable before its B run
                 mtp_seed_pos_ = pos_;
             }
             back.go(verify_back);
             if (prepare) prepared_n = prepare();
+            mtp_input_pos_ = -1;
         } else {
             if (seed_draft) throw std::logic_error("pipeline draft seed needs stage0 MTP");
             draft_ahead.wait();  // the last card's draft chain ran while the first card evaluated this window
@@ -4664,6 +4712,7 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
         pipe_ready_ = false;
         pipe_n_ = 0;
         mtp_seed_pos_ = -1;
+        mtp_input_pos_ = -1;
         std::rethrow_exception(failure);
     }
     if (!mtp_stage0_) back.go(verify_back);
@@ -4673,7 +4722,7 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
                "pipeline snapshot");
             pos_ = start + t;
             windowed_ = true;
-            snap_bits_ = snap_tokens(prepared_n);
+            snap_bits_ = no_snap ? 0 : snap_tokens(prepared_n);
             snap_at_ = snap_;
             run(predicted, prepared_n);
             windowed_ = false;
@@ -4846,17 +4895,48 @@ void Engine::draft_step(int32_t token, int i) {
     moe_shared(L, n_layer_, 1);
     tok_ = nullptr;   // a guess's row has no token of the sequence
     if (moe(L, n_layer_, 1)) moe_add(1);
-    axpy(fo_, 1.f, x, n_embd_, true, st_);
-    rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
+    const bool head_q8 = mtp_head_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0 &&
+                         kernels::native_mmvq_supported((int) output_.type);
+    if (head_q8)
+        kernels::native_add_rms_norm_q8_1(x, fo_, fp(d_head_), own, q8_, n_embd_, 1,
+                                          rms_eps_, sum_threads(n_embd_), st_);
+    else {
+        axpy(fo_, 1.f, x, n_embd_, true, st_);
+        rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
+    }
     Dev head = output_;   // the matrix's first rows are the common tokens'
     head.n_out = draft_rows();
-    lin(head, own, logits_, 1);
+    lin(head, own, logits_, 1, head_q8 ? q8_ : nullptr);
     finish_logits(logits_, 1);
 }
 
 // One front-card MTP guess as a graph. Its single router uses the same mapped payload and CPU sum doorbell as a
 // partial verifier pass. The front card never runs a verifier window and this draft concurrently, so those buffers
 // and their sequence number can be shared without another allocation per guess.
+void Engine::prefetch_mtp_input(int32_t token) {
+    mtp_input_pos_ = -1;
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_PREFETCH_INPUT");
+        const char* graph = std::getenv("STRATA_POLY_MTP_GRAPH");
+        return v && v[0] == '1' && v[1] == '\0' && graph && graph[0] == '1' && graph[1] == '\0';
+    }();
+    if (!enabled || !mtp_stage0_ || !partial_graph_on() || pcie_frac_ != 0.f || opt_.dump || image_at(pos_)) return;
+    // Only the embedding half is independent of the canonical hidden row. The front residual has already
+    // left for the verifier; the handoff's pack/unpack touches neither cur_ nor this input scratch.
+    if (ev_hr_) ck(cudaEventSynchronize((cudaEvent_t) ev_hr_), "MTP input prefetch");
+    else {
+        cudaEvent_t event = nullptr;
+        ck(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "MTP input prefetch");
+        ev_hr_ = event;
+    }
+    input(token, pos_, h_r_);
+    copy2(h_r_, cur_, n_embd_, nullptr, nullptr, 0, st_);
+    ck(cudaEventRecord((cudaEvent_t) ev_hr_, cs(st_)), "MTP input prefetch");
+    rms_norm(cur_, fp(d_enorm_), r_, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
+    mtp_input_pos_ = pos_;
+    mtp_input_token_ = token;
+}
+
 bool Engine::mtp_graph_draft(int32_t token, int i) {
     static const bool asked = [] {
         const char* v = std::getenv("STRATA_POLY_MTP_GRAPH");
@@ -4883,13 +4963,19 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
     // Only the token embedding upload is outside the graph. This path synchronizes at its end, so h_r_ is
     // already free before the next guess and needs no per-guess host event wait.
     const int64_t row = pos_ + i;
-    input(token, row, h_r_);
-    copy2(h_r_, cur_, n_embd_, nullptr, nullptr, 0, st_);
+    const bool pending_input = mtp_input_pos_ >= 0;
+    const bool prefetched = i == 0 && mtp_input_pos_ == row && mtp_input_token_ == token;
+    mtp_input_pos_ = -1;
+    if (!prefetched) {
+        if (pending_input) ck(cudaEventSynchronize((cudaEvent_t) ev_hr_), "MTP input prefetch");
+        input(token, row, h_r_);
+        copy2(h_r_, cur_, n_embd_, nullptr, nullptr, 0, st_);
+    }
     h_at_[0] = row;
     h_at_[1] = turn(row);
     copy2(h_at_, at_, 2 * (int) (sizeof(long long) / sizeof(float)), nullptr, nullptr, 0, st_);
 
-    std::vector<int> key{-3, room_key(i + 1), i == 0 ? 0 : 1};
+    std::vector<int> key{-3, room_key(i + 1), i == 0 ? 0 : 1, (int) prefetched};
     void*& graph = passes_[key];
     if (!graph) {
         const int64_t original_pos = pos_;
@@ -4900,7 +4986,8 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 const size_t e = (size_t) n_embd_;
                 float* own = hn_ + e;
                 const float* source = i == 0 ? hn_ : own;
-                rms_norm(cur_, fp(d_enorm_), r_, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
+                if (!prefetched)
+                    rms_norm(cur_, fp(d_enorm_), r_, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
                 rms_norm(source, fp(d_hnorm_), r_ + e, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
                 float* x = r_ + 2 * e;
                 lin(d_proj_, r_, x, 1);
@@ -4940,11 +5027,18 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 else
                     partial_graph_add(partial_device_words_, partial_device_words_ + 1,
                                       partial_device_words_ + 2, d_partial_cpu_, fo_, n_embd_, st_);
-                axpy(fo_, 1.f, x, n_embd_, true, st_);
-                rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
+                const bool head_q8 = mtp_head_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0 &&
+                                     kernels::native_mmvq_supported((int) output_.type);
+                if (head_q8)
+                    kernels::native_add_rms_norm_q8_1(x, fo_, fp(d_head_), own, q8_, n_embd_, 1,
+                                                      rms_eps_, sum_threads(n_embd_), st_);
+                else {
+                    axpy(fo_, 1.f, x, n_embd_, true, st_);
+                    rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
+                }
                 Dev head = output_;
                 head.n_out = draft_rows();
-                lin(head, own, logits_, 1);
+                lin(head, own, logits_, 1, head_q8 ? q8_ : nullptr);
                 finish_logits(logits_, 1);
                 likeliest(logits_, draft_rows(), h_guess_, st_);
             });
@@ -5011,6 +5105,14 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
 
 void Engine::sync_mtp_stage0() {
     if (!mtp_stage0_ || !next_) return;
+    static const bool compact_handoff = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_COMPACT_HANDOFF");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    static const bool async_upload = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_ASYNC_UPLOAD");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
     auto* front = dynamic_cast<Qwen35*>(this);
     auto* last = dynamic_cast<Qwen35*>(next_.get());
     if (!front || !last || !next_->draft_ || next_->pos_ != pos_)
@@ -5022,6 +5124,11 @@ void Engine::sync_mtp_stage0() {
     if (!h_mtp_rows_) {
         OnCard here(device_, split_);
         h_mtp_rows_ = (uint8_t*) hmalloc(bytes, "stage0 MTP handoff");
+    } else if (async_upload) {
+        // A preparation callback may decline the next window without drafting. In that case no draft()
+        // joined the previous upload, so join it before the last card can overwrite this pinned buffer.
+        OnCard here(device_, split_);
+        ck(cudaStreamSynchronize(cs(st_)), "stage0 MTP handoff reuse");
     }
     if (mtp_synced_ > pos_) mtp_synced_ = 0;
     {
@@ -5031,13 +5138,16 @@ void Engine::sync_mtp_stage0() {
     bool copied = false;
     for (int64_t at = mtp_synced_; at < pos_;) {
         const int n = (int) std::min<int64_t>(kRows, pos_ - at);
+        const bool source = !compact_handoff || at + n == pos_;
         {
             OnCard there(next_->device_, split_);
-            last->mtp_download_rows(at, n, h_mtp_rows_);
+            last->mtp_download_rows(at, n, h_mtp_rows_, source);
         }
         {
             OnCard here(device_, split_);
-            front->mtp_upload_rows(at, n, h_mtp_rows_);
+            // Reusing the pinned handoff needs the earlier chunks complete. The last upload can stay
+            // queued while pipeline_window launches the back verifier; draft() joins this stream before use.
+            front->mtp_upload_rows(at, n, h_mtp_rows_, !async_upload || at + n < pos_, source);
         }
         at += n;
         copied = true;
@@ -5050,7 +5160,7 @@ void Engine::sync_mtp_stage0() {
         }
         {
             OnCard here(device_, split_);
-            front->mtp_upload_rows(pos_, 0, h_mtp_rows_);
+            front->mtp_upload_rows(pos_, 0, h_mtp_rows_, !async_upload);
         }
     }
     mtp_synced_ = pos_;
@@ -5067,7 +5177,14 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
         else sync_mtp_stage0();
     }
     cover(pos_ + i + 1);
-    ck(cudaStreamSynchronize(cs(st_)), "draft");
+    static const bool ordered_stage0 = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_ORDERED");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    // Front-card handoffs and preceding guesses have already released h_r_/h_at_. MTP cache uploads use
+    // separate pinned storage and this same stream, so the next draft can follow them without a host join.
+    // Keep the completion join below: the caller consumes h_guess_ and its probability immediately.
+    if (!ordered_stage0 || !mtp_stage0_) ck(cudaStreamSynchronize(cs(st_)), "draft");
     if (mtp_graph_draft(token, i)) {
         if (i == 0) {
             ahead_pos_ = pos_;
@@ -5076,6 +5193,7 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
         *prob = h_guess_->prob;
         return h_guess_->token;
     }
+    mtp_input_pos_ = -1;
     draft_step(token, i);
     // The guess and its probability are found on the card.  On the host a vocabulary's softmax takes up to 2 ms
     // where the block is unsure, four times what the block takes.

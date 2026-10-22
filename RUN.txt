@@ -145,3 +145,12 @@ STRATA_POLY_Q35_ALPHA_BETA=1  # fused F32 projections and gate transforms for wi
 STRATA_POLY_EXPERT_ACT_Q8=1 STRATA_POLY_EXPERT_ACT_Q8_VEC4=1  # vectorized activation loads and packed Q8 stores
 STRATA_POLY_EXPERT_ACT_Q8=1 STRATA_POLY_EXPERT_ACT_Q8_SCALAR_THREADS=64  # scalar launch width 64/128/256, default 256
 STRATA_POLY_Q35_ALPHA_BETA=1 STRATA_POLY_Q35_ALPHA_BETA_PAIR=1  # share activation loads between both F32 projections
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_CHAIN=1 STRATA_POLY_PIPELINE_NO_SNAP=1  # omit dead front-prefix snapshots
+STRATA_POLY_PIPELINE_SWAP_SNAP=1  # swap rollback buffers on pipeline hits
+STRATA_POLY_MTP_ASYNC_UPLOAD=1  # overlap final stage0 upload with back verifier launch
+STRATA_POLY_MTP_COMPACT_HANDOFF=1  # omit repeated source rows and bypass source-only pack/unpack
+STRATA_POLY_MTP_ORDERED=1  # rely on front stream ordering before draft, keep result join
+STRATA_POLY_PIPELINE_WORKER=1  # reuse sleeping verifier worker across windows
+STRATA_POLY_MTP_GRAPH=1 STRATA_POLY_MTP_PREFETCH_INPUT=1  # prefetch chained token embedding while hidden source transfers
+STRATA_POLY_HEAD_NORM_Q8=1  # fuse final verifier RMS norm and Q8 quantization
+STRATA_POLY_MTP_HEAD_NORM_Q8=1  # fuse draft-head residual add, norm and Q8 quantization

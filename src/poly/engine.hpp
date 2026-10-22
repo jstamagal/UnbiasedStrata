@@ -358,6 +358,10 @@ protected:
     virtual void layer_tail(Layer& L, int il, int n) = 0;
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
+    virtual const void* output_rows_q8(int first, int rows, float* h) {
+        output_rows(first, rows, h);
+        return nullptr;
+    }
     /// A token's experts and their weights from its scores at layer il's router.  `token` is the token the row is
     /// for, or -1 where it has none (a picture's row, the draft block).  tmp: 2 * n_expert_ floats of scratch.  A
     /// prompt batch's tokens are routed by several threads at once: it changes nothing of the engine's.
@@ -458,6 +462,7 @@ protected:
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
     void draft_rows(const int32_t* tokens, int first, int n);
     bool mtp_graph_draft(int32_t token, int i);
+    void prefetch_mtp_input(int32_t token);
     void sync_mtp_stage0();
     const Image* image_at(int64_t row) const;
     bool input(int32_t token, int64_t row, float* dst) const;
@@ -554,6 +559,8 @@ protected:
     bool mtp_stage0_last_ = false;        ///< last card keeps only canonical MTP rows, not its unused MoE
     int64_t mtp_synced_ = 0;             ///< committed draft-cache rows mirrored from the last card
     int64_t mtp_seed_pos_ = -1;          ///< front MTP source seeded before last-card verification begins
+    int64_t mtp_input_pos_ = -1;
+    int32_t mtp_input_token_ = -1;
     uint8_t* h_mtp_rows_ = nullptr;      ///< bounded pinned row handoff for the front drafter
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
     const float* pass_ = nullptr;

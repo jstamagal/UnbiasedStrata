@@ -14,8 +14,8 @@ namespace strata::poly {
 class Qwen35 final : public Engine {
 public:
     size_t mtp_row_bytes() const;
-    void mtp_download_rows(int64_t first, int n, uint8_t* dst);
-    void mtp_upload_rows(int64_t first, int n, const uint8_t* src);
+    void mtp_download_rows(int64_t first, int n, uint8_t* dst, bool source = true);
+    void mtp_upload_rows(int64_t first, int n, const uint8_t* src, bool wait = true, bool source = true);
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
@@ -39,6 +39,7 @@ protected:
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
+    const void* output_rows_q8(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
     void router_scores(const Layer& L, int n) override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;

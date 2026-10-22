@@ -234,31 +234,53 @@ size_t Qwen35::mtp_row_bytes() const {
     return 2 * (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
 }
 
-void Qwen35::mtp_download_rows(int64_t first, int n, uint8_t* dst) {
+void Qwen35::mtp_download_rows(int64_t first, int n, uint8_t* dst, bool source) {
     const Block& B = blocks_[(size_t) n_layer_];
     if (n < 0 || n > 256) throw std::logic_error("MTP handoff takes at most 256 rows");
-    const size_t bytes = (size_t) n * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float);
+    const size_t source_bytes = source ? (size_t) n_embd_ * sizeof(float) : 0;
+    const size_t bytes = (size_t) n * mtp_row_bytes() + source_bytes;
+    static const bool direct_source = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_COMPACT_HANDOFF");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (direct_source && n == 0) {
+        if (source_bytes)
+            ck(cudaMemcpyAsync(dst, hn_, source_bytes, cudaMemcpyDeviceToHost, cs(st_)), "MTP source handoff");
+        ck(cudaStreamSynchronize(cs(st_)), "MTP source handoff");
+        return;
+    }
     if (!mtp_pack_) mtp_pack_ = (uint8_t*) dmalloc(256 * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float),
                                                    "MTP packed handoff");
     if (opt_.kv_format == KvFmt::kQ8_0) {
         const size_t c = (size_t) n_kv_ * head_dim_, s = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
         mtp_pack_rows(B.k_codes + (size_t) first * c, (const uint8_t*) B.k_scales + (size_t) first * s,
                       B.v_codes + (size_t) first * c, (const uint8_t*) B.v_scales + (size_t) first * s,
-                      hn_, mtp_pack_, (size_t) n * c, (size_t) n * s, (size_t) n_embd_ * sizeof(float), st_);
+                      hn_, mtp_pack_, (size_t) n * c, (size_t) n * s, source_bytes, st_);
     } else {
         const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
         mtp_pack_rows((const uint8_t*) B.keys + (size_t) first * row, nullptr,
                       (const uint8_t*) B.vals + (size_t) first * row, nullptr,
-                      hn_, mtp_pack_, (size_t) n * row, 0, (size_t) n_embd_ * sizeof(float), st_);
+                      hn_, mtp_pack_, (size_t) n * row, 0, source_bytes, st_);
     }
     ck(cudaMemcpyAsync(dst, mtp_pack_, bytes, cudaMemcpyDeviceToHost, cs(st_)), "MTP row handoff");
     ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
 }
 
-void Qwen35::mtp_upload_rows(int64_t first, int n, const uint8_t* src) {
+void Qwen35::mtp_upload_rows(int64_t first, int n, const uint8_t* src, bool wait, bool source) {
     Block& B = blocks_[(size_t) n_layer_];
     if (n < 0 || n > 256) throw std::logic_error("MTP handoff takes at most 256 rows");
-    const size_t bytes = (size_t) n * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float);
+    const size_t source_bytes = source ? (size_t) n_embd_ * sizeof(float) : 0;
+    const size_t bytes = (size_t) n * mtp_row_bytes() + source_bytes;
+    static const bool direct_source = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_COMPACT_HANDOFF");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (direct_source && n == 0) {
+        if (source_bytes)
+            ck(cudaMemcpyAsync(hn_, src, source_bytes, cudaMemcpyHostToDevice, cs(st_)), "MTP source handoff");
+        if (wait) ck(cudaStreamSynchronize(cs(st_)), "MTP source handoff");
+        return;
+    }
     if (!mtp_pack_) mtp_pack_ = (uint8_t*) dmalloc(256 * mtp_row_bytes() + (size_t) n_embd_ * sizeof(float),
                                                    "MTP packed handoff");
     ck(cudaMemcpyAsync(mtp_pack_, src, bytes, cudaMemcpyHostToDevice, cs(st_)), "MTP row handoff");
@@ -266,14 +288,14 @@ void Qwen35::mtp_upload_rows(int64_t first, int n, const uint8_t* src) {
         const size_t c = (size_t) n_kv_ * head_dim_, s = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
         mtp_unpack_rows(mtp_pack_, B.k_codes + (size_t) first * c, (uint8_t*) B.k_scales + (size_t) first * s,
                         B.v_codes + (size_t) first * c, (uint8_t*) B.v_scales + (size_t) first * s,
-                        hn_, (size_t) n * c, (size_t) n * s, (size_t) n_embd_ * sizeof(float), st_);
+                        hn_, (size_t) n * c, (size_t) n * s, source_bytes, st_);
     } else {
         const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
         mtp_unpack_rows(mtp_pack_, (uint8_t*) B.keys + (size_t) first * row, nullptr,
                         (uint8_t*) B.vals + (size_t) first * row, nullptr,
-                        hn_, (size_t) n * row, 0, (size_t) n_embd_ * sizeof(float), st_);
+                        hn_, (size_t) n * row, 0, source_bytes, st_);
     }
-    ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
+    if (wait) ck(cudaStreamSynchronize(cs(st_)), "MTP row handoff");
 }
 
 void Qwen35::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
@@ -666,6 +688,19 @@ void Qwen35::layer_tail(Layer&, int il, int n) {
 
 void Qwen35::output_rows(int first, int rows, float* h) {
     rms_norm(r_ + (size_t) first * n_embd_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
+}
+
+const void* Qwen35::output_rows_q8(int first, int rows, float* h) {
+    static const bool fuse = [] {
+        const char* v = std::getenv("STRATA_POLY_HEAD_NORM_Q8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!fuse || opt_.dump || rows < 1 || rows > 8 || n_embd_ % 32 != 0 ||
+        !kernels::native_mmvq_supported((int) output_.type))
+        return Engine::output_rows_q8(first, rows, h);
+    kernels::native_add_rms_norm_q8_1(r_ + (size_t) first * n_embd_, nullptr, fp(out_norm_), h, q8_,
+                                      n_embd_, rows, rms_eps_, sum_threads(n_embd_), st_);
+    return q8_;
 }
 
 // What ggml's MoE graph does for this model: a softmax over every expert's score, the n_used most likely, and
