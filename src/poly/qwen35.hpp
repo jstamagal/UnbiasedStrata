@@ -73,7 +73,7 @@ private:
     void gdn(Block& B, int n);
     void attn(Block& B, int64_t pos, int n);
     void attn_rows(Block& B, int n);
-    void attn_store(Block& B, int64_t pos, int n);
+    void attn_store(Block& B, int64_t pos, int n, bool projected = false);
     void turn_of(int64_t row, int32_t* thw) const;
     const int32_t* turns(int64_t pos, int n, int64_t* first);
 

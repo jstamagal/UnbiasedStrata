@@ -106,3 +106,8 @@ STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_PCIE_FRAC=0
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_MTP_GRAPH=1 STRATA_POLY_PCIE_FRAC=0 STRATA_POLY_ADAPT_OVERLAP=0 STRATA_POLY_PIPELINE_WINDOWS=2  # front-card MTP graph with CPU misses via doorbell, area C
 STRATA_POLY_Q35_GATES_WINDOW=1  # fused alpha/beta projection and gates for 2-8-row windows, area E
 STRATA_POLY_Q35_SHARED_GATE=1  # fused F32 shared gate dot and expert output scaling for 1-8 rows, area E
+
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_ADAPT_OVERLAP=1 STRATA_POLY_PCIE_FRAC=0  # rebuilt: cached-layer runahead now admits landed swaps per layer; abort clears stale plan slots, areas B/D
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_MTP_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_ADAPT_OVERLAP=1 STRATA_POLY_PCIE_FRAC=0 STRATA_POLY_PIPELINE_WINDOWS=2  # rebuilt: MTP graph accepts adaptive overlap and bypasses CPU-result waits on cached drafts, area C
+STRATA_POLY_Q35_ATTN_SET=1  # combine Q/K/V projections for 1-8-row attention windows, area E
+STRATA_POLY_Q35_KV_STORE_PAIR=1  # combine Q8_0 K/V stores using existing quantization arithmetic, area E

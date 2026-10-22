@@ -15,6 +15,8 @@ void partial_graph_publish_runahead(const float* x, const int32_t* ids, const fl
                                     int x_count, int route_count, uint32_t* ready,
                                     uint32_t* layer_ready, void* stream);
 void partial_graph_wait(const uint32_t* ready, const uint32_t* done, const uint32_t* abort, void* stream);
+void partial_graph_wait_slots(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                              void** slots, int n_expert, void* stream);
 void partial_graph_add(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
                        const float* cpu, float* sum, int count, void* stream);
 void partial_graph_add_cached(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,

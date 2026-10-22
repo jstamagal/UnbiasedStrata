@@ -41,12 +41,20 @@ __global__ void partial_ring_kernel(uint32_t* ready) {
     __threadfence_system();
 }
 
-__global__ void partial_wait_kernel(const uint32_t* ready, const uint32_t* done, const uint32_t* abort) {
+__global__ void partial_wait_kernel(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                                    void** slots, int n_expert) {
     const auto* r = reinterpret_cast<const volatile uint32_t*>(ready);
     const auto* d = reinterpret_cast<const volatile uint32_t*>(done);
     const auto* a = reinterpret_cast<const volatile uint32_t*>(abort);
-    const uint32_t need = *r;
-    while (*d != need && *a == 0) { }
+    __shared__ int cancelled;
+    if (threadIdx.x == 0) {
+        const uint32_t need = *r;
+        while (*d != need && *a == 0) { }
+        cancelled = *a != 0;
+    }
+    __syncthreads();
+    if (cancelled && slots)
+        for (int i = threadIdx.x; i < n_expert; i += blockDim.x) slots[i] = nullptr;
     __threadfence_system();
 }
 
@@ -123,7 +131,12 @@ void partial_graph_ring(uint32_t* ready, void* stream) {
 }
 
 void partial_graph_wait(const uint32_t* ready, const uint32_t* done, const uint32_t* abort, void* stream) {
-    partial_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ready, done, abort);
+    partial_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ready, done, abort, nullptr, 0);
+}
+
+void partial_graph_wait_slots(const uint32_t* ready, const uint32_t* done, const uint32_t* abort,
+                              void** slots, int n_expert, void* stream) {
+    partial_wait_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(ready, done, abort, slots, n_expert);
 }
 
 

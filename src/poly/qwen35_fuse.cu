@@ -3,6 +3,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <stdexcept>
 #include "poly_q35_conv_norm_window.cuh"
 
 namespace strata::poly {
@@ -62,6 +63,37 @@ __global__ void alpha_beta_kernel(const float* aw, const float* bw, const float*
             }
         }
         (beta ? b : a)[(size_t) row * n_out + out] = sum;
+    }
+}
+
+__global__ void kv_store_pair_kernel(const float* __restrict__ key, const float* __restrict__ value,
+                                     int8_t* __restrict__ key_codes, half* __restrict__ key_scales,
+                                     int8_t* __restrict__ value_codes, half* __restrict__ value_scales,
+                                     int n, int rows, int nb, long long pos,
+                                     const long long* __restrict__ at) {
+    const int gb = blockIdx.x * blockDim.x + threadIdx.x;
+    const int one = nb * rows;
+    if (gb >= 2 * one) return;
+    const bool is_value = gb >= one;
+    const int b = is_value ? gb - one : gb;
+    const int trow = b / nb, blk = b % nb;
+    const long long row = (at ? *at : pos) + trow;
+    const float* x = is_value ? value : key;
+    int8_t* codes = is_value ? value_codes : key_codes;
+    half* scales = is_value ? value_scales : key_scales;
+    const float* xr = x + (size_t) trow * n + blk * 32;
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xr[j]));
+    const float d = amax / 127.0f;
+    const float id = d > 0.f ? 1.0f / d : 0.0f;
+    scales[(size_t) row * nb + blk] = __float2half(d);
+    int8_t* cr = codes + (size_t) row * n + blk * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        float q = rintf(xr[j] * id);
+        q = fminf(fmaxf(q, -127.0f), 127.0f);
+        cr[j] = (int8_t) q;
     }
 }
 
@@ -136,6 +168,18 @@ void qwen35_conv_norm1(const float* x, float* state, const float* w, float* out,
                        int dim, int k_heads, float eps, float* snap, void* stream) {
     conv_norm1_kernel<<<channels / dim, dim, 0, (cudaStream_t) stream>>>(
         x, state, w, out, dim, k_heads, eps, snap);
+}
+
+void qwen35_kv_store_pair(const float* key, const float* value,
+                          int8_t* key_codes, uint16_t* key_scales,
+                          int8_t* value_codes, uint16_t* value_scales,
+                          int n, int rows, int64_t pos, const long long* at, void* stream) {
+    if ((n & 31) != 0) throw std::invalid_argument("qwen35_kv_store_pair: n is not a multiple of 32");
+    const int blocks = (n >> 5) * rows * 2;
+    if (!blocks) return;
+    kv_store_pair_kernel<<<(blocks + 255) / 256, 256, 0, (cudaStream_t) stream>>>(
+        key, value, key_codes, (half*) key_scales, value_codes, (half*) value_scales,
+        n, rows, n >> 5, (long long) pos, at);
 }
 
 void qwen35_shared_gate(const float* w, const float* x, float* gate, float* expert_out,

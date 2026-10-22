@@ -449,16 +449,23 @@ const int32_t* Qwen35::turns(int64_t pos, int n, int64_t* first) {
 
 // The rows n tokens from position `pos` leave in an attention layer's caches: each head group's key, normed and
 // turned by the position, and its value.  xn_ and xq_ hold the layer's input.
-void Qwen35::attn_store(Block& B, int64_t pos, int n) {
+void Qwen35::attn_store(Block& B, int64_t pos, int n, bool projected) {
     int64_t first;
     const int32_t* axes = turns(pos, n, &first);
     const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens from what at_ holds
-    lin(B.wk, xn_, kraw_, n, xq_);
+    if (!projected) lin(B.wk, xn_, kraw_, n, xq_);
     head_norm_rope(kraw_, head_dim_, fp(B.k_norm), k_, head_dim_, n_kv_, n_rot_, theta_scale_, first, n, rms_eps_, st_,
                    nullptr, axes, sections_, at ? at + 1 : nullptr);
-    lin(B.wv, xn_, v_, n, xq_);
+    if (!projected) lin(B.wv, xn_, v_, n, xq_);
     if (opt_.kv_format == KvFmt::kQ8_0) {
-        if (at) {
+        static const bool pair_on = [] {
+            const char* v = std::getenv("STRATA_POLY_Q35_KV_STORE_PAIR");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        if (pair_on && n <= 8 && !opt_.dump)
+            qwen35_kv_store_pair(k_, v_, B.k_codes, B.k_scales, B.v_codes, B.v_scales,
+                                 n_kv_ * head_dim_, n, pos, at, st_);
+        else if (at) {
             store_q8_at(k_, B.k_codes, B.k_scales, n_kv_ * head_dim_, at, n, 0, st_);
             store_q8_at(v_, B.v_codes, B.v_scales, n_kv_ * head_dim_, at, n, 0, st_);
         } else {
@@ -488,10 +495,23 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
     int64_t first;
     const int32_t* axes = turns(pos, n, &first);
     const long long* at = recording_ ? at_ : nullptr;
-    lin(B.wq, xn_, qg_, n, xq_);
+    static const bool attn_set_on = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_ATTN_SET");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    bool projected = false;
+    if (attn_set_on && n >= 1 && n <= 8 && !opt_.dump) {
+        const kernels::NativeMmvqItem projections[] = {
+            {(int) B.wq.type, B.wq.p, qg_, (int) B.wq.n_out},
+            {(int) B.wk.type, B.wk.p, kraw_, (int) B.wk.n_out},
+            {(int) B.wv.type, B.wv.p, v_, (int) B.wv.n_out},
+        };
+        projected = kernels::native_mmvq_set_explicit(projections, 3, xq_, n_embd_, n, st_);
+    }
+    if (!projected) lin(B.wq, xn_, qg_, n, xq_);
     head_norm_rope(qg_, 2 * head_dim_, fp(B.q_norm), q_, head_dim_, n_head_, n_rot_, theta_scale_, first, n, rms_eps_,
                    st_, nullptr, axes, sections_, at ? at + 1 : nullptr);
-    attn_store(B, pos, n);
+    attn_store(B, pos, n, projected);
     const float scale = 1.f / std::sqrt((float) head_dim_);
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
     // a prompt batch through cuBLAS; a few tokens with the kernels that give a token the same bits in any company

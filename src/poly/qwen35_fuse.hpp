@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::poly {
 
@@ -18,6 +19,12 @@ void qwen35_conv_norm1(const float* x, float* state, const float* w, float* out,
 void qwen35_conv_norm_window(const float* x, float* state, const float* w, float* out,
                              int channels, int k_heads, int rows, float eps,
                              float* snap, size_t snap_stride, unsigned snaps, void* stream);
+
+// Store Q8_0 K and V cache rows in one launch, with a fixed or device-held starting position.
+void qwen35_kv_store_pair(const float* key, const float* value,
+                          int8_t* key_codes, uint16_t* key_scales,
+                          int8_t* value_codes, uint16_t* value_scales,
+                          int n, int rows, int64_t pos, const long long* at, void* stream);
 
 // Dot the F32 shared-expert gate with each row, then apply its sigmoid to that row's output.
 void qwen35_shared_gate(const float* w, const float* x, float* gate, float* expert_out,

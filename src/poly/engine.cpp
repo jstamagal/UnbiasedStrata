@@ -2471,7 +2471,7 @@ void Engine::alloc() {
             h_partial_wts_ = (float*) ((uint8_t*) h_partial_ids_ + ids_bytes);
             d_partial_ids_ = (int32_t*) ((uint8_t*) d_partial_x_ + x_bytes);
             d_partial_wts_ = (float*) ((uint8_t*) d_partial_ids_ + ids_bytes);
-            if (graph_runahead_on() && pcie_frac_ == 0.f && !adapt_overlap_on()) {
+            if (graph_runahead_on() && pcie_frac_ == 0.f) {
                 runahead_route_stride_ = (size_t) kCpuRows * n_used_;
                 const size_t entries = (size_t) n_layer_ * runahead_route_stride_;
 #if defined(STRATA_USE_HIP)
@@ -3561,7 +3561,7 @@ void Engine::run(const int32_t* tokens, int n) {
     partial &= any_partial_layer;
     if (partial) {
         const bool with_head = graph_head_on() && windowed_ && !next_ && opt_.batch == 0;
-        const bool runahead = h_runahead_ready_ && pcie_frac_ == 0.f && !adapt_overlap_on();
+        const bool runahead = h_runahead_ready_ && pcie_frac_ == 0.f;
         if (pcie_frac_ > 0.f && !dma_stage_synced_) {
             // A prompt may have left an upload on up_; the stage is now reserved for decode.
             ck(cudaStreamSynchronize(cs(up_)), "PCIe stage from prompt");
@@ -3595,8 +3595,8 @@ void Engine::run(const int32_t* tokens, int n) {
                 }
                 moe_shared(L, il, n);
                 if (adapt_overlap_on())
-                    partial_graph_wait(partial_device_words_, partial_device_words_ + 4,
-                                       partial_device_words_ + 2, st_);
+                    partial_graph_wait_slots(partial_device_words_, partial_device_words_ + 4,
+                                             partial_device_words_ + 2, d_partial_slots_, n_expert_, st_);
                 const void* const* table = adapt_overlap_on()
                     ? (const void* const*) d_partial_slots_ : d_slots_ + (size_t) il * n_expert_;
                 const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_),
@@ -4711,7 +4711,7 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
         const char* v = std::getenv("STRATA_POLY_MTP_GRAPH");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    if (!asked || !mtp_stage0_ || !partial_graph_on() || pcie_frac_ != 0.f || adapt_overlap_on() || opt_.dump ||
+    if (!asked || !mtp_stage0_ || !partial_graph_on() || pcie_frac_ != 0.f || opt_.dump ||
         !partial_host_words_ || !h_partial_x_ || !h_partial_cpu_ || !d_ids_ || !d_wts_ ||
         image_at(pos_ + i)) return false;
     Layer& L = layers_[(size_t) n_layer_];
@@ -4723,6 +4723,8 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
         h_mtp_slots_ = (void**) hmalloc((size_t) n_expert_ * sizeof(void*), "MTP graph expert slots");
         d_mtp_slots_ = (void**) dmalloc((size_t) n_expert_ * sizeof(void*), "MTP graph expert slots");
     }
+    // This front card finishes each draft before its next run can claim landed swaps. The follower uploads
+    // into unpublished slots only, so this snapshot stays fixed throughout the graph even with overlap enabled.
     std::copy(L.slot.begin(), L.slot.end(), h_mtp_slots_);
     ck(cudaMemcpyAsync(d_mtp_slots_, h_mtp_slots_, (size_t) n_expert_ * sizeof(void*),
                        cudaMemcpyHostToDevice, cs(st_)), "MTP graph expert slots");
@@ -4773,8 +4775,13 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                     kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, n_used_, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, 1, st_);
-                partial_graph_add(partial_device_words_, partial_device_words_ + 1,
-                                  partial_device_words_ + 2, d_partial_cpu_, fo_, n_embd_, st_);
+                if (graph_runahead_on())
+                    partial_graph_add_cached(partial_device_words_, partial_device_words_ + 1,
+                                             partial_device_words_ + 2, (const void* const*) d_mtp_slots_,
+                                             d_ids_, n_used_, n_expert_, d_partial_cpu_, fo_, n_embd_, st_);
+                else
+                    partial_graph_add(partial_device_words_, partial_device_words_ + 1,
+                                      partial_device_words_ + 2, d_partial_cpu_, fo_, n_embd_, st_);
                 axpy(fo_, 1.f, x, n_embd_, true, st_);
                 rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
                 Dev head = output_;
@@ -4793,8 +4800,8 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
     }
     tok_ = nullptr;
     __atomic_store_n(partial_host_words_ + 2, 0u, __ATOMIC_RELEASE);
-    ck(cudaGraphLaunch((cudaGraphExec_t) graph, cs(st_)), "MTP graph");
     try {
+        ck(cudaGraphLaunch((cudaGraphExec_t) graph, cs(st_)), "MTP graph");
         const uint32_t expected = ++partial_expected_;
         const Clock::time_point start = Clock::now();
         uint32_t spins = 0;
@@ -4828,9 +4835,10 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
         if (n_host)
             cpu_experts(*workers_, host, n_host, 1, (int) L.gu_type, (int) L.d_type,
                         n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) n_layer_], gelu_, h_partial_cpu_);
-        else std::fill_n(h_partial_cpu_, n_embd_, 0.f);
+        else if (!graph_runahead_on()) std::fill_n(h_partial_cpu_, n_embd_, 0.f);
         stats_.cpu_ms += ms_since(cpu_start);
-        __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
+        if (!graph_runahead_on() || n_host)
+            __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
         ck(cudaStreamSynchronize(cs(st_)), "MTP graph");
     } catch (...) {
         __atomic_store_n(partial_host_words_ + 2, 1u, __ATOMIC_RELEASE);
