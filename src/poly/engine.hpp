@@ -628,6 +628,8 @@ protected:
     int dma_slots_cap_ = 0;
     bool dma_stage_synced_ = false;
     bool partial_capture_ = false;
+    float* d_handoff_input_ = nullptr;      ///< mapped alias of the stable h_r_ staging allocation
+    bool handoff_norm_active_ = false;    ///< this pass captures the first input copy together with RMS/Q8
     void router_record();
     void router_wait();
     std::vector<void*> dev_allocs_, host_allocs_;

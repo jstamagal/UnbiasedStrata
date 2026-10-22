@@ -125,6 +125,14 @@ inline bool poly_q40_expert_pair_on() {
     return on;
 }
 
+inline bool poly_expert_reuse_skip_single_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_EXPERT_REUSE_SKIP_SINGLE");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 inline bool poly_q40_expert_enabled(int n_in, int n_out) {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_Q40_EXPERT_WAVE");
@@ -156,11 +164,12 @@ inline void poly_q4_expert_slots(const S& slots, int count,
     }
     if (rows == 0) rows = poly_q40_expert_pair_on() ? 2 : 1;
     if constexpr (std::is_same_v<S, MmvqIds>) {
-        if (poly_expert_reuse_group4_on()) {
+        const bool skip_reuse = slots.ids_unique && poly_expert_reuse_skip_single_on();
+        if (!skip_reuse && poly_expert_reuse_group4_on()) {
             poly_expert_reuse_group4<Weight, PARTIAL>(slots, count, n_in, n_out, rows, stream);
             return;
         }
-        if (poly_expert_reuse_pair_on()) {
+        if (!skip_reuse && poly_expert_reuse_pair_on()) {
             poly_expert_reuse_pair<Weight, PARTIAL>(slots, count, n_in, n_out, rows, stream);
             return;
         }

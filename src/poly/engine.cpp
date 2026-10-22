@@ -78,6 +78,13 @@ bool partial_graph_on() {
     }();
     return on;
 }
+bool handoff_norm_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_HANDOFF_NORM_Q8");
+        return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool graph_head_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_GRAPH_HEAD");
@@ -2582,6 +2589,12 @@ void Engine::alloc() {
     q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
+    if (handoff_norm_on() && lo_ > 0 && dynamic_cast<Qwen35*>(this)) {
+        if (cudaHostGetDevicePointer((void**) &d_handoff_input_, h_r_, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d_handoff_input_ = nullptr;  // an unmapped allocation retains the ordinary upload path
+        }
+    }
     const size_t at_rows = (size_t) std::max(opt_.window, opt_.batch + 1);   // window()'s tokens, step()'s
     at_ = (long long*) dmalloc(at_rows * 2 * sizeof(long long), "scratch");
     h_at_ = (long long*) hmalloc(at_rows * 2 * sizeof(long long), "pinned memory");
@@ -3165,9 +3178,11 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     }
     L.card = 1;
     const int rr = n * n_used_;
+    // Qwen's top-k selects each expert at most once per token.
+    const bool ids_unique = n == 1 && dynamic_cast<const Qwen35*>(this);
     const void* const* table = d_slots_ + (size_t) il * n_expert_;
     const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
-                                   2 * (size_t) n_ff_exp_};
+                                   2 * (size_t) n_ff_exp_, nullptr, nullptr, ids_unique};
     kernels::native_mmvq_ids((int) L.gu_type, gate_up, rr, n_embd_, 2 * n_ff_exp_, st_);
     if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
         expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
@@ -3177,7 +3192,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
         kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     }
     const kernels::MmvqIds down{table, d_ids_, 2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
-                                (size_t) n_embd_};
+                                (size_t) n_embd_, nullptr, nullptr, ids_unique};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
     return true;
@@ -3576,10 +3591,15 @@ void Engine::run(const int32_t* tokens, int n) {
         const char* v = std::getenv("STRATA_POLY_DIRECT_HANDOFF");
         return v && std::strcmp(v, "1") == 0;
     }();
+    // h_r_ has an engine-long address, so two pipeline handoffs can share one captured first-layer kernel.
+    // The stream synchronization above protects it until the previous mapped read is finished.
+    const bool handoff_candidate = pass_ && d_handoff_input_ && n <= 8 && n_embd_ % 32 == 0 &&
+                                   opt_.graphs && !opt_.dump;
+    handoff_norm_active_ = false;
     const float* input_rows = h_r_;
     if (pass_) {   // a later card: the card before it left the rows
         const float* handed = pass_ + (size_t) (pos_ - pass_at_) * r_row;
-        if (direct_handoff) input_rows = handed;
+        if (direct_handoff && !handoff_candidate) input_rows = handed;
         else std::memcpy(h_r_, handed, (size_t) n * r_row * sizeof(float));
     } else {
         for (int t = 0; t < n; ++t) {
@@ -3589,8 +3609,11 @@ void Engine::run(const int32_t* tokens, int n) {
             for (int h = 1; h < streams(); ++h) std::memcpy(r + (size_t) h * e_row, r, e_row * sizeof(float));
         }
     }
-    if (n < kStageRows && input_rows == h_r_) copy2(h_r_, r_, n * (int) r_row, nullptr, nullptr, 0, st_);
-    else ck(cudaMemcpyAsync(r_, input_rows, (size_t) n * r_row * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
+    const auto upload_input = [&] {
+        if (n < kStageRows && input_rows == h_r_) copy2(h_r_, r_, n * (int) r_row, nullptr, nullptr, 0, st_);
+        else ck(cudaMemcpyAsync(r_, input_rows, (size_t) n * r_row * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
+    };
+    if (!handoff_candidate) upload_input();
 
     // A token alone, or a window of guessed ones, hands the card the same launches every time, some thirty a
     // layer up to the router, and they cost this thread more than the card.  They are recorded once, a graph a
@@ -3740,6 +3763,9 @@ void Engine::run(const int32_t* tokens, int n) {
             any_partial_layer |= std::any_of(L.slot.begin(), L.slot.end(), [](const void* p) { return p == nullptr; });
     }
     partial &= any_partial_layer;
+    handoff_norm_active_ = handoff_candidate && partial;
+    // Unsupported formats, prompt calls and fully cached stages keep the existing input path.
+    if (handoff_candidate && !partial) upload_input();
     if (partial) {
         const bool with_head = graph_head_on() && windowed_ && !next_ && opt_.batch == 0;
         const bool runahead = h_runahead_ready_ && (pcie_frac_ == 0.f || dma_runahead_on());
@@ -3752,7 +3778,8 @@ void Engine::run(const int32_t* tokens, int n) {
             dma_stage_synced_ = true;
         }
         std::vector<int> key{-2, n, (int) with_head, (int) runahead, snap_key, snap_offset_key,
-                             (int) uint32_t(rollback_key), (int) uint32_t(rollback_key >> 32)};
+                             (int) uint32_t(rollback_key), (int) uint32_t(rollback_key >> 32),
+                             (int) handoff_norm_active_};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
         if (!pass) {
@@ -3790,6 +3817,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 }
                 const int32_t* reuse_partner = published ? d_reuse_partner_ : nullptr;
                 const int32_t* reuse_group4 = published ? d_reuse_group4_ : nullptr;
+                const bool ids_unique = n == 1 && dynamic_cast<const Qwen35*>(this);
                 moe_shared(L, il, n);
                 if (adapt_overlap_on())
                     partial_graph_wait_slots(partial_device_words_, partial_device_words_ + 4,
@@ -3797,7 +3825,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 const void* const* table = adapt_overlap_on()
                     ? (const void* const*) d_partial_slots_ : d_slots_ + (size_t) il * n_expert_;
                 const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_),
-                                               n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4};
+                                               n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4, ids_unique};
                 kernels::native_mmvq_ids_partial(2, gate_up, rr, n_embd_, 2 * n_ff_exp_, st_);
                 if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
                     expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
@@ -3807,7 +3835,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
                 }
                 const kernels::MmvqIds down{table, d_ids_, 2 * L.gu_bytes, q8_,
-                                            kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4};
+                                            kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4, ids_unique};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 if (pcie_frac_ > 0.f) {
@@ -3822,7 +3850,7 @@ void Engine::run(const int32_t* tokens, int n) {
                                                n_expert_, st_);
                     const kernels::MmvqIds dma_gu{(const void* const*) d_dma_safe_slots_, d_ids_, 0, xq_,
                                                   kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
-                                                  2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4};
+                                                  2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4, ids_unique};
                     kernels::native_mmvq_ids_partial(2, dma_gu, rr, n_embd_, 2 * n_ff_exp_, st_);
                     if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
                         expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
@@ -3832,7 +3860,7 @@ void Engine::run(const int32_t* tokens, int n) {
                         kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
                     }
                     const kernels::MmvqIds dma_down{(const void* const*) d_dma_safe_slots_, d_ids_,
-                        2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4};
+                        2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4, ids_unique};
                     kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
                     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 }
@@ -5114,9 +5142,10 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 }
                 const int32_t* reuse_partner = published ? d_reuse_partner_ : nullptr;
                 const int32_t* reuse_group4 = published ? d_reuse_group4_ : nullptr;
+                const bool ids_unique = dynamic_cast<const Qwen35*>(this) != nullptr;
                 moe_shared(L, n_layer_, 1);
                 const kernels::MmvqIds gate_up{(const void* const*) d_mtp_slots_, d_ids_, 0, xq_,
-                    kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4};
+                    kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4, ids_unique};
                 kernels::native_mmvq_ids_partial((int) L.gu_type, gate_up, n_used_, n_embd_, 2 * n_ff_exp_, st_);
                 if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
                     expert_activation_q8(g_, q8_, n_ff_exp_, n_used_, clamp_exp_[(size_t) n_layer_], gelu_, st_);
@@ -5126,7 +5155,7 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * n_used_, 1, st_);
                 }
                 const kernels::MmvqIds down{(const void* const*) d_mtp_slots_, d_ids_, 2 * L.gu_bytes, q8_,
-                    kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4};
+                    kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4, ids_unique};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, n_used_, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, 1, st_);
                 if (graph_runahead_on())

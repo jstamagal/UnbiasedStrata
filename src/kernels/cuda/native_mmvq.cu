@@ -234,7 +234,7 @@ __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gat
 // with its block size (SUM threads of the block) and its IEEE operations written out (this file is built with
 // --use_fast_math).  Then every thread of the block takes values, a warp 32 of one Q8_1 block, and quantizes them as
 // native_quantize_q8_1_kernel does: more threads than the sum's make the row's quantization fewer steps.
-template<int SUM>
+template<int SUM, bool COPY = false>
 __launch_bounds__(1024, 1)
 __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
                                                 const float* __restrict__ w, float* __restrict__ y,
@@ -247,8 +247,12 @@ __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const flo
     if (threadIdx.x < SUM) {
         float ss = 0.0f;
         for (int i = threadIdx.x; i < n; i += SUM) {
-            float v = xr[i];
-            if (ar) xr[i] = v = __fadd_rn(v, ar[i]);
+            float v;
+            if constexpr (COPY) xr[i] = v = ar[i];
+            else {
+                v = xr[i];
+                if (ar) xr[i] = v = __fadd_rn(v, ar[i]);
+            }
             ss = __fmaf_rn(v, v, ss);
         }
         ss = warp_sum(ss);
@@ -3109,6 +3113,30 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     case 512: native_add_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     case 1024: native_add_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+}
+
+// The mapped source is read once, into the residual. After the block barrier the norm and Q8 pass read VRAM.
+void native_copy_rms_norm_q8_1(const float* input, float* x, const float* w, float* y, void* y_q8_1,
+                               int n, int rows, float eps, int threads, void* stream) {
+    validate_shape(n, 1);
+    validate_pointer(input);
+    validate_pointer(x);
+    validate_pointer(w);
+    validate_pointer(y);
+    validate_pointer(y_q8_1);
+    validate_stream(stream);
+    if (rows < 1) return;
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto* q = static_cast<Q81Block*>(y_q8_1);
+    const int block = std::max(threads, std::min(1024, n));
+    switch (threads) {
+    case 128: native_add_rms_norm_q8_1_kernel<128, true><<<rows, block, 0, s>>>(x, input, w, y, q, n, eps); break;
+    case 256: native_add_rms_norm_q8_1_kernel<256, true><<<rows, block, 0, s>>>(x, input, w, y, q, n, eps); break;
+    case 512: native_add_rms_norm_q8_1_kernel<512, true><<<rows, block, 0, s>>>(x, input, w, y, q, n, eps); break;
+    case 1024: native_add_rms_norm_q8_1_kernel<1024, true><<<rows, block, 0, s>>>(x, input, w, y, q, n, eps); break;
+    default: throw std::invalid_argument("native_copy_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
     }
     launch_check();
 }

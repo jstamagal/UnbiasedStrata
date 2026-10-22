@@ -660,7 +660,10 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
     const bool quick = fuse && n <= 8 && !opt_.dump;
     const bool carried = tail_next_norm_on() && partial_capture_ && n <= 8 && !opt_.dump &&
                          il > lo_ && layers_[(size_t) il - 1].moe;
-    if (quick || carried)
+    if (handoff_norm_active_ && partial_capture_ && il == lo_)
+        kernels::native_copy_rms_norm_q8_1(d_handoff_input_, r_, fp(L.attn_norm), xn_, xq_, n_embd_, n,
+                                          rms_eps_, sum_threads(n_embd_), st_);
+    else if (quick || carried)
         kernels::native_add_rms_norm_q8_1(r_, carried ? fo_ : nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, n,
                                            rms_eps_, sum_threads(n_embd_), st_);
     else {

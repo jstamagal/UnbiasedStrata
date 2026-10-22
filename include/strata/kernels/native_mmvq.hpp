@@ -51,6 +51,10 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 /// keeps the sum.  n is a multiple of 32.
 void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
                               float eps, int threads, void* stream);
+/// Copy a mapped input to the device residual x, then the same RMS/Q8 preparation as above. Each input
+/// value crosses PCIe once; both the residual and the normalized float/Q8 outputs remain on the device.
+void native_copy_rms_norm_q8_1(const float* input, float* x, const float* w, float* y, void* y_q8_1,
+                               int n, int rows, float eps, int threads, void* stream);
 void native_mtp_proj_norm_q8_1(const float* x0, const float* w0, const float* x1, const float* w1,
                                float* y, void* y_q8_1, int n, int rows, float eps, int threads,
                                bool embed_ready, void* stream);
@@ -170,6 +174,8 @@ struct MmvqIds {
     std::size_t y_stride;
     const int32_t* reuse_partner = nullptr;
     const int32_t* reuse_group4 = nullptr;
+    // The caller proves ids[0:count] are unique; independent of x_every.
+    bool ids_unique = false;
 };
 bool native_mmvq_ids_supported(int ggml_type);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
