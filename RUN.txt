@@ -155,3 +155,4 @@ STRATA_POLY_MTP_GRAPH=1 STRATA_POLY_MTP_PREFETCH_INPUT=1  # prefetch chained tok
 STRATA_POLY_HEAD_NORM_Q8=1  # fuse final verifier RMS norm and Q8 quantization
 STRATA_POLY_MTP_HEAD_NORM_Q8=1  # fuse draft-head residual add, norm and Q8 quantization
 STRATA_POLY_ROUTER_TOPK=1 STRATA_POLY_ROUTER_TOPK_WINDOW=1 STRATA_POLY_ROUTER_TOPK_WINDOW3=1  # exact three-row router window specialization
+STRATA_POLY_DENSE_X_SCALE=1  # broadcast packed Q8 scales across dense wave lane groups
