@@ -902,6 +902,9 @@ __global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __re
 struct ExpertQ81Block { half2 ds; int8_t qs[32]; };
 static_assert(sizeof(ExpertQ81Block) == 36);
 
+#include "expert_activation_vec4.cuh"
+#include "expert_activation_launch.cuh"
+
 template<bool GELU>
 __global__ void expert_activation_q8_kernel(const float* __restrict__ gate_up,
                                             ExpertQ81Block* __restrict__ out,
@@ -2669,10 +2672,15 @@ void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream)
 void expert_activation_q8(const float* gate_up, void* out, int n, int rows, float limit,
                           bool gelu, void* stream) {
     if (n <= 0 || rows <= 0 || n % 32 != 0) throw std::invalid_argument("expert_activation_q8: invalid shape");
-    const unsigned blocks = grid((size_t) n * rows, 256);
-    if (gelu) expert_activation_q8_kernel<true><<<blocks, 256, 0, cs(stream)>>>(
+    if (expert_activation_q8_vec4_on()) {
+        expert_activation_q8_vec4(gate_up, out, n, rows, limit, gelu, stream);
+        return;
+    }
+    const int threads = expert_activation_q8_scalar_threads();
+    const unsigned blocks = grid((size_t) n * rows, threads);
+    if (gelu) expert_activation_q8_kernel<true><<<blocks, threads, 0, cs(stream)>>>(
         gate_up, (ExpertQ81Block*) out, n, rows, limit);
-    else expert_activation_q8_kernel<false><<<blocks, 256, 0, cs(stream)>>>(
+    else expert_activation_q8_kernel<false><<<blocks, threads, 0, cs(stream)>>>(
         gate_up, (ExpertQ81Block*) out, n, rows, limit);
 }
 
