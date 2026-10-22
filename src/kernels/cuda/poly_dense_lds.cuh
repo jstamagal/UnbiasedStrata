@@ -4,7 +4,7 @@ template<typename F, int NC, int ROWS>
 __launch_bounds__(128)
 __global__ void poly_dense_lds_kernel(const typename F::Block* __restrict__ w,
                                      const Q81Block* __restrict__ x, float* __restrict__ y,
-                                     int n_in, int n_out, bool vector_load, bool broadcast_scale,
+                                     int n_in, int n_out, int weight_mode, bool broadcast_scale,
                                      bool transpose_sum) {
     constexpr int MAX_BLOCKS = 3072 / 32;
     constexpr int WORDS_PER_BLOCK = sizeof(Q81Block) / sizeof(uint32_t);
@@ -35,7 +35,7 @@ __global__ void poly_dense_lds_kernel(const typename F::Block* __restrict__ w,
                 for (int row = 0; row < ROWS; ++row) {
                     if (row0 + row < n_out) {
                         const typename F::W weight = poly_dense_weight_load<F>(
-                            w + size_t(row0 + row) * nb + kb, iqs, vector_load);
+                            w + size_t(row0 + row) * nb + kb, iqs, weight_mode);
 #pragma unroll
                         for (int col = 0; col < NC; ++col)
                             sum[group][col][row] += Fragment::dot(weight, activation[col]);
@@ -63,7 +63,7 @@ void poly_dense_lds_n(const typename F::Block* w, const Q81Block* x, float* y,
                       int n_in, int n_out, cudaStream_t stream) {
     const dim3 grid(unsigned((size_t(n_out) + 4 * ROWS - 1) / (4 * ROWS)));
     poly_dense_lds_kernel<F, NC, ROWS><<<grid, dim3(32, 4), 0, stream>>>(
-        w, x, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on());
+        w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on());
 }
 
 template<typename F, int ROWS>

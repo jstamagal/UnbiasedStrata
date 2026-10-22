@@ -172,3 +172,4 @@ STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_EXPERT_REUSE_
 STRATA_POLY_DENSE_X_LDS=1  # stage dense Q8 activations once per CTA, 1-4 columns and K<=3072; precedes PREFETCH
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_EXPERT_REUSE_GROUP4_META=1  # routing prepares four-occurrence expert groups once
 STRATA_POLY_MTP_PROJ_Q8=1  # draft input norms produce projection Q8 directly, with concat scratch capacity
+STRATA_POLY_DENSE_W_SCALE=1  # broadcast exact fp16 weight scales within dense block lane groups

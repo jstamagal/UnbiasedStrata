@@ -1,11 +1,16 @@
 #pragma once
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#include "poly_dense_wscale.cuh"
 inline bool poly_dense_weight_vector_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_DENSE_WEIGHT_VEC");
         return v && v[0] == '1' && v[1] == '\0';
     }();
     return on;
+}
+
+inline int poly_dense_weight_mode() {
+    return int(poly_dense_weight_vector_on()) | (int(poly_dense_wscale_on()) << 1);
 }
 
 __device__ __forceinline__ int2 poly_dense_weight_pair(const uint8_t* p) {
@@ -28,20 +33,27 @@ __device__ __forceinline__ int2 poly_dense_weight_pair(const uint8_t* p) {
 
 template<typename F>
 __device__ __forceinline__ typename F::W poly_dense_weight_load(
-        const typename F::Block* w, int iqs, bool vector_load) {
-    if (!vector_load) return F::load(w, iqs);
-    const int2 codes = poly_dense_weight_pair(reinterpret_cast<const uint8_t*>(w->qs) + 4 * iqs);
+        const typename F::Block* w, int iqs, int weight_mode) {
+    if (weight_mode == 0) return F::load(w, iqs);
+    int2 codes;
+    if (weight_mode & 1) {
+        codes = poly_dense_weight_pair(reinterpret_cast<const uint8_t*>(w->qs) + 4 * iqs);
+    } else {
+        codes.x = load_int_b2(w->qs, iqs);
+        codes.y = load_int_b2(w->qs, iqs + 1);
+    }
+    const float scale = poly_dense_wscale<F>(w, (weight_mode & 2) != 0);
     typename F::W result;
     if constexpr (std::is_same_v<F, SmallTraits<Q40Block, 4>>) {
         result.vi0[0] = codes.x & 0x0f0f0f0f;
         result.vi1[0] = (codes.x >> 4) & 0x0f0f0f0f;
         result.vi0[1] = codes.y & 0x0f0f0f0f;
         result.vi1[1] = (codes.y >> 4) & 0x0f0f0f0f;
-        result.d = w->d;
+        result.d = scale;
     } else {
         result.v[0] = codes.x;
         result.v[1] = codes.y;
-        result.d0 = w->d;
+        result.d0 = scale;
     }
     return result;
 }

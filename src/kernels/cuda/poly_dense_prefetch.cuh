@@ -4,7 +4,7 @@ template<typename F, int NC, int ROWS>
 __device__ __forceinline__ void poly_dense_prefetch_load(
         const typename F::Block* w, const Q81Block* x, int nb, int n_out, int row0, int kb, int iqs,
         typename PolyDenseFragment<F>::X (&activation)[NC], typename F::W (&weight)[ROWS],
-        bool vector_load, bool broadcast_scale) {
+        int weight_mode, bool broadcast_scale) {
     if (kb >= nb) return;
 #pragma unroll
     for (int col = 0; col < NC; ++col)
@@ -12,14 +12,14 @@ __device__ __forceinline__ void poly_dense_prefetch_load(
 #pragma unroll
     for (int row = 0; row < ROWS; ++row)
         if (row0 + row < n_out)
-            weight[row] = poly_dense_weight_load<F>(w + size_t(row0 + row) * nb + kb, iqs, vector_load);
+            weight[row] = poly_dense_weight_load<F>(w + size_t(row0 + row) * nb + kb, iqs, weight_mode);
 }
 
 template<typename F, int NC, int ROWS>
 __launch_bounds__(128)
 __global__ void poly_dense_prefetch_kernel(const typename F::Block* __restrict__ w,
                                           const Q81Block* __restrict__ x, float* __restrict__ y,
-                                          int n_in, int n_out, bool vector_load, bool broadcast_scale,
+                                          int n_in, int n_out, int weight_mode, bool broadcast_scale,
                                           bool transpose_sum) {
     using Fragment = PolyDenseFragment<F>;
     const int row0 = (4 * int(blockIdx.x) + int(threadIdx.y)) * ROWS;
@@ -31,14 +31,14 @@ __global__ void poly_dense_prefetch_kernel(const typename F::Block* __restrict__
     typename F::W weight[ROWS] = {}, next_weight[ROWS] = {};
     float sum[4][NC][ROWS] = {};
     poly_dense_prefetch_load<F, NC, ROWS>(w, x, nb, n_out, row0, lane / F::T, iqs,
-                                        activation, weight, vector_load, broadcast_scale);
+                                        activation, weight, weight_mode, broadcast_scale);
     for (int base = lane / F::T; base < nb; base += F::BPI) {
 #pragma unroll
         for (int group = 0; group < 4; ++group) {
             const int kb = base + group * (32 / F::T);
             const int next_kb = group == 3 ? base + F::BPI : base + (group + 1) * (32 / F::T);
             poly_dense_prefetch_load<F, NC, ROWS>(w, x, nb, n_out, row0, next_kb, iqs,
-                                                next_activation, next_weight, vector_load, broadcast_scale);
+                                                next_activation, next_weight, weight_mode, broadcast_scale);
             if (kb < nb) {
 #pragma unroll
                 for (int row = 0; row < ROWS; ++row) {
@@ -74,7 +74,7 @@ void poly_dense_prefetch_n(const typename F::Block* w, const Q81Block* x, float*
                            int n_in, int n_out, cudaStream_t stream) {
     const dim3 grid(unsigned((size_t(n_out) + 4 * ROWS - 1) / (4 * ROWS)));
     poly_dense_prefetch_kernel<F, NC, ROWS><<<grid, dim3(32, 4), 0, stream>>>(
-        w, x, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on());
+        w, x, y, n_in, n_out, poly_dense_weight_mode(), poly_dense_xscale_on(), poly_dense_tsum_on());
 }
 
 template<typename F, int ROWS>
