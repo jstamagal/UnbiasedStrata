@@ -2739,6 +2739,17 @@ bool router_f32_publish(const float* weights, const float* x, float* logits, int
             kernel<<<n_expert, physical_threads, 0, cs(stream)>>>(weights, x, logits, n_in, n_expert,
                                                                    n_used, rows, threads, ticket, ids, w, publish);
         };
+        static const bool window3_on = [] {
+            const char* value = std::getenv("STRATA_POLY_ROUTER_TOPK_WINDOW3");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (window3_on && rows == 3) {
+            if (n_expert <= 2 * WARP) launch_window(router_f32_publish_window_kernel<2, 3>);
+            else if (n_expert <= 4 * WARP) launch_window(router_f32_publish_window_kernel<4, 3>);
+            else if (n_expert <= 8 * WARP) launch_window(router_f32_publish_window_kernel<8, 3>);
+            else launch_window(router_f32_publish_window_kernel<ROUTE_PER, 3>);
+            return true;
+        }
         if (rows <= 4) {
             if (n_expert <= 2 * WARP) launch_window(router_f32_publish_window_kernel<2, 4>);
             else if (n_expert <= 4 * WARP) launch_window(router_f32_publish_window_kernel<4, 4>);
