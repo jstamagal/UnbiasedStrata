@@ -85,6 +85,13 @@ bool graph_head_on() {
     }();
     return on;
 }
+bool mtp_likeliest_split_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_LIKELIEST_SPLIT");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool mtp_head_norm_q8_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_MTP_HEAD_NORM_Q8");
@@ -2516,6 +2523,8 @@ void Engine::alloc() {
     if (draft_) {
         hn_ = state_ + rec_n_;
         h_guess_ = (Likeliest*) hmalloc(sizeof(Likeliest), "pinned memory");   // likeliest() writes it
+        if (mtp_likeliest_split_on())
+            d_guess_work_ = (LikeliestWork*) dmalloc(sizeof(LikeliestWork), "draft reduction scratch");
     }
     // window(): the state after tokens of it, for keep(), and every token's logits
     snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
@@ -5140,7 +5149,7 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 head.n_out = draft_rows();
                 lin(head, own, logits_, 1, head_q8 ? q8_ : nullptr);
                 finish_logits(logits_, 1);
-                likeliest(logits_, draft_rows(), h_guess_, st_);
+                likeliest(logits_, draft_rows(), h_guess_, st_, d_guess_work_);
             });
         } catch (...) {
             partial_capture_ = false;
@@ -5297,7 +5306,7 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     draft_step(token, i);
     // The guess and its probability are found on the card.  On the host a vocabulary's softmax takes up to 2 ms
     // where the block is unsure, four times what the block takes.
-    likeliest(logits_, draft_rows(), h_guess_, st_);
+    likeliest(logits_, draft_rows(), h_guess_, st_, d_guess_work_);
     ck(cudaStreamSynchronize(cs(st_)), "draft");
     if (i == 0) {
         ahead_pos_ = pos_;

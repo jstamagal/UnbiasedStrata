@@ -35,6 +35,7 @@ namespace strata::poly {
 
 class Shards;
 struct Likeliest;
+struct LikeliestWork;
 
 /// The attention caches' storing format: fp16 (default) or ggml Q8_0; opt-in via --kv.
 enum class KvFmt { kFp16 = 0, kQ8_0 = 1 };
@@ -727,6 +728,7 @@ protected:
     // the last token of the sequence, and the outputs of the tokens of the call under way follow it.
     float* hn_ = nullptr;
     Likeliest* h_guess_ = nullptr;   ///< a guess and its probability, pinned
+    LikeliestWork* d_guess_work_ = nullptr;   ///< optional split reduction's persistent device workspace
     int32_t win_tok_[8] = {};           ///< the window's tokens, for keep()
     int64_t ahead_pos_ = -1;            ///< draft() has left the block's row of this position as its token leaves it,
     int32_t ahead_tok_ = 0;             ///< which is this one

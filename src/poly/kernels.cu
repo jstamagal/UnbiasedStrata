@@ -1069,12 +1069,52 @@ __device__ __forceinline__ int32_t route_reuse_partner_ballot(const int32_t* ids
     return -1;
 }
 
+// Each warp cooperates on one fixed four-int record, preserving occurrence-order groups.
+__device__ __forceinline__ void route_reuse_group4_ballot(const int32_t* ids, int count, int entry, int32_t* records) {
+    const int lane = int(threadIdx.x) & (WARP - 1);
+    const int expert = __shfl_sync(0xffffffffu, lane == 0 ? ids[entry] : 0, 0, WARP);
+    int previous = 0, group_count = 0, partner1 = -1, partner2 = -1, partner3 = -1;
+    for (int first = 0; first < count; first += WARP) {
+        const int index = first + lane;
+        const uint32_t matches = uint32_t(__ballot_sync(0xffffffffu, index < count && ids[index] == expert));
+        if (first + WARP <= entry) {
+            previous += __popc(matches);
+            continue;
+        }
+        uint32_t later = matches;
+        if (first <= entry) {
+            const int before = entry - first;
+            const uint32_t lower = before == 0 ? 0u : ((1u << before) - 1u);
+            previous += __popc(matches & lower);
+            if (previous & 3) break;
+            group_count = 1;
+            later &= before == WARP - 1 ? 0u : (~0u << (before + 1));
+        }
+        while (later && group_count < 4) {
+            const int partner = first + __ffs(later) - 1;
+            if (group_count == 1) partner1 = partner;
+            else if (group_count == 2) partner2 = partner;
+            else partner3 = partner;
+            ++group_count;
+            later &= later - 1;
+        }
+        if (group_count == 4) break;
+    }
+    if (lane == 0) {
+        int32_t* record = records + size_t(entry) * 4;
+        record[0] = group_count;
+        record[1] = partner1;
+        record[2] = partner2;
+        record[3] = partner3;
+    }
+}
+
 RoutePublish route_publish_config(RoutePublish publish) {
     static const bool ballot = [] {
         const char* value = std::getenv("STRATA_POLY_EXPERT_REUSE_META_BALLOT");
         return value && value[0] == '1' && value[1] == '\0';
     }();
-    publish.partner_ballot = publish.partners && ballot;
+    publish.partner_ballot = (publish.partners || publish.expert_group4) && ballot;
     return publish;
 }
 
@@ -1154,9 +1194,16 @@ __device__ __forceinline__ void route_publish_body(const volatile float* logits,
     // All warps, including inactive rows and lanes beyond n_used, reach this barrier.
     __syncthreads();
     const int t = int(threadIdx.x);
-    if (publish.expert_group4)
-        for (int entry = t; entry < rows * n_used; entry += blockDim.x)
-            route_reuse_group4(ids, rows * n_used, entry, publish.expert_group4);
+    if (publish.expert_group4) {
+        if (publish.partner_ballot) {
+            const int warps = int(blockDim.x) / WARP;
+            for (int entry = t / WARP; entry < rows * n_used; entry += warps)
+                route_reuse_group4_ballot(ids, rows * n_used, entry, publish.expert_group4);
+        } else {
+            for (int entry = t; entry < rows * n_used; entry += blockDim.x)
+                route_reuse_group4(ids, rows * n_used, entry, publish.expert_group4);
+        }
+    }
     if (publish.partners) {
         if (publish.partner_ballot) {
             const int warps = int(blockDim.x) / WARP;
@@ -2183,6 +2230,49 @@ __global__ void likeliest_kernel(const float* __restrict__ x, int n, Likeliest* 
     out->prob = 1.0f / sum;
 }
 
+// Spread the original 1,024 logical lanes over 32 independent CTAs. Each lane still walks every 1,024th
+// logit in order; each warp uses the original shuffle order, and the final fold keeps warp order too.
+__global__ void likeliest_max_split_kernel(const float* __restrict__ x, int n,
+                                           LikeliestWork* __restrict__ work) {
+    const int lane = int(blockIdx.x) * WARP + threadIdx.x;
+    float m = -INFINITY;
+    for (int i = lane; i < n; i += 1024) m = fmaxf(m, x[i]);
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o, WARP));
+    if (threadIdx.x == 0) work->maximum[blockIdx.x] = m;
+}
+
+__global__ void likeliest_sum_split_kernel(const float* __restrict__ x, int n,
+                                           LikeliestWork* __restrict__ work) {
+    float m = work->maximum[0];
+    for (int k = 1; k < 32; ++k) m = fmaxf(m, work->maximum[k]);
+    const int lane = int(blockIdx.x) * WARP + threadIdx.x;
+    int at = n;
+    float sum = 0.0f;
+    for (int i = lane; i < n; i += 1024) {
+        if (x[i] == m) at = min(at, i);
+        if (x[i] > m - 20.0f) sum += expf(x[i] - m);
+    }
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) at = min(at, __shfl_xor_sync(0xffffffff, at, o, WARP));
+    sum = warp_sum(sum);
+    if (threadIdx.x == 0) {
+        work->sum[blockIdx.x] = sum;
+        work->first[blockIdx.x] = at;
+    }
+}
+
+__global__ void likeliest_finish_split_kernel(const LikeliestWork* __restrict__ work, int n,
+                                              Likeliest* __restrict__ out) {
+    if (threadIdx.x != 0) return;
+    float sum = 0.0f;
+    int at = work->first[0];
+    for (int k = 0; k < 32; ++k) sum += work->sum[k];
+    for (int k = 1; k < 32; ++k) at = min(at, work->first[k]);
+    out->token = at < n ? at : 0;
+    out->prob = 1.0f / sum;
+}
+
 __global__ void mul_sigmoid_kernel(float* __restrict__ acc, const float* __restrict__ g, int n, int g_stride,
                                    bool one_gate) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3118,8 +3208,14 @@ void softcap(float* x, size_t n, float cap, void* stream) {
     softcap_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(x, n, cap);
 }
 
-void likeliest(const float* logits, int n, Likeliest* out, void* stream) {
-    likeliest_kernel<<<1, 1024, 0, cs(stream)>>>(logits, n, out);
+void likeliest(const float* logits, int n, Likeliest* out, void* stream, LikeliestWork* work) {
+    if (work) {
+        likeliest_max_split_kernel<<<32, WARP, 0, cs(stream)>>>(logits, n, work);
+        likeliest_sum_split_kernel<<<32, WARP, 0, cs(stream)>>>(logits, n, work);
+        likeliest_finish_split_kernel<<<1, WARP, 0, cs(stream)>>>(work, n, out);
+    } else {
+        likeliest_kernel<<<1, 1024, 0, cs(stream)>>>(logits, n, out);
+    }
 }
 
 void mul_sigmoid(float* acc, const float* g, int n, int rows, int g_stride, bool one_gate, void* stream) {
