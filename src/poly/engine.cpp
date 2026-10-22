@@ -67,6 +67,14 @@ bool partial_graph_on() {
     }();
     return on;
 }
+bool adapt_overlap_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_ADAPT_OVERLAP");
+        return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 
 int tile_class(int rows) {
     int c = 0;
@@ -368,7 +376,7 @@ size_t ram_available() {
 // One expert on its way into the cache.  The engine's thread asks, the follower copies and sends, and the engine's
 // thread gives it the slot once the upload has arrived.
 struct Engine::Swap {
-    enum { kFree, kAsked, kSent };
+    enum { kFree, kAsked, kSent, kLanded };
     std::atomic<int> at{kFree};
     int il = 0, e = 0;
     uint8_t* slot = nullptr;       // where it goes in VRAM: the slot of the expert it replaces
@@ -414,6 +422,7 @@ Engine::~Engine() {
     if (partial_host_words_) cudaFreeHost(partial_host_words_);
     if (h_partial_x_) cudaFreeHost(h_partial_x_);
     if (h_partial_cpu_) cudaFreeHost(h_partial_cpu_);
+    if (h_partial_slots_) cudaFreeHost(h_partial_slots_);
     for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (void* e : ev_row_)
@@ -944,6 +953,14 @@ void Engine::settle_swaps() {
         while (swap_[(size_t) j].at.load() == Swap::kAsked && !failed()) std::this_thread::yield();
     if (failed()) throw std::runtime_error("expert upload: " + swap_error_);
     ck(cudaStreamSynchronize(cs(swap_st_)), "expert upload");
+    // The follower normally promotes completed events. A blocking settle has
+    // already waited for them, so promote here too rather than waiting for its
+    // next poll before publishing the cache entries.
+    if (adapt_overlap_on())
+        for (int j = 0; j < n_swap_; ++j) {
+            int sent = Swap::kSent;
+            swap_[(size_t) j].at.compare_exchange_strong(sent, Swap::kLanded);
+        }
     follow(0);
 }
 
@@ -1756,15 +1773,50 @@ void Engine::plan_ahead(Layer& L, int il) {
 // The file may have to be read for it, which is why this is not the engine's thread.
 void Engine::follow_loop() {
     cudaSetDevice(device_);   // a thread starts on card 0
+    const bool poll = adapt_overlap_on();
     std::unique_lock<std::mutex> lk(swap_m_);
+    const auto asked = [&]() -> Swap* {
+        for (int j = 0; j < n_swap_; ++j)
+            if (swap_[(size_t) j].at.load() == Swap::kAsked) return &swap_[(size_t) j];
+        return nullptr;
+    };
     for (;;) {
         Swap* s = nullptr;
-        swap_cv_.wait(lk, [&] {
-            for (int j = 0; j < n_swap_ && !s; ++j)
-                if (swap_[(size_t) j].at.load() == Swap::kAsked) s = &swap_[(size_t) j];
-            return swap_quit_ || s;
-        });
-        if (swap_quit_) return;
+        if (poll) {
+            // Poll completion on the helper, never on the per-layer host plan.
+            // New upload requests wake wait_for immediately; the short timeout
+            // also checks copies that complete while no new request is posted.
+            lk.unlock();
+            bool pending = false;
+            cudaError_t failed = cudaSuccess;
+            for (int j = 0; j < n_swap_; ++j) {
+                Swap& q = swap_[(size_t) j];
+                if (q.at.load() != Swap::kSent) continue;
+                const cudaError_t arrived = cudaEventQuery(q.done);
+                if (arrived == cudaErrorNotReady) pending = true;
+                else if (arrived == cudaSuccess) {
+                    int sent = Swap::kSent;
+                    q.at.compare_exchange_strong(sent, Swap::kLanded);
+                } else { failed = arrived; break; }
+            }
+            lk.lock();
+            if (failed != cudaSuccess) {
+                swap_error_ = cudaGetErrorString(failed);
+                return;
+            }
+            if (swap_quit_) return;
+            s = asked();
+            if (!s) {
+                if (pending)
+                    swap_cv_.wait_for(lk, std::chrono::microseconds(25), [&] { return swap_quit_ || asked(); });
+                else
+                    swap_cv_.wait(lk, [&] { return swap_quit_ || asked(); });
+                continue;
+            }
+        } else {
+            swap_cv_.wait(lk, [&] { s = asked(); return swap_quit_ || s; });
+            if (swap_quit_) return;
+        }
         lk.unlock();
         const Layer& L = layers_[(size_t) s->il];
         const size_t e = (size_t) s->e, gu = L.gu_bytes;
@@ -1789,33 +1841,47 @@ void Engine::follow_loop() {
 //
 // A prompt batch neither counts nor moves anything.  What a prompt routes to says no more about the answer than
 // the profile does, and moving the cache while the prompt was read cost 3% of the reading speed (measured).
-void Engine::follow(int written) {
+// Publish only landed uploads. A layer-time plan may call this while a graph is
+// paused before its cached experts; it must update that layer's mapped slot
+// table and release the graph only after this returns. Never starts a trade.
+bool Engine::claim_arrived_swaps(int il) {
     {
         std::lock_guard<std::mutex> l(swap_m_);
         if (!swap_error_.empty()) throw std::runtime_error("expert upload: " + swap_error_);
     }
-    // STRATA_FREEZE_EXPERTS: the split between the card's experts and the CPU's is the request's first token's
-    // for the whole answer, so an arrival claims no slot and no trade is asked while one is being written.  A
-    // frozen answer sees a cache that never changes, which makes it a function of the request alone.  The
-    // uploads themselves go on: the followers fill their slots, and unfreeze_experts() lets the next request's
-    // first token claim them.
-    if (freeze_experts_) return;
+    // A frozen answer sees the same CPU/GPU split for every token.
+    if (freeze_experts_) return false;
     const size_t ne = (size_t) n_expert_;
-    int n_free = 0;
+    bool changed = false;
     for (int j = 0; j < n_swap_; ++j) {
         Swap& s = swap_[(size_t) j];
-        if (s.at.load() == Swap::kSent) {
+        if (il >= 0 && s.il != il) continue;
+        const int state = s.at.load();
+        if (adapt_overlap_on()) {
+            if (state != Swap::kLanded) continue;
+        } else {
+            if (state != Swap::kSent) continue;
             const cudaError_t arrived = cudaEventQuery(s.done);
             if (arrived == cudaErrorNotReady) continue;
             ck(arrived, "expert upload");
-            layers_[(size_t) s.il].slot[(size_t) s.e] = s.slot;
-            coming_[(size_t) s.il * ne + (size_t) s.e] = 0;
-            s.at.store(Swap::kFree);
-            ++stats_.swapped_experts;
-            staged_il_ = -1;   // the staging buffer holds what was not cached
         }
-        n_free += s.at.load() == Swap::kFree;
+        layers_[(size_t) s.il].slot[(size_t) s.e] = s.slot;
+        coming_[(size_t) s.il * ne + (size_t) s.e] = 0;
+        s.at.store(Swap::kFree);
+        ++stats_.swapped_experts;
+        staged_il_ = -1;   // the staging buffer holds what was not cached
+        changed = true;
     }
+    return changed;
+}
+
+void Engine::follow(int written) {
+    claim_arrived_swaps(-1);
+    // STRATA_FREEZE_EXPERTS keeps both arrivals and new trades out of an answer.
+    if (freeze_experts_) return;
+    const size_t ne = (size_t) n_expert_;
+    int n_free = 0;
+    for (int j = 0; j < n_swap_; ++j) n_free += swap_[(size_t) j].at.load() == Swap::kFree;
     if (written <= 0) return;
     const float keep = std::exp2(-(float) written / (float) kSwapHalf);
     for (float& r : recent_) r *= keep;
@@ -1953,13 +2019,13 @@ void Engine::load(const Options& o) {
     }
     if (partial_graph_on()) {
 #if defined(STRATA_USE_HIP)
-        ck(hipHostMalloc((void**) &partial_host_words_, 4 * sizeof(uint32_t),
+        ck(hipHostMalloc((void**) &partial_host_words_, 5 * sizeof(uint32_t),
                          hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable), "partial graph doorbell");
 #else
-        ck(cudaHostAlloc((void**) &partial_host_words_, 4 * sizeof(uint32_t),
+        ck(cudaHostAlloc((void**) &partial_host_words_, 5 * sizeof(uint32_t),
                          cudaHostAllocMapped | cudaHostAllocPortable), "partial graph doorbell");
 #endif
-        std::memset(partial_host_words_, 0, 4 * sizeof(uint32_t));
+        std::memset(partial_host_words_, 0, 5 * sizeof(uint32_t));
         ck(cudaHostGetDevicePointer((void**) &partial_device_words_, partial_host_words_, 0),
            "partial graph doorbell");
     }
@@ -2134,7 +2200,8 @@ void Engine::load_drafter() {
 // Per-token buffers hold rows_ tokens, row after row.
 void Engine::shared_scratch() {
     const size_t n = (size_t) rows_, e = n * n_embd_;
-    const size_t ff = n * std::max({n_ff_, n_ff_shexp_, 2 * n_ff_exp_});
+    const size_t ff = n * std::max({n_ff_, n_ff_shexp_, 2 * n_ff_exp_,
+                                    partial_graph_on() ? 2 * n_used_ * n_ff_exp_ : 0});
     // the draft block works in it too (draft_input()); read() keeps two calls' rows in it
     r_ = fbuf(std::max(streams(), draft_ ? 3 : 1) * (size_t) (read_rows_ > rows_ ? 2 : 1) * rows_ * n_embd_);
     cur_ = fbuf(e);
@@ -2144,7 +2211,7 @@ void Engine::shared_scratch() {
     g_ = fbuf(ff);   // a routed expert's gate and up rows come out of one launch, back to back
     u_ = fbuf(ff);
     h_ = fbuf(ff);
-    d_ = fbuf((size_t) kSumRows * n_embd_);   // the routed experts of a few tokens, until they are added up
+    d_ = fbuf((size_t) std::max(kSumRows, partial_graph_on() ? kCpuRows * n_used_ : 0) * n_embd_);   // the routed experts of a few tokens, until they are added up
     rl_ = fbuf(n * n_expert_);
     logits_ = fbuf((size_t) n_vocab_);
     if (rows_ >= kStageRows && bf16_max_ > 0) wf_ = fbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
@@ -2219,7 +2286,8 @@ void Engine::alloc() {
     shared_scratch();
     assign_scratch();
 
-    const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
+    const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256,
+                                partial_graph_on() ? n_used_ * n_ff_exp_ : 0});
     xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
     q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
 
@@ -2269,6 +2337,19 @@ void Engine::alloc() {
             h_partial_wts_ = (float*) ((uint8_t*) h_partial_ids_ + ids_bytes);
             d_partial_ids_ = (int32_t*) ((uint8_t*) d_partial_x_ + x_bytes);
             d_partial_wts_ = (float*) ((uint8_t*) d_partial_ids_ + ids_bytes);
+            if (adapt_overlap_on()) {
+#if defined(STRATA_USE_HIP)
+                ck(hipHostMalloc((void**) &h_partial_slots_, (size_t) n_expert_ * sizeof(void*),
+                                 hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable),
+                   "partial graph expert slots");
+#else
+                ck(cudaHostAlloc((void**) &h_partial_slots_, (size_t) n_expert_ * sizeof(void*),
+                                 cudaHostAllocMapped | cudaHostAllocPortable), "partial graph expert slots");
+#endif
+                std::memset(h_partial_slots_, 0, (size_t) n_expert_ * sizeof(void*));
+                ck(cudaHostGetDevicePointer((void**) &d_partial_slots_, h_partial_slots_, 0),
+                   "partial graph expert slots");
+            }
         }
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
         tab_ = (int32_t*) dmalloc(tab, "scratch");
@@ -2694,19 +2775,19 @@ void Engine::moe_add(int n) { axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_); }
 // With every routed expert in VRAM, a few tokens' experts are routed on the card and found there by its picks
 // (moe_card()), so a layer never waits for the host.  The cache's slots go to the card again when they changed.
 bool Engine::card_moe(int n) {
-    if (!d_slots_ || n * n_used_ > kSumRows || opt_.dump) return false;
+    const int max_rows = partial_graph_on() ? std::max(kSumRows, kCpuRows * n_used_) : kSumRows;
+    if (!d_slots_ || n * n_used_ > max_rows || opt_.dump) return false;
     if (cache_layers_on() || partial_graph_on()) {
         bool any_full = false;
-        bool any_cached = false;
         for (int il = lo_; il < hi_; ++il) {
             Layer& L = layers_[(size_t) il];
             if (!L.moe) continue;
             const bool full = std::all_of(L.slot.begin(), L.slot.end(), [](const void* p) { return p != nullptr; });
             if (full) any_full = true;
             else L.card = -1;
-            any_cached |= std::any_of(L.slot.begin(), L.slot.end(), [](const void* p) { return p != nullptr; });
         }
-        if (!(any_full || (partial_graph_on() && any_cached))) return false;
+        // The partial graph's nullable slots also handle a stage whose cache has no hits yet.
+        if (!partial_graph_on() && !any_full) return false;
     } else if (!all_cached()) {
         return false;
     }
@@ -2722,8 +2803,8 @@ bool Engine::card_moe(int n) {
             if (layers_[(size_t) il].moe)
                 std::copy(layers_[(size_t) il].slot.begin(), layers_[(size_t) il].slot.end(),
                           h_slots_.begin() + (ptrdiff_t) il * n_expert_);
-        ck(cudaMemcpy(d_slots_, h_slots_.data(), h_slots_.size() * sizeof(void*), cudaMemcpyHostToDevice),
-           "expert slots");
+        ck(cudaMemcpyAsync(d_slots_, h_slots_.data(), h_slots_.size() * sizeof(void*),
+                           cudaMemcpyHostToDevice, cs(st_)), "expert slots");
     }
     return true;
 }
@@ -3286,7 +3367,7 @@ void Engine::run(const int32_t* tokens, int n) {
     // shown it routes there (Layer::card).
     const bool card = n < kStageRows && card_moe(n);
     bool partial = partial_graph_on() && card && replay && partial_host_words_ && h_partial_wts_ &&
-                   n <= kCpuRows && n * n_used_ <= kSumRows;
+                   n <= kCpuRows && n * n_used_ <= std::max(kSumRows, kCpuRows * n_used_);
     bool any_partial_layer = false;
     for (int il = lo_; il < hi_ && partial; ++il) {
         const Layer& L = layers_[(size_t) il];
@@ -3323,7 +3404,11 @@ void Engine::run(const int32_t* tokens, int n) {
                 partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
                                       n * n_embd_, rr, partial_device_words_, st_);
                 moe_shared(L, il, n);
-                const void* const* table = d_slots_ + (size_t) il * n_expert_;
+                if (adapt_overlap_on())
+                    partial_graph_wait(partial_device_words_, partial_device_words_ + 4,
+                                       partial_device_words_ + 2, st_);
+                const void* const* table = adapt_overlap_on()
+                    ? (const void* const*) d_partial_slots_ : d_slots_ + (size_t) il * n_expert_;
                 const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_),
                                                n_used_, g_, 2 * (size_t) n_ff_exp_};
                 kernels::native_mmvq_ids_partial(2, gate_up, rr, n_embd_, 2 * n_ff_exp_, st_);
@@ -3376,6 +3461,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 if (!L.moe) continue;
                 const uint32_t expected = ++partial_expected_;
                 const Clock::time_point wait_start = Clock::now();
+                auto next_driver_check = wait_start + std::chrono::milliseconds(50);
                 uint32_t spins = 0;
                 while (__atomic_load_n(partial_host_words_, __ATOMIC_ACQUIRE) != expected) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -3384,16 +3470,30 @@ void Engine::run(const int32_t* tokens, int n) {
                     std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
                     if ((++spins & 16383u) == 0) {
-                        const cudaError_t state = cudaStreamQuery(cs(st_));
-                        if (state != cudaErrorNotReady) {
-                            ck(state, "partial layer graph");
-                            throw std::runtime_error("partial layer graph completed before routing");
+                        const auto now = Clock::now();
+                        if (now >= next_driver_check) {
+                            const cudaError_t state = cudaStreamQuery(cs(st_));
+                            if (state != cudaErrorNotReady) {
+                                ck(state, "partial layer graph");
+                                throw std::runtime_error("partial layer graph completed before routing");
+                            }
+                            if (dma_st_) {
+                                const cudaError_t copy_state = cudaStreamQuery(cs(dma_st_));
+                                if (copy_state != cudaSuccess && copy_state != cudaErrorNotReady)
+                                    ck(copy_state, "partial layer PCIe copy");
+                            }
+                            next_driver_check = now + std::chrono::milliseconds(50);
                         }
-                        if (Clock::now() - wait_start > std::chrono::seconds(5))
+                        if (now - wait_start > std::chrono::seconds(5))
                             throw std::runtime_error("partial layer graph router timed out");
                     }
                 }
                 stats_.route_wait_ms += ms_since(wait_start);
+                if (adapt_overlap_on()) {
+                    claim_arrived_swaps(il);
+                    std::copy(L.slot.begin(), L.slot.end(), h_partial_slots_);
+                    __atomic_store_n(partial_host_words_ + 4, expected, __ATOMIC_RELEASE);
+                }
                 CpuExpert host[kCpuRows * kMaxUsed];
                 std::vector<int> dma_ids;
                 if (pcie_frac_ > 0.f) {
@@ -3451,7 +3551,6 @@ void Engine::run(const int32_t* tokens, int n) {
                         ck(cudaMemcpyAsync(d_dma_slots_, h_dma_slots_, (size_t) n_expert_ * sizeof(void*),
                                            cudaMemcpyHostToDevice, cs(dma_st_)), "PCIe expert table");
                         partial_graph_ring(partial_device_words_ + 3, dma_st_);
-                        ck(cudaGetLastError(), "PCIe copy ready");
                     } catch (...) { dma_failed = std::current_exception(); }
                 };
                 const Clock::time_point cpu_start = Clock::now();
@@ -3473,6 +3572,7 @@ void Engine::run(const int32_t* tokens, int n) {
             if (dma_st_) cudaStreamSynchronize(cs(dma_st_));
             partial_expected_ = __atomic_load_n(partial_host_words_, __ATOMIC_ACQUIRE);
             __atomic_store_n(partial_host_words_ + 3, partial_expected_, __ATOMIC_RELEASE);
+            __atomic_store_n(partial_host_words_ + 4, partial_expected_, __ATOMIC_RELEASE);
             throw;
         }
         return;
@@ -4063,6 +4163,15 @@ bool Engine::pipeline_windows() const {
 bool Engine::pipeline_match(const int32_t* tokens, int t) const {
     return pipe_ready_ && !pipe_inflight_ && pipe_n_ == t &&
            std::equal(tokens, tokens + t, pipe_tokens_.begin());
+}
+
+// A predicted front window is already paid for. If its first token survived the preceding verifier, offer the
+// remaining tokens to this verifier directly; a fresh MTP chain can disagree with the chain that made the window.
+// The verifier still samples every position and keep() restores the state after the accepted prefix on a miss.
+int Engine::pipeline_proposal(int32_t first, int32_t* drafts, int max_t) const {
+    if (!pipe_ready_ || pipe_inflight_ || pipe_n_ < 2 || pipe_n_ > max_t || pipe_tokens_[0] != first) return 0;
+    std::copy(pipe_tokens_.begin() + 1, pipe_tokens_.begin() + pipe_n_, drafts);
+    return pipe_n_;
 }
 
 bool Engine::pipeline_gate(float probability, const char* reason) {

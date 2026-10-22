@@ -78,3 +78,6 @@ STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_TRACE=1 --max-context 262144
 STRATA_POLY_CPUS='host=0,hip=1,pool=8-15,aux=2-7' STRATA_POLY_WORKER_SPINS=0 --max-context 262144  # host/runtime/worker isolation; separate pool halves with pipeline2
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PCIE_FRAC=0 --max-context 262144  # built: one stage graph with cached GPU plus CPU misses; fused mapped route publication removes two launches/layer, areas C/D
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PCIE_FRAC=0.25,0 --max-context 262144  # built opt-in: bounded PCIe share on card 0, CPU-only misses on x4 card 1; existing VRAM staging, every expert computed, separate PCIe statistics, area D
+STRATA_POLY_PARTIAL_GRAPH=1 --max-context 262144  # rebuilt: whole-stage graphs through eight-token verify windows, zero-cache stages supported, driver polling only on stalls
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_ADAPT_OVERLAP=1 --max-context 262144  # built opt-in: helper polls swap completion; mapped per-layer slot plan admits landed experts inside the stage graph without host driver waits
+STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_TRACE=1 --max-context 262144  # rebuilt: reuse completed next-window proposals after matching sampled bonus instead of redrafting a different chain; verifier and sampler unchanged

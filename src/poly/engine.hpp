@@ -234,6 +234,7 @@ public:
     /// Two-card, opt-in decode: verify this window on the last card while the first card runs a predicted next one.
     bool pipeline_windows() const;
     bool pipeline_match(const int32_t* tokens, int t) const;
+    int pipeline_proposal(int32_t first, int32_t* drafts, int max_t) const;
     void pipeline_window(const int32_t* tokens, int t, const int32_t* predicted, int predicted_n,
                          const std::function<int()>& prepare = {});
     bool pipeline_gate(float probability, const char* reason);
@@ -469,6 +470,7 @@ protected:
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void mind_memory();
     void follow(int written);
+    bool claim_arrived_swaps(int il);  ///< publish landed uploads for one layer, or all when il is -1
     void follow_loop();
     void embed(int32_t token, float* dst) const;
     void dbg(const char* name, int il, const float* dev, int n);
@@ -562,7 +564,7 @@ protected:
     uint32_t* router_host_seq_ = nullptr;   ///< eight mapped pinned words, one per router event
     uint32_t* router_device_seq_ = nullptr;
     uint32_t router_expected_[8] = {};
-    uint32_t* partial_host_words_ = nullptr;   ///< ready, done, abort, DMA ready: mapped coherent graph handshake
+    uint32_t* partial_host_words_ = nullptr;   ///< ready, done, abort, DMA ready, plan ready
     uint32_t* partial_device_words_ = nullptr;
     uint32_t partial_expected_ = 0;
     float* h_partial_x_ = nullptr;                 ///< one coherent mapped allocation: input, ids, weights
@@ -573,6 +575,8 @@ protected:
     float* d_partial_wts_ = nullptr;
     float* h_partial_cpu_ = nullptr;
     float* d_partial_cpu_ = nullptr;
+    void** h_partial_slots_ = nullptr;        ///< one coherent host slot row, published before cached MMVQ
+    void** d_partial_slots_ = nullptr;
     float pcie_frac_ = 0.f;                  ///< optional share of unique cache misses copied to GPU
     void* dma_st_ = nullptr;                 ///< copies for the partial-stage graph
     uint8_t* h_dma_stage_ = nullptr;        ///< bounded pinned expert copies

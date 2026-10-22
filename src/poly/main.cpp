@@ -503,7 +503,14 @@ struct Session {
                 strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
                 int last_draft_i = -1;
                 float draft_prob[strata::spec::DraftPolicy::kMaxT] = {};
-                if (ask) {
+                // The previous round may already have run this exact front window. Keep its proposed tokens
+                // when the sampled bonus matches: redrafting from the now verified MTP state can produce a
+                // different chain and needlessly discard the completed front-card work.
+                const int held = k == 0 && room && engine.pipeline_windows()
+                    ? engine.pipeline_proposal(t, d, std::min(widest, kBlockWindow)) : 0;
+                if (held > 1) {
+                    use = {false, held};
+                } else if (ask) {
                     int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, kBlockWindow) - 1 && guesses.wants(n_d); from = d[n_d++]) {
                         float p = 0.f;
