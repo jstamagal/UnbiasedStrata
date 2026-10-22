@@ -106,6 +106,13 @@ bool mtp_input_norm_pair_on() {
     }();
     return on;
 }
+bool mtp_attn_norm_q8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_ATTN_NORM_Q8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool graph_runahead_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_GRAPH_RUNAHEAD");
@@ -3575,10 +3582,11 @@ void Engine::run(const int32_t* tokens, int n) {
     for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
     // A rollback's accepted prefix has no need to save intermediate GDN state. Keep it out of per-layer
     // recordings made for ordinary windows, whose same-sized calls do need those snapshot writes.
-    const bool layer_replay = replay && (!windowed_ || snap_bits_ == snap_tokens(n));
+    const bool layer_replay = replay && !pipe_save_into_ && (!windowed_ || snap_bits_ == snap_tokens(n));
     const int snap_key = (int) snap_bits_;
     const int snap_offset_key = snap_bits_ && snap_ && snap_at_ && rec_n_
         ? (int) ((snap_at_ - snap_) / (ptrdiff_t) rec_n_) : 0;
+    const uintptr_t rollback_key = reinterpret_cast<uintptr_t>(pipe_save_into_);
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
@@ -3723,7 +3731,8 @@ void Engine::run(const int32_t* tokens, int n) {
             staged_.clear();
             dma_stage_synced_ = true;
         }
-        std::vector<int> key{-2, n, (int) with_head, (int) runahead, snap_key, snap_offset_key};
+        std::vector<int> key{-2, n, (int) with_head, (int) runahead, snap_key, snap_offset_key,
+                             (int) uint32_t(rollback_key), (int) uint32_t(rollback_key >> 32)};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
         if (!pass) {
@@ -4003,7 +4012,8 @@ void Engine::run(const int32_t* tokens, int n) {
         whole = L.fixed && (!L.moe || L.card == 1);
     }
     if (whole) {
-        std::vector<int> key{n, snap_key, snap_offset_key};
+        std::vector<int> key{n, snap_key, snap_offset_key,
+                             (int) uint32_t(rollback_key), (int) uint32_t(rollback_key >> 32)};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
         if (!pass)
@@ -4032,7 +4042,8 @@ void Engine::run(const int32_t* tokens, int n) {
             int end = il + 1;
             while (end < hi_ && stage_ready(end)) ++end;
             if (end - il >= 2) {
-                std::vector<int> key{-1, n, il, end, snap_key, snap_offset_key};
+                std::vector<int> key{-1, n, il, end, snap_key, snap_offset_key,
+                                     (int) uint32_t(rollback_key), (int) uint32_t(rollback_key >> 32)};
                 for (int j = il; j < end; ++j) key.push_back(head_key(j, n));
                 void*& pass = passes_[key];
                 if (!pass) pass = record([&] {
@@ -4637,6 +4648,10 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
         const char* v = std::getenv("STRATA_POLY_PIPELINE_NO_SNAP");
         return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
     }();
+    static const bool save_load = [] {
+        const char* v = std::getenv("STRATA_POLY_PIPELINE_SAVE_LOAD");
+        return partial_graph_on() && v && v[0] == '1' && v[1] == '\0';
+    }();
     if (!pipe_saved_[0]) {
         for (float*& p : pipe_saved_) p = (float*) dmalloc(rec_n_ * sizeof(float), "pipeline GDN snapshot");
         const size_t bytes = (size_t) rows_ * streams() * n_embd_ * sizeof(float);
@@ -4679,13 +4694,17 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
                                cudaMemcpyDeviceToDevice, cs(st_)), "pipeline snapshot");
         pipe_ready_ = false;
     } else {
-        ck(cudaMemcpyAsync(pipe_saved_[0], state_, rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-           "pipeline snapshot");
+        const bool fused_save = save_load && t <= 8;
+        if (!fused_save)
+            ck(cudaMemcpyAsync(pipe_saved_[0], state_, rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+               "pipeline snapshot");
+        pipe_save_into_ = fused_save ? pipe_saved_[0] : nullptr;
         windowed_ = true;
         snap_bits_ = no_snap ? 0 : snap_tokens(t);
         snap_at_ = snap_;
         try { run(tokens, t); }
-        catch (...) { windowed_ = false; snap_bits_ = 0; throw; }
+        catch (...) { pipe_save_into_ = nullptr; windowed_ = false; snap_bits_ = 0; throw; }
+        pipe_save_into_ = nullptr;
         windowed_ = false;
         snap_bits_ = 0;
         ck(cudaMemcpyAsync(pipe_pass_[current_slot], r_, (size_t) t * streams() * n_embd_ * sizeof(float),
@@ -4741,13 +4760,17 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
     if (!mtp_stage0_) back.go(verify_back);
     try {
         if (prepared_n > 0 && start + t + prepared_n <= opt_.max_context) {
-            ck(cudaMemcpyAsync(pipe_saved_[1], state_, rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-               "pipeline snapshot");
+            const bool fused_save = save_load && prepared_n <= 8;
+            if (!fused_save)
+                ck(cudaMemcpyAsync(pipe_saved_[1], state_, rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+                   "pipeline snapshot");
+            pipe_save_into_ = fused_save ? pipe_saved_[1] : nullptr;
             pos_ = start + t;
             windowed_ = true;
             snap_bits_ = no_snap ? 0 : snap_tokens(prepared_n);
             snap_at_ = snap_;
             run(predicted, prepared_n);
+            pipe_save_into_ = nullptr;
             windowed_ = false;
             snap_bits_ = 0;
             ck(cudaMemcpyAsync(pipe_pass_[next_slot], r_, (size_t) prepared_n * streams() * n_embd_ * sizeof(float),
@@ -4762,6 +4785,7 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
             pipe_n_ = 0;
         }
     } catch (...) {
+        pipe_save_into_ = nullptr;
         pos_ = start;
         windowed_ = false;
         snap_bits_ = 0;
@@ -4888,8 +4912,13 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
     }
     float* x = r_ + 2 * rows * e;
     lin(d_proj_, r_, x, n);
-    rms_norm(x, fp(layers_[(size_t) n_layer_].attn_norm), xn_, n_embd_, n, rms_eps_, st_);
-    kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    if (mtp_attn_norm_q8_on() && !opt_.dump && n >= 1 && n <= 8 && n_embd_ % 32 == 0)
+        kernels::native_add_rms_norm_q8_1(x, nullptr, fp(layers_[(size_t) n_layer_].attn_norm),
+                                          xn_, xq_, n_embd_, n, rms_eps_, sum_threads(n_embd_), st_);
+    else {
+        rms_norm(x, fp(layers_[(size_t) n_layer_].attn_norm), xn_, n_embd_, n, rms_eps_, st_);
+        kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    }
     return x;
 }
 
@@ -5027,8 +5056,13 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 }
                 float* x = r_ + 2 * e;
                 lin(d_proj_, r_, x, 1);
-                rms_norm(x, fp(L.attn_norm), xn_, n_embd_, 1, rms_eps_, st_);
-                kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+                if (mtp_attn_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0)
+                    kernels::native_add_rms_norm_q8_1(x, nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, 1,
+                                                      rms_eps_, sum_threads(n_embd_), st_);
+                else {
+                    rms_norm(x, fp(L.attn_norm), xn_, n_embd_, 1, rms_eps_, st_);
+                    kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+                }
                 block_attend(row, 1);
                 if (mtp_ffn_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0)
                     kernels::native_add_rms_norm_q8_1(x, ao_, fp(L.ffn_norm), xn_, xq_, n_embd_, 1,

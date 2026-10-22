@@ -13,12 +13,12 @@ void qwen35_alpha_beta_gates(const float* alpha_w, const float* beta_w, const fl
 
 // One decode row: convolution and the Q/K head norms in the same block.
 void qwen35_conv_norm1(const float* x, float* state, const float* w, float* out, int channels,
-                       int dim, int k_heads, float eps, float* snap, void* stream);
+                       int dim, int k_heads, float eps, float* snap, void* stream, float* rollback = nullptr);
 
 // Short decode windows: convolution and Q/K norm across rows, preserving state snapshots.
 void qwen35_conv_norm_window(const float* x, float* state, const float* w, float* out,
                              int channels, int k_heads, int rows, float eps,
-                             float* snap, size_t snap_stride, unsigned snaps, void* stream);
+                             float* snap, size_t snap_stride, unsigned snaps, void* stream, float* rollback = nullptr);
 
 // Store Q8_0 K and V cache rows in one launch, with a fixed or device-held starting position.
 void qwen35_kv_store_pair(const float* key, const float* value,

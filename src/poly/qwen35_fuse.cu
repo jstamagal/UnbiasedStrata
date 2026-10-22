@@ -233,12 +233,16 @@ __global__ void shared_gate_kernel(const float* w, const float* x, float* gate_o
 }
 
 __global__ void conv_norm1_kernel(const float* x, float* state, const float* w, float* out, int dim,
-                                  int k_heads, float eps, float* snap) {
+                                  int k_heads, float eps, float* snap, float* rollback) {
     __shared__ float part[8];
     const int group = blockIdx.x, j = threadIdx.x, c = group * dim + j;
     const float* wc = w + (size_t) c * 4;
     float* st = state + (size_t) c * 3;
     const float s0 = st[0], s1 = st[1], s2 = st[2], v = x[c];
+    if (rollback) {
+        float* saved = rollback + size_t(c) * 3;
+        saved[0] = s0; saved[1] = s1; saved[2] = s2;
+    }
     const float z = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3];
     st[0] = s1;
     st[1] = s2;
@@ -292,9 +296,9 @@ void qwen35_alpha_beta_gates(const float* alpha_w, const float* beta_w, const fl
 }
 
 void qwen35_conv_norm1(const float* x, float* state, const float* w, float* out, int channels,
-                       int dim, int k_heads, float eps, float* snap, void* stream) {
+                       int dim, int k_heads, float eps, float* snap, void* stream, float* rollback) {
     conv_norm1_kernel<<<channels / dim, dim, 0, (cudaStream_t) stream>>>(
-        x, state, w, out, dim, k_heads, eps, snap);
+        x, state, w, out, dim, k_heads, eps, snap, rollback);
 }
 
 void qwen35_kv_store_pair(const float* key, const float* value,

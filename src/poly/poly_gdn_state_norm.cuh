@@ -13,7 +13,7 @@ __global__ void poly_gdn_state_norm_kernel(const float* __restrict__ qkv,
                                            float* __restrict__ out,
                                            int value_heads, int key_heads, int rows,
                                            float eps, float* __restrict__ snap,
-                                           size_t snap_stride, unsigned snaps) {
+                                           size_t snap_stride, unsigned snaps, float* __restrict__ rollback) {
     constexpr int dim = 128, warps = 16, tiles = dim / warps, per_lane = dim / 32;
     const int head = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int key_head = head % key_heads;
@@ -25,8 +25,10 @@ __global__ void poly_gdn_state_norm_kernel(const float* __restrict__ qkv,
     for (int tile = 0; tile < tiles; ++tile) {
         const size_t base = (size_t(head) * dim + tile * warps + warp) * dim;
 #pragma unroll
-        for (int k = 0; k < per_lane; ++k)
+        for (int k = 0; k < per_lane; ++k) {
             cell[tile][k] = state[base + lane + k * 32];
+            if (rollback) rollback[base + lane + k * 32] = cell[tile][k];
+        }
     }
 
     for (int row = 0; row < rows; ++row) {
@@ -101,10 +103,10 @@ __global__ void poly_gdn_state_norm_kernel(const float* __restrict__ qkv,
 inline void poly_gdn_state_norm(const float* qkv, const float* decay, const float* share,
                                 float* state, const float* z, const float* gamma, float* out,
                                 int value_heads, int key_heads, int rows, float eps,
-                                float* snap, size_t snap_stride, unsigned snaps, void* stream) {
+                                float* snap, size_t snap_stride, unsigned snaps, void* stream, float* rollback) {
     poly_gdn_state_norm_kernel<<<value_heads, 512, 0, (cudaStream_t) stream>>>(
         qkv, decay, share, state, z, gamma, out, value_heads, key_heads, rows,
-        eps, snap, snap_stride, snaps);
+        eps, snap, snap_stride, snaps, rollback);
 }
 
 } // namespace

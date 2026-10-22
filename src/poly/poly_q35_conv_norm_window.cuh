@@ -11,13 +11,17 @@ __global__ void poly_q35_conv_norm_window_kernel(const float* __restrict__ x,
                                                  float* __restrict__ out,
                                                  int channels, int key_heads, int rows,
                                                  float eps, float* __restrict__ snap,
-                                                 size_t snap_stride, unsigned snaps) {
+                                                 size_t snap_stride, unsigned snaps, float* __restrict__ rollback) {
     constexpr int dim = 128;
     __shared__ float part[dim / 32];
     const int group = blockIdx.x, lane = threadIdx.x, c = group * dim + lane;
     const float* wc = w + size_t(c) * 4;
     float* st = state + size_t(c) * 3;
     float s0 = st[0], s1 = st[1], s2 = st[2];
+    if (rollback) {
+        float* saved = rollback + size_t(c) * 3;
+        saved[0] = s0; saved[1] = s1; saved[2] = s2;
+    }
     const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
     const bool query = group < key_heads;
     const bool key = group >= key_heads && group < 2 * key_heads;
@@ -60,9 +64,9 @@ __global__ void poly_q35_conv_norm_window_kernel(const float* __restrict__ x,
 
 void qwen35_conv_norm_window(const float* x, float* state, const float* w, float* out,
                                     int channels, int key_heads, int rows, float eps,
-                                    float* snap, size_t snap_stride, unsigned snaps, void* stream) {
+                                    float* snap, size_t snap_stride, unsigned snaps, void* stream, float* rollback) {
     poly_q35_conv_norm_window_kernel<<<channels / 128, 128, 0, (cudaStream_t) stream>>>(
-        x, state, w, out, channels, key_heads, rows, eps, snap, snap_stride, snaps);
+        x, state, w, out, channels, key_heads, rows, eps, snap, snap_stride, snaps, rollback);
 }
 
 } // namespace strata::poly

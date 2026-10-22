@@ -156,6 +156,7 @@ struct RoutePublish {
     uint32_t* ready;
     uint32_t* layer_ready;
     int32_t* partners = nullptr;
+    bool partner_ballot = false;
 };
 bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
                         const float* bias, const float* escale, bool norm, float w_scale,
@@ -270,7 +271,7 @@ void mul_sigmoid(float* acc, const float* g, int n, int rows, int g_stride, bool
 /// tokens to go back to (gdn_step too): `snaps` has a bit for each token that leaves it, and the states lie in
 /// the tokens' order, `stride` floats apart.
 void conv4_silu(const float* x, float* state, const float* w, float* out, int channels, int rows, void* stream,
-                float* snap = nullptr, size_t stride = 0, unsigned snaps = 0);
+                float* snap = nullptr, size_t stride = 0, unsigned snaps = 0, float* rollback = nullptr);
 /// LFM2's gated short convolution (llama.cpp's shortconv block between its two projections).  bcx: B, C and x of a
 /// token, `channels` values each, as the in_proj writes them.  out = C * conv3(B * x), `channels` values a token,
 /// a causal convolution of three taps w (3, channels).  state: the 2 B * x before the call a channel, oldest
@@ -286,7 +287,7 @@ void shortconv(const float* bcx, float* state, const float* w, float* out, int c
 void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const float* a, float* s,
               const float* z, const float* o_norm, float* out, int dim, int n_head, int k_heads, int rows,
               float norm_eps, void* stream, float* snap = nullptr, size_t stride = 0, unsigned snaps = 0,
-              bool qk_pre_normed = false, bool gates_precomputed = false);
+              bool qk_pre_normed = false, bool gates_precomputed = false, float* rollback = nullptr);
 
 // ---- DeepSeek V4 (deepseek4): one key head that is its value too, a window of raw rows, rows compressed 4 or 128
 // to one, and an indexer that picks among the 4-to-1 rows

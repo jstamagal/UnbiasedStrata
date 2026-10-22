@@ -1021,6 +1021,39 @@ __device__ __forceinline__ int32_t route_reuse_partner(const int32_t* ids, int c
     return -1;
 }
 
+__device__ __forceinline__ int32_t route_reuse_partner_ballot(const int32_t* ids, int count, int entry) {
+    const int lane = int(threadIdx.x) & (WARP - 1);
+    const int expert = __shfl_sync(0xffffffffu, lane == 0 ? ids[entry] : 0, 0, WARP);
+    int previous = 0;
+    for (int first = 0; first < count; first += WARP) {
+        const int index = first + lane;
+        const uint32_t matches = uint32_t(__ballot_sync(0xffffffffu, index < count && ids[index] == expert));
+        if (first + WARP <= entry) {
+            previous += __popc(matches);
+            continue;
+        }
+        uint32_t later = matches;
+        if (first <= entry) {
+            const int before = entry - first;
+            const uint32_t lower = before == 0 ? 0u : ((1u << before) - 1u);
+            previous += __popc(matches & lower);
+            if (previous & 1) return -2;
+            later &= before == WARP - 1 ? 0u : (~0u << (before + 1));
+        }
+        if (later) return first + __ffs(later) - 1;
+    }
+    return -1;
+}
+
+RoutePublish route_publish_config(RoutePublish publish) {
+    static const bool ballot = [] {
+        const char* value = std::getenv("STRATA_POLY_EXPERT_REUSE_META_BALLOT");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    publish.partner_ballot = publish.partners && ballot;
+    return publish;
+}
+
 // A decode window routes in one 256-thread block; the same block publishes its
 // input and selected experts to mapped host memory after the exact route math.
 template<int PER>
@@ -1097,9 +1130,18 @@ __device__ __forceinline__ void route_publish_body(const volatile float* logits,
     // All warps, including inactive rows and lanes beyond n_used, reach this barrier.
     __syncthreads();
     const int t = int(threadIdx.x);
-    if (publish.partners)
-        for (int i = t; i < rows * n_used; i += blockDim.x)
-            publish.partners[i] = route_reuse_partner(ids, rows * n_used, i);
+    if (publish.partners) {
+        if (publish.partner_ballot) {
+            const int warps = int(blockDim.x) / WARP;
+            for (int entry = t / WARP; entry < rows * n_used; entry += warps) {
+                const int partner = route_reuse_partner_ballot(ids, rows * n_used, entry);
+                if ((t & (WARP - 1)) == 0) publish.partners[entry] = partner;
+            }
+        } else {
+            for (int i = t; i < rows * n_used; i += blockDim.x)
+                publish.partners[i] = route_reuse_partner(ids, rows * n_used, i);
+        }
+    }
     for (int i = t; i < publish.x_count; i += blockDim.x)
         publish.host_x[i] = publish.x[i];
     for (int i = t; i < rows * n_used; i += blockDim.x) {
@@ -2131,12 +2173,16 @@ __device__ __forceinline__ float* snap_of(float* snap, size_t stride, unsigned s
 // is after a token of `snaps` goes to snap (snap_of()).
 __global__ void conv4_silu_kernel(const float* __restrict__ x, float* __restrict__ state,
                                   const float* __restrict__ w, float* __restrict__ out, int channels, int rows,
-                                  float* __restrict__ snap, size_t stride, unsigned snaps) {
+                                  float* __restrict__ snap, size_t stride, unsigned snaps, float* __restrict__ rollback) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const float* wc = w + 4 * size_t(c);
     float* st = state + size_t(c) * 3;
     float s0 = st[0], s1 = st[1], s2 = st[2];
+    if (rollback) {
+        float* saved = rollback + size_t(c) * 3;
+        saved[0] = s0; saved[1] = s1; saved[2] = s2;
+    }
     for (int row = 0; row < rows; ++row) {
         const size_t at = size_t(row) * channels + c;
         const float v = x[at];
@@ -2285,7 +2331,7 @@ __global__ void gdn_gates_kernel(float* __restrict__ alpha, float* __restrict__ 
 __global__ void gdn_state_kernel(const float* __restrict__ qkv, const float* __restrict__ decay,
                                  const float* __restrict__ share, float* __restrict__ s, float* __restrict__ out,
                                  int dim, int n_head, int k_heads, int rows, float* __restrict__ snap, size_t stride,
-                                 unsigned snaps) {
+                                 unsigned snaps, float* __restrict__ rollback) {
     const int per_head = dim / int(blockDim.x / WARP);   // blocks a head
     const int h = blockIdx.x / per_head, hk = h % k_heads;
     const int j = (blockIdx.x % per_head) * int(blockDim.x / WARP) + int(threadIdx.x / WARP);
@@ -2294,6 +2340,8 @@ __global__ void gdn_state_kernel(const float* __restrict__ qkv, const float* __r
     const size_t keys = size_t(dim) * k_heads, d_inner = size_t(dim) * n_head, row_n = 2 * keys + d_inner;
     const size_t mine = (size_t(h) * dim + j) * dim;
     float* col = s + mine;
+    if (rollback)
+        for (int i = lane; i < dim; i += WARP) rollback[mine + i] = col[i];
     for (int row = 0; row < rows; ++row) {
         const float* x = qkv + size_t(row) * row_n;
         const float* qn = x + size_t(hk) * dim;
@@ -2326,7 +2374,7 @@ template <int PER>
 __global__ void gdn_state_reg_kernel(const float* __restrict__ qkv, const float* __restrict__ decay,
                                      const float* __restrict__ share, float* __restrict__ s, float* __restrict__ out,
                                      int dim, int n_head, int k_heads, int rows, float* __restrict__ snap,
-                                     size_t stride, unsigned snaps) {
+                                     size_t stride, unsigned snaps, float* __restrict__ rollback) {
     const int per_head = dim / int(blockDim.x / WARP);
     const int h = blockIdx.x / per_head, hk = h % k_heads;
     const int j = (blockIdx.x % per_head) * int(blockDim.x / WARP) + int(threadIdx.x / WARP);
@@ -2337,7 +2385,10 @@ __global__ void gdn_state_reg_kernel(const float* __restrict__ qkv, const float*
     float* col = s + mine;
     float c[PER];
 #pragma unroll
-    for (int k = 0; k < PER; ++k) c[k] = col[lane + k * WARP];
+    for (int k = 0; k < PER; ++k) {
+        c[k] = col[lane + k * WARP];
+        if (rollback) rollback[mine + lane + k * WARP] = c[k];
+    }
     // a token's inputs: its query and key values of this lane, its value of the column, its decay and share
     float qa[PER], ka[PER], va = 0.0f, da = 0.0f, sa = 0.0f;
     auto fetch = [&](int row, float* q, float* kk, float& v, float& dc, float& sh) {
@@ -2718,7 +2769,8 @@ void route_rows(const float* logits, int n_expert, int n_used, int rows, int gat
 
 bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
                         const float* bias, const float* escale, bool norm, float w_scale,
-                        int32_t* ids, float* w, const RoutePublish& publish, void* stream) {
+                        int32_t* ids, float* w, const RoutePublish& requested_publish, void* stream) {
+    const RoutePublish publish = route_publish_config(requested_publish);
     if (rows < 1 || rows > 8 || n_expert < 1 || n_expert > ROUTE_PER * WARP ||
         n_used < 1 || n_used > WARP || n_used > n_expert || publish.x_count < 0 ||
         !logits || !ids || !w || !publish.x || !publish.host_x || !publish.host_ids ||
@@ -2737,7 +2789,8 @@ bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows,
 
 bool router_f32_publish(const float* weights, const float* x, float* logits, int n_in, int n_expert,
                          int n_used, int rows, uint32_t* ticket, int32_t* ids, float* w,
-                         const RoutePublish& publish, void* stream) {
+                         const RoutePublish& requested_publish, void* stream) {
+    const RoutePublish publish = route_publish_config(requested_publish);
     if (rows < 1 || rows > 8 || n_in < 128 || n_expert < 1 || n_expert > ROUTE_PER * WARP ||
         n_used < 1 || n_used > WARP || n_used > n_expert || !weights || !x || !logits || !ticket ||
         !ids || !w || !publish.x || !publish.host_x || !publish.host_ids || !publish.host_wts ||
@@ -3049,15 +3102,15 @@ void mul_sigmoid(float* acc, const float* g, int n, int rows, int g_stride, bool
 }
 
 void conv4_silu(const float* x, float* state, const float* w, float* out, int channels, int rows, void* stream,
-                float* snap, size_t stride, unsigned snaps) {
+                float* snap, size_t stride, unsigned snaps, float* rollback) {
     if (rows <= 0) return;
-    if (rows >= CONV_ROWS && (!snap || !snaps)) {
+    if (!rollback && rows >= CONV_ROWS && (!snap || !snaps)) {
         conv4_silu_rows_kernel<<<dim3(grid(channels, 256), rows), 256, 0, cs(stream)>>>(x, state, w, out, channels);
         conv4_state_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, channels, rows);
         return;
     }
     conv4_silu_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, w, out, channels, rows, snap, stride,
-                                                                  snaps);
+                                                                  snaps, rollback);
 }
 
 void shortconv(const float* bcx, float* state, const float* w, float* out, int channels, int rows, void* stream,
@@ -3078,7 +3131,7 @@ void shortconv(const float* bcx, float* state, const float* w, float* out, int c
 
 void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const float* a, float* s, const float* z,
               const float* o_norm, float* out, int dim, int n_head, int k_heads, int rows, float norm_eps, void* stream,
-              float* snap, size_t stride, unsigned snaps, bool qk_pre_normed, bool gates_precomputed) {
+              float* snap, size_t stride, unsigned snaps, bool qk_pre_normed, bool gates_precomputed, float* rollback) {
     if (dim % WARP != 0 || dim > 256) throw std::invalid_argument("gdn_step: a head of 32 to 256 values, in 32s");
     const size_t row_n = (2 * size_t(k_heads) + n_head) * dim;
     const int gates = rows * n_head, columns = std::min(dim, 1024 / WARP);   // a block's columns: a warp each
@@ -3093,20 +3146,20 @@ void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const floa
     }();
     if (fused_state_norm && dim == 128 && rows >= 1 && rows <= 8) {
         poly_gdn_state_norm(qkv, alpha, beta, s, z, o_norm, out, n_head, k_heads,
-                             rows, norm_eps, snap, stride, sn, stream);
+                             rows, norm_eps, snap, stride, sn, stream, rollback);
         return;
     }
     switch (dim / WARP) {
     case 1: gdn_state_reg_kernel<1><<<blocks, threads, 0, cs(stream)>>>(qkv, alpha, beta, s, out, dim, n_head, k_heads,
-                                                                          rows, snap, stride, sn); break;
+                                                                          rows, snap, stride, sn, rollback); break;
     case 2: gdn_state_reg_kernel<2><<<blocks, threads, 0, cs(stream)>>>(qkv, alpha, beta, s, out, dim, n_head, k_heads,
-                                                                          rows, snap, stride, sn); break;
+                                                                          rows, snap, stride, sn, rollback); break;
     case 4: gdn_state_reg_kernel<4><<<blocks, threads, 0, cs(stream)>>>(qkv, alpha, beta, s, out, dim, n_head, k_heads,
-                                                                          rows, snap, stride, sn); break;
+                                                                          rows, snap, stride, sn, rollback); break;
     case 8: gdn_state_reg_kernel<8><<<blocks, threads, 0, cs(stream)>>>(qkv, alpha, beta, s, out, dim, n_head, k_heads,
-                                                                          rows, snap, stride, sn); break;
+                                                                          rows, snap, stride, sn, rollback); break;
     default: gdn_state_kernel<<<blocks, threads, 0, cs(stream)>>>(qkv, alpha, beta, s, out, dim, n_head, k_heads, rows,
-                                                                  snap, stride, sn);
+                                                                  snap, stride, sn, rollback);
     }
     gdn_out_kernel<<<rows * n_head, dim, 0, cs(stream)>>>(out, z, o_norm, dim, norm_eps);
 }

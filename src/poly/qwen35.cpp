@@ -437,16 +437,18 @@ void Qwen35::gdn(Block& B, int n) {
         if (conv_window)
             qwen35_conv_norm_window(proj_, B.past, fp(B.conv), qkv_, conv_dim_, k_heads_, n,
                                      rms_eps_, snap_bits_ ? snap_at_ + (B.past - state_) : nullptr,
-                                     rec_n_, snap_bits_, st_);
+                                     rec_n_, snap_bits_, st_, pipe_save_into_ ? pipe_save_into_ + (B.past - state_) : nullptr);
         else if (conv_normed)
             qwen35_conv_norm1(proj_, B.past, fp(B.conv), qkv_, conv_dim_, s_dim_, k_heads_, rms_eps_,
-                               (snap_bits_ & 1u) ? snap_at_ + (B.past - state_) : nullptr, st_);
+                               (snap_bits_ & 1u) ? snap_at_ + (B.past - state_) : nullptr, st_,
+                               pipe_save_into_ ? pipe_save_into_ + (B.past - state_) : nullptr);
         else
             conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
-                       snap_bits_ ? snap_at_ + (B.past - state_) : nullptr, rec_n_, snap_bits_);
+                       snap_bits_ ? snap_at_ + (B.past - state_) : nullptr, rec_n_, snap_bits_,
+                       pipe_save_into_ ? pipe_save_into_ + (B.past - state_) : nullptr);
         gdn_step(qkv_, alpha_, beta_, fp(B.dt), fp(B.a), B.s, z_, fp(B.o_norm), gated_, s_dim_, v_heads_, k_heads_, n,
                  rms_eps_, st_, snap_bits_ ? snap_at_ + (B.s - state_) : nullptr, rec_n_, snap_bits_, conv_normed,
-                 gates_fused);
+                 gates_fused, pipe_save_into_ ? pipe_save_into_ + (B.s - state_) : nullptr);
     }
     lin(B.wo, gated_, ao_, n);
 }

@@ -579,6 +579,7 @@ protected:
     void* blas_ = nullptr; ///< cuBLAS on st_
     void* ev_ = nullptr;   ///< marks the router's copy to the host: ev_row_'s first, or a window's row's own
     void* ev_row_[8] = {}; ///< one for each token a window can have
+    float* pipe_save_into_ = nullptr;
     float* pipe_saved_[2] = {};   ///< front card's recurrent state before current and predicted windows
     float* pipe_pass_[2] = {};    ///< distinct pinned handoffs while both cards run
     void** h_mtp_slots_ = nullptr; ///< pinned expert pointers for the optional front-card MTP graph

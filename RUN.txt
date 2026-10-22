@@ -165,3 +165,6 @@ STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_EXPERT_REUSE_PAIR=1 STRATA_POLY_EXPERT_REUS
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_EXPERT_REUSE_META=1  # routing prepares pair metadata once for gate/up and down
 STRATA_POLY_MTP_INPUT_NORM_PAIR=1  # combine draft embedding and source RMS norms into one launch
 STRATA_POLY_DENSE_PREFETCH=1  # overlap next dense K-group loads with current dot products, 1-4 columns
+STRATA_POLY_PIPELINE_SAVE_LOAD=1 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PIPELINE_WINDOWS=2  # save rollback state during existing conv/GDN loads
+STRATA_POLY_EXPERT_REUSE_META=1 STRATA_POLY_EXPERT_REUSE_META_BALLOT=1  # parallelize metadata generation inside route publication
+STRATA_POLY_MTP_ATTN_NORM_Q8=1  # fuse draft projection-output attention norm and Q8 quantization
