@@ -1,12 +1,14 @@
 #pragma once
 
 #include "poly_expert_reuse_group4_meta.cuh"
+#include "poly_expert_reuse_group4_block.cuh"
 
 #if defined(__HIPCC__)
 inline bool poly_expert_reuse_group4_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_EXPERT_REUSE_GROUP4");
-        return (v && v[0] == '1' && v[1] == '\0') || poly_expert_reuse_group4_meta_on();
+        return (v && v[0] == '1' && v[1] == '\0') || poly_expert_reuse_group4_meta_on() ||
+               poly_expert_reuse_group4_block_on();
     }();
     return on;
 }
@@ -52,7 +54,7 @@ __device__ __forceinline__ PolyExpertGroup4 poly_expert_group4_find(
     return group;
 }
 
-template<typename F, bool PARTIAL, int ROWS>
+template<typename F, bool PARTIAL, int ROWS, bool BLOCK = false, bool VECTOR = false>
 __global__ void __launch_bounds__(128) poly_expert_reuse_group4_kernel(
         MmvqIds slots, int count, int n_in, int n_out) {
     const int j = int(blockIdx.y);
@@ -92,15 +94,20 @@ __global__ void __launch_bounds__(128) poly_expert_reuse_group4_kernel(
     }
     const int nblocks = n_in / 32;
     float sums[4][ROWS] = {};
-    for (int k = lane; k < 2 * nblocks; k += 32) {
-        const int kb = k >> 1, iqs = 2 * (k & 1);
+    if constexpr (BLOCK) {
+        poly_expert_reuse_group4_block_accumulate<typename F::Block, ROWS, VECTOR>(
+            w, x, group.count, row0, n_out, nblocks, sums);
+    } else {
+        for (int k = lane; k < 2 * nblocks; k += 32) {
+            const int kb = k >> 1, iqs = 2 * (k & 1);
 #pragma unroll
-        for (int r = 0; r < ROWS; ++r) {
-            if (row0 + r < n_out) {
-                const auto weight = F::load(w + size_t(row0 + r) * nblocks + kb, iqs);
+            for (int r = 0; r < ROWS; ++r) {
+                if (row0 + r < n_out) {
+                    const auto weight = F::load(w + size_t(row0 + r) * nblocks + kb, iqs);
 #pragma unroll
-                for (int c = 0; c < 4; ++c)
-                    if (c < group.count) sums[c][r] += F::apply(weight, x[c] + kb, iqs);
+                    for (int c = 0; c < 4; ++c)
+                        if (c < group.count) sums[c][r] += F::apply(weight, x[c] + kb, iqs);
+                }
             }
         }
     }
@@ -116,20 +123,32 @@ __global__ void __launch_bounds__(128) poly_expert_reuse_group4_kernel(
     }
 }
 
-template<typename Weight, bool PARTIAL>
-inline void poly_expert_reuse_group4(const MmvqIds& slots, int count, int n_in,
+template<typename Weight, bool PARTIAL, bool BLOCK, bool VECTOR = false>
+inline void poly_expert_reuse_group4_impl(const MmvqIds& slots, int count, int n_in,
                                      int n_out, int rows, cudaStream_t stream) {
     using F = SmallTraits<Weight, 4>;
     const dim3 threads(32, 4);
     if (rows == 4) {
         const dim3 blocks(unsigned((n_out + 15) / 16), unsigned(count));
-        poly_expert_reuse_group4_kernel<F, PARTIAL, 4><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+        poly_expert_reuse_group4_kernel<F, PARTIAL, 4, BLOCK, VECTOR><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
     } else if (rows == 2) {
         const dim3 blocks(unsigned((n_out + 7) / 8), unsigned(count));
-        poly_expert_reuse_group4_kernel<F, PARTIAL, 2><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+        poly_expert_reuse_group4_kernel<F, PARTIAL, 2, BLOCK, VECTOR><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
     } else {
         const dim3 blocks(unsigned((n_out + 3) / 4), unsigned(count));
-        poly_expert_reuse_group4_kernel<F, PARTIAL, 1><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+        poly_expert_reuse_group4_kernel<F, PARTIAL, 1, BLOCK, VECTOR><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+    }
+}
+template<typename Weight, bool PARTIAL>
+inline void poly_expert_reuse_group4(const MmvqIds& slots, int count, int n_in,
+                                     int n_out, int rows, cudaStream_t stream) {
+    if (poly_expert_reuse_group4_block_on()) {
+        if (poly_q40_expert_weight_vector_on())
+            poly_expert_reuse_group4_impl<Weight, PARTIAL, true, true>(slots, count, n_in, n_out, rows, stream);
+        else
+            poly_expert_reuse_group4_impl<Weight, PARTIAL, true>(slots, count, n_in, n_out, rows, stream);
+    } else {
+        poly_expert_reuse_group4_impl<Weight, PARTIAL, false>(slots, count, n_in, n_out, rows, stream);
     }
 }
 #endif
