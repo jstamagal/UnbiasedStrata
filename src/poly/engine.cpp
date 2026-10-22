@@ -2776,10 +2776,14 @@ void Engine::save_profile() const {
 
 void Engine::reset() {
     OnCard here(device_, split_);
+    if (mtp_input_pos_ >= 0 && ev_hr_)
+        ck(cudaEventSynchronize((cudaEvent_t) ev_hr_), "reset MTP input");
     pipe_ready_ = pipe_inflight_ = false;
     pipe_n_ = 0;
     mtp_synced_ = 0;
     mtp_seed_pos_ = -1;
+    mtp_input_pos_ = -1;
+    pipe_save_into_ = nullptr;
     ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
     pos_ = 0;
     ahead_pos_ = -1;
@@ -2831,6 +2835,8 @@ void Engine::load_state(const uint8_t* src, int64_t pos) {
     pipe_n_ = 0;
     mtp_synced_ = 0;
     mtp_seed_pos_ = -1;
+    mtp_input_pos_ = -1;
+    pipe_save_into_ = nullptr;
     ck(cudaStreamSynchronize(cs(st_)), "load state");
     ck(cudaMemcpy(state_, src, state_n_ * sizeof(float), cudaMemcpyHostToDevice), "load state");
     load_extra(src + state_n_ * sizeof(float), pos);
@@ -4796,14 +4802,14 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
         // Preserve the preparation failure even if the verifier also failed while it was in flight.
         const std::exception_ptr failure = std::current_exception();
         try { back.wait(); } catch (...) {}
-        ck(cudaMemcpyAsync(state_, pipe_saved_[0], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
-           "pipeline draft rollback");
-        ck(cudaStreamSynchronize(cs(st_)), "pipeline draft rollback");
         win_ = 0;
-        pipe_ready_ = false;
+        pipe_ready_ = pipe_inflight_ = false;
         pipe_n_ = 0;
+        pipe_save_into_ = nullptr;
         mtp_seed_pos_ = -1;
         mtp_input_pos_ = -1;
+        (void) cudaMemcpyAsync(state_, pipe_saved_[0], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_));
+        (void) cudaStreamSynchronize(cs(st_));
         std::rethrow_exception(failure);
     }
     if (!mtp_stage0_) back.go(verify_back);
@@ -4833,17 +4839,26 @@ void Engine::pipeline_window(const int32_t* tokens, int t, const int32_t* predic
             pipe_ready_ = false;
             pipe_n_ = 0;
         }
+        pos_ = start;  // the speculative state is ahead, but callers see only committed tokens
+        back.wait();
+        pipe_inflight_ = true;
     } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
         pipe_save_into_ = nullptr;
         pos_ = start;
         windowed_ = false;
         snap_bits_ = 0;
-        back.wait();
-        throw;
+        try { back.wait(); } catch (...) {}
+        pipe_ready_ = pipe_inflight_ = false;
+        pipe_n_ = 0;
+        win_ = 0;
+        mtp_seed_pos_ = -1;
+        mtp_input_pos_ = -1;
+        // Cleanup must preserve the failure, including when the stream itself failed.
+        (void) cudaMemcpyAsync(state_, pipe_saved_[0], rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_));
+        (void) cudaStreamSynchronize(cs(st_));
+        std::rethrow_exception(failure);
     }
-    pos_ = start;  // the speculative state is ahead, but callers see only committed tokens
-    back.wait();
-    pipe_inflight_ = true;
 }
 
 // How a window of t tokens goes through the layers: in halves, or its tokens together.  Each way is timed a few
