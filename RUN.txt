@@ -132,3 +132,6 @@ STRATA_POLY_Q40_DENSE_WAVE=1  # Q4_0 dense paired-row wave kernel, 1-4 columns
 STRATA_POLY_Q80_DENSE_WAVE=1  # Q8_0 dense paired-row wave kernel, 1-4 columns
 STRATA_POLY_DENSE_WAVE_WIDE=1  # Q4_0/Q8_0 dense wave kernels for 5-8 verify columns
 STRATA_POLY_Q80_DENSE_WAVE=1 STRATA_POLY_Q80_DENSE_ROWS=4  # Q8_0 activation reuse over 1/2/4 output rows, default 2
+STRATA_POLY_HEAD_VERIFY=1  # Q6_K verify head reuses input and weights across 2-4 columns
+STRATA_POLY_HEAD_VERIFY=1 STRATA_POLY_HEAD_VERIFY_ROWS=2  # rows per persistent CTA, choose 1/2/4
+STRATA_POLY_HEAD_VERIFY=1 STRATA_POLY_HEAD_VERIFY_GRID=2048  # persistent verify grid, range 256-16384

@@ -6,6 +6,7 @@ constexpr int kPolyHeadBlocks = kPolyHeadIn / 256;
 constexpr int kPolyHeadBlockBytes = 210;
 
 #include "poly_head_preload.cuh"
+#include "poly_head_verify.cuh"
 
 template<int NC>
 __launch_bounds__(128)
@@ -149,7 +150,8 @@ inline bool poly_head_wave_enabled(int n_in, int n_out, int ncols) {
         const char* v = std::getenv("STRATA_POLY_HEAD_WAVE");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    return (on || poly_head_pair_enabled() || (ncols == 1 && poly_head_preload_enabled())) &&
+    return (on || poly_head_pair_enabled() || (ncols == 1 && poly_head_preload_enabled()) ||
+            (ncols >= 2 && poly_head_verify_enabled())) &&
            n_in == kPolyHeadIn && n_out >= 65536 && ncols >= 1 && ncols <= 4;
 }
 
@@ -159,6 +161,10 @@ inline void poly_head_wave(const void* weights, const void* x, float* y, int n_o
     const dim3 threads(32, 4);
     const auto* w = static_cast<const Q6KBlock*>(weights);
     const auto* q = static_cast<const Q81Block*>(x);
+    if (ncols >= 2 && poly_head_verify_enabled()) {
+        poly_head_verify(w, q, y, n_out, ncols, stream);
+        return;
+    }
     if (ncols == 1 && poly_head_preload_enabled()) {
         poly_head_preload(w, q, y, n_out, stream);
         return;
