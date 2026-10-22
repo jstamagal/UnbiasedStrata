@@ -72,6 +72,10 @@ Recorded here because a client written for one of the two may notice.
 - **Streams always end with a usage chunk** (empty `choices`, `usage`, `timings`), as upstream's server does,
   whether or not the client sent `stream_options.include_usage`; llama-server sends it only on request (96f4ef1f).
   Same reason: the bench client reads `prompt_tokens` from it.
+- **`/v1/messages` and `/v1/messages/count_tokens`** (Anthropic Messages, for Claude Code): converted to an OpenAI chat
+  request with llama.cpp's own `server_chat_convert_anthropic_to_oai`, as llama-server does, and answered in Anthropic's
+  shape and SSE events (`TASK_RESPONSE_TYPE_ANTHROPIC`, which the front end already formatted). `count_tokens` tokenizes
+  the rendered prompt without running it (2026-10-22).
 - **One slot.** Requests are served one at a time in arrival order, as upstream's server does with one engine.
 - **No constrained decoding.** `response_format` and tool schemas are parsed and used for output parsing, not
   enforced at the sampler, because the engine samples; logged once per such request.
