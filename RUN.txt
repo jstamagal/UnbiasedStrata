@@ -121,3 +121,4 @@ STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_ROLLBACK_
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_GRAPH_RUNAHEAD=1 STRATA_POLY_DMA_RUNAHEAD=1 STRATA_POLY_PCIE_FRAC=0.25,0  # fully cached layers bypass DMA handshake; miss layers retain DMA/CPU completion, areas A/B
 STRATA_POLY_Q35_GDN_SET=1  # combine GDN QKV and output-gate projections for 2-8-row windows, area E
 STRATA_POLY_Q35_ATTN_GATE_WINDOW=1  # combine attention output gating and Q8_1 quantization for 2-8-row windows, area E
+STRATA_POLY_HEAD_WIDE=0  # stock Q6_K head is now the gfx103x default; HEAD_WIDE=1 restores wide candidate

@@ -1281,7 +1281,7 @@ void gfx103x_poly_defaults() {
     const char* arch = prop.gcnArchName;
     if (std::strncmp(arch, "gfx103", 6) != 0) return;
     for (const char* name : {"STRATA_POLY_Q40_EXPERT_WAVE", "STRATA_POLY_Q40_EXPERT_PAIR",
-                             "STRATA_POLY_MMVQ_ROW", "STRATA_POLY_HEAD_WIDE", "STRATA_POLY_Q35_FUSE",
+                             "STRATA_POLY_MMVQ_ROW", "STRATA_POLY_Q35_FUSE",
                              "STRATA_POLY_ROUTER_DOORBELL", "STRATA_POLY_ASYNC_SWAPS",
                              "STRATA_POLY_DECODE_CACHE"})
         if (!std::getenv(name)) setenv(name, "1", 0);
