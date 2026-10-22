@@ -508,6 +508,7 @@ struct Session {
                 // different chain and needlessly discard the completed front-card work.
                 const int held = k == 0 && room && engine.pipeline_windows()
                     ? engine.pipeline_proposal(t, d, std::min(widest, kBlockWindow)) : 0;
+                const bool chain = held > 1 && engine.pipeline_chain();
                 if (held > 1) {
                     use = {false, held};
                 } else if (ask) {
@@ -541,18 +542,32 @@ struct Session {
                 if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
                 // The next window is a guess until this one's sampled logits arrive.  Its first-card work can
                 // run while the second card verifies this one; a miss is discarded by keep().
-                const bool pipeline_candidate = engine.pipeline_windows() && ask && !use.lookup &&
-                                      last_draft_i == use.t - 2 &&
+                const bool pipeline_candidate = engine.pipeline_windows() && !use.lookup &&
+                                      ((ask && last_draft_i == use.t - 2) || chain) &&
                                       engine.pos() + 2 * use.t <= engine.max_context() &&
                                       r.produced + use.t < max_new;
                 float p_accept = 1.f;
-                if (pipeline_candidate)
+                if (pipeline_candidate && !chain)
                     for (int i = 0; i + 1 < use.t; ++i)
                         p_accept *= std::clamp(draft_prob[i], 0.f, 1.f);
-                const bool pipeline = pipeline_candidate && engine.pipeline_gate(p_accept, "accept");
+                const bool pipeline = pipeline_candidate && (chain || engine.pipeline_gate(p_accept, "accept"));
                 if (pipeline) {
                     int32_t future[strata::spec::DraftPolicy::kMaxT];
                     engine.pipeline_window(w, use.t, future, use.t, [&] {
+                        if (chain) {
+                            // B's front work was reused. Replay its proposed tokens through the MTP on card 0
+                            // while card 1 verifies B, so the next bonus comes from the committed A state.
+                            for (int i = 0; i + 1 < use.t; ++i) {
+                                float p = 0.f;
+                                guesses.wants(i);
+                                const Clock::time_point asked_at = Clock::now();
+                                const int32_t proposed = engine.draft(w[i], i, &p);
+                                if (proposed != w[i + 1]) return 0;
+                                guesses.takes(i, p, ms_since(asked_at));
+                                p_accept *= std::clamp(p, 0.f, 1.f);
+                            }
+                            if (!engine.pipeline_gate(p_accept, "accept")) return 0;
+                        }
                         int32_t from = w[use.t - 1];
                         float bonus_prob = 0.f;
                         future[0] = engine.draft(from, use.t - 1, &bonus_prob);
@@ -575,7 +590,7 @@ struct Session {
                             from = future[n_future + 1];
                         }
                         return 1 + n_future;
-                    });
+                    }, chain);
                 } else if (engine.pipeline_match(w, use.t)) {
                     engine.pipeline_window(w, use.t, nullptr, 0);
                 } else {

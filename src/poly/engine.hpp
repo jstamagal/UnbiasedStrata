@@ -234,10 +234,11 @@ public:
     void window(const int32_t* tokens, int t);
     /// Two-card, opt-in decode: verify this window on the last card while the first card runs a predicted next one.
     bool pipeline_windows() const;
+    bool pipeline_chain() const;
     bool pipeline_match(const int32_t* tokens, int t) const;
     int pipeline_proposal(int32_t first, int32_t* drafts, int max_t) const;
     void pipeline_window(const int32_t* tokens, int t, const int32_t* predicted, int predicted_n,
-                         const std::function<int()>& prepare = {});
+                         const std::function<int()>& prepare = {}, bool seed_draft = false);
     bool pipeline_gate(float probability, const char* reason);
     void pipeline_cancel();
     const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
@@ -543,6 +544,7 @@ protected:
     bool mtp_stage0_ = false;             ///< opt-in duplicate drafter on the front card of a two-card split
     bool mtp_stage0_last_ = false;        ///< last card keeps only canonical MTP rows, not its unused MoE
     int64_t mtp_synced_ = 0;             ///< committed draft-cache rows mirrored from the last card
+    int64_t mtp_seed_pos_ = -1;          ///< front MTP source seeded before last-card verification begins
     uint8_t* h_mtp_rows_ = nullptr;      ///< bounded pinned row handoff for the front drafter
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
     const float* pass_ = nullptr;
@@ -585,6 +587,7 @@ protected:
     float* d_partial_cpu_ = nullptr;
     void** h_partial_slots_ = nullptr;        ///< one coherent host slot row, published before cached MMVQ
     void** d_partial_slots_ = nullptr;
+    double pcie_credit_ = 0.;               ///< fractional miss budget carried between layer plans
     float pcie_frac_ = 0.f;                  ///< optional share of unique cache misses copied to GPU
     void* dma_st_ = nullptr;                 ///< copies for the partial-stage graph
     uint8_t* h_dma_stage_ = nullptr;        ///< bounded pinned expert copies
@@ -611,6 +614,7 @@ protected:
     long long* h_at_ = nullptr;   ///< pinned
     bool recording_ = false;      ///< a layer's launches are being recorded: positions are read from at_
     bool recorded_ = false;       ///< took_record()
+    bool graph_head_done_ = false; ///< this run's partial graph also wrote h_wlogits_
 
     // geometry
     int n_embd_ = 0, n_layer_ = 0, n_vocab_ = 0;

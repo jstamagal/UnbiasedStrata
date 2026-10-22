@@ -92,3 +92,8 @@ STRATA_POLY_ADAPT_SWAPS=160  # built: in-flight swap capacity override, supporte
 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_TAIL_NEXT_NORM=1 --max-context 262144  # built: fold interior layer residual add into next input norm/Q8 quantization, one fewer launch/interior layer (B/E)
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 --max-context 262144  # rebuilt: draft-only head prefix on card0; packed canonical MTP KV plus hidden row transfer, one copy per direction (C)
 STRATA_POLY_HEAD_WIDE=1 STRATA_POLY_HEAD_WIDE_GRID=8192  # built opt-in: more Q6_K head workgroups and no unused final-row prefetch; default grid unchanged (E)
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_GRAPH_HEAD=1 --max-context 262144  # built: last-card output norm/head/logits transfer captured in the window graph (B)
+STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_MTP_STAGE0=1 STRATA_POLY_PIPELINE_CHAIN=1 --max-context 262144  # built opt-in: replay held proposals on card0 to predict another window while card1 verifies; confidence/matching still gate speculation (C)
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_ADAPT_OVERLAP=1  # rebuilt: helper dispatches requested uploads earliest-layer first so arrivals serve the current pass (D)
+STRATA_POLY_GDN_STATE_NORM=1  # built opt-in: GDN state update and gated output norm in one launch for 128-wide heads, windows 1..8 (E)
+STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PCIE_FRAC=0.25,0  # rebuilt: fractional miss budget carries across layer plans rather than rounding every lone miss to DMA (A)

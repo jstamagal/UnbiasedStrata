@@ -11,6 +11,7 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -2749,6 +2750,8 @@ void shortconv(const float* bcx, float* state, const float* w, float* out, int c
         throw std::runtime_error(std::string("shortconv: ") + cudaGetErrorString(e));
 }
 
+#include "poly_gdn_state_norm.cuh"
+
 void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const float* a, float* s, const float* z,
               const float* o_norm, float* out, int dim, int n_head, int k_heads, int rows, float norm_eps, void* stream,
               float* snap, size_t stride, unsigned snaps, bool qk_pre_normed, bool gates_precomputed) {
@@ -2760,6 +2763,15 @@ void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const floa
         gdn_gates_kernel<<<grid(gates, 256), 256, 0, cs(stream)>>>(alpha, beta, dt, a, n_head, gates);
     const int blocks = n_head * ((dim + columns - 1) / columns), threads = columns * WARP;
     const unsigned sn = snap ? snaps : 0u;
+    static const bool fused_state_norm = [] {
+        const char* v = std::getenv("STRATA_POLY_GDN_STATE_NORM");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (fused_state_norm && dim == 128 && rows >= 1 && rows <= 8) {
+        poly_gdn_state_norm(qkv, alpha, beta, s, z, o_norm, out, n_head, k_heads,
+                             rows, norm_eps, snap, stride, sn, stream);
+        return;
+    }
     switch (dim / WARP) {
     case 1: gdn_state_reg_kernel<1><<<blocks, threads, 0, cs(stream)>>>(qkv, alpha, beta, s, out, dim, n_head, k_heads,
                                                                           rows, snap, stride, sn); break;
