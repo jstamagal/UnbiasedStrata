@@ -156,7 +156,7 @@ The four rules still decide what the merge may bring. Removed from it, as above:
 desktop app (`apps`), `strata_control`, `packaging`, `docker`, `integrations`, `serve`, `strata.py`, `.github`, `bin`,
 `CONTRIBUTING.md`, the files this fork had deleted, their tests (`tests/terminal`, `tests/desktop`, `tests/tuning`,
 `tests/time_skip`, `tests/sycl/test_setup_intel_prefill.py`, `tools/test_setup_*.py`), the downloaders
-(`tools/hf_pin_fetch.py`, `metal/setup_mac.py`), the tools that drive the Python server (`tools/minimal_*_smoke.py`,
+(`tools/hf_pin_fetch.py`; `metal/setup_mac.py` stays as this fork had it), the tools that drive the Python server (`tools/minimal_*_smoke.py`,
 `tools/portable_monitor_*`, `tools/monitor_soak.py`, `tools/test_vision_reader.py`, `tools/test_pool_plan.py`,
 `tools/test_picture_defaults.py`), `bench/results/`, and the documents of removed components (Terminal, Docker, app,
 management protocol, release notes, safety, the community benchmark protocol). `sycl/serve` and `sycl/setup_intel.py`
