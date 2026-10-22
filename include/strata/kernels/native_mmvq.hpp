@@ -165,6 +165,7 @@ struct MmvqIds {
     int x_every;
     float* y;
     std::size_t y_stride;
+    const int32_t* reuse_partner = nullptr;
 };
 bool native_mmvq_ids_supported(int ggml_type);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);

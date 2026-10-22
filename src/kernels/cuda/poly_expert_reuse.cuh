@@ -1,15 +1,19 @@
 #pragma once
 
+#include "poly_expert_reuse_ballot.cuh"
+
 #if defined(__HIPCC__)
 inline bool poly_expert_reuse_pair_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_EXPERT_REUSE_PAIR");
-        return v && v[0] == '1' && v[1] == '\0';
+        const char* meta = std::getenv("STRATA_POLY_EXPERT_REUSE_META");
+        return (v && v[0] == '1' && v[1] == '\0') ||
+               (meta && meta[0] == '1' && meta[1] == '\0');
     }();
     return on;
 }
 
-template<typename F, bool PARTIAL, int ROWS>
+template<typename F, bool PARTIAL, int ROWS, bool BALLOT = false>
 __global__ void __launch_bounds__(128) poly_expert_reuse_pair_kernel(
         MmvqIds slots, int count, int n_in, int n_out) {
     const int j = int(blockIdx.y);
@@ -17,14 +21,23 @@ __global__ void __launch_bounds__(128) poly_expert_reuse_pair_kernel(
     const int row0 = 4 * ROWS * int(blockIdx.x) + ROWS * int(threadIdx.y);
     if (row0 >= n_out) return;
     const int expert = slots.ids[j];
-    int prior = 0;
-    for (int k = 0; k < j; ++k) prior += slots.ids[k] == expert;
-    if (prior & 1) return;
     int partner = -1;
-    for (int k = j + 1; k < count; ++k) {
-        if (slots.ids[k] == expert) {
-            partner = k;
-            break;
+    if (slots.reuse_partner) {
+        partner = slots.reuse_partner[j];
+        if (partner == -2) return;
+    } else if constexpr (BALLOT) {
+        const PolyExpertPairMatch match = poly_expert_pair_ballot(slots.ids, count, j, expert);
+        if (match.prior & 1) return;
+        partner = match.partner;
+    } else {
+        int prior = 0;
+        for (int k = 0; k < j; ++k) prior += slots.ids[k] == expert;
+        if (prior & 1) return;
+        for (int k = j + 1; k < count; ++k) {
+            if (slots.ids[k] == expert) {
+                partner = k;
+                break;
+            }
         }
     }
     if constexpr (PARTIAL) {
@@ -71,20 +84,28 @@ __global__ void __launch_bounds__(128) poly_expert_reuse_pair_kernel(
     }
 }
 
-template<typename Weight, bool PARTIAL>
-inline void poly_expert_reuse_pair(const MmvqIds& slots, int count, int n_in,
+template<typename Weight, bool PARTIAL, bool BALLOT>
+inline void poly_expert_reuse_pair_impl(const MmvqIds& slots, int count, int n_in,
                                    int n_out, int rows, cudaStream_t stream) {
     using F = SmallTraits<Weight, 4>;
     const dim3 threads(32, 4);
     if (rows == 4) {
         const dim3 blocks(unsigned((n_out + 15) / 16), unsigned(count));
-        poly_expert_reuse_pair_kernel<F, PARTIAL, 4><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+        poly_expert_reuse_pair_kernel<F, PARTIAL, 4, BALLOT><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
     } else if (rows == 2) {
         const dim3 blocks(unsigned((n_out + 7) / 8), unsigned(count));
-        poly_expert_reuse_pair_kernel<F, PARTIAL, 2><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+        poly_expert_reuse_pair_kernel<F, PARTIAL, 2, BALLOT><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
     } else {
         const dim3 blocks(unsigned((n_out + 3) / 4), unsigned(count));
-        poly_expert_reuse_pair_kernel<F, PARTIAL, 1><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
+        poly_expert_reuse_pair_kernel<F, PARTIAL, 1, BALLOT><<<blocks, threads, 0, stream>>>(slots, count, n_in, n_out);
     }
+}
+template<typename Weight, bool PARTIAL>
+inline void poly_expert_reuse_pair(const MmvqIds& slots, int count, int n_in,
+                                   int n_out, int rows, cudaStream_t stream) {
+    if (poly_expert_reuse_ballot_on())
+        poly_expert_reuse_pair_impl<Weight, PARTIAL, true>(slots, count, n_in, n_out, rows, stream);
+    else
+        poly_expert_reuse_pair_impl<Weight, PARTIAL, false>(slots, count, n_in, n_out, rows, stream);
 }
 #endif

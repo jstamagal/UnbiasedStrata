@@ -40,6 +40,8 @@ void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);
 void rms_norm(const float* x, const float* w, float* y, int n, int rows, float eps, void* stream, int y_stride = 0);
 /// The threads of a block that sums over n values (rms_norm()'s among them).
 int sum_threads(int n);
+void rms_norm_pair(const float* x0, const float* w0, const float* x1, const float* w1,
+                    float* y, int n, int rows, float eps, void* stream);
 /// y = (x - mean) / sqrt(var + eps) * w + b.
 void layer_norm(const float* x, const float* w, const float* b, float* y, int n, int rows, float eps, void* stream);
 
@@ -153,6 +155,7 @@ struct RoutePublish {
     int x_count;
     uint32_t* ready;
     uint32_t* layer_ready;
+    int32_t* partners = nullptr;
 };
 bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
                         const float* bias, const float* escale, bool norm, float w_scale,

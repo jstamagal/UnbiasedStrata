@@ -1009,6 +1009,18 @@ __global__ void route_kernel(const float* __restrict__ logits, int n_expert, int
     w[size_t(row) * n_used + lane] = v;
 }
 
+// Pair repeated experts in flattened token/selection order. A leader points to its next occurrence;
+// that occurrence is skipped, while an unmatched final occurrence stays a singleton.
+__device__ __forceinline__ int32_t route_reuse_partner(const int32_t* ids, int count, int entry) {
+    const int expert = ids[entry];
+    int previous = 0;
+    for (int i = 0; i < entry; ++i) previous += ids[i] == expert;
+    if (previous & 1) return -2;
+    for (int i = entry + 1; i < count; ++i)
+        if (ids[i] == expert) return i;
+    return -1;
+}
+
 // A decode window routes in one 256-thread block; the same block publishes its
 // input and selected experts to mapped host memory after the exact route math.
 template<int PER>
@@ -1082,9 +1094,12 @@ __device__ __forceinline__ void route_publish_body(const volatile float* logits,
     w[size_t(row) * n_used + lane] = v;
     }
     }
-    // All eight warps, including inactive rows and lanes beyond n_used, reach this barrier.
+    // All warps, including inactive rows and lanes beyond n_used, reach this barrier.
     __syncthreads();
     const int t = int(threadIdx.x);
+    if (publish.partners)
+        for (int i = t; i < rows * n_used; i += blockDim.x)
+            publish.partners[i] = route_reuse_partner(ids, rows * n_used, i);
     for (int i = t; i < publish.x_count; i += blockDim.x)
         publish.host_x[i] = publish.x[i];
     for (int i = t; i < rows * n_used; i += blockDim.x) {
@@ -2465,6 +2480,8 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream) {
     bf16_to_f32_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(w, out, n);
 }
+
+#include "mtp_norm_pair.cuh"
 
 void rms_norm(const float* x, const float* w, float* y, int n, int rows, float eps, void* stream, int y_stride) {
     rms_norm_kernel<<<rows, sum_threads(n), 0, cs(stream)>>>(x, w, y, n, eps, y_stride ? y_stride : n);
