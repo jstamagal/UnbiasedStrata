@@ -160,3 +160,4 @@ STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_Q40_EXPERT_BL
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_EXPERT_REUSE_PAIR=1  # reuse decoded weights across paired routed expert occurrences
 STRATA_POLY_DENSE_TSUM=1  # combine dense wave reductions and stores for 2-4 columns
 STRATA_POLY_Q35_ALPHA_BETA=1 STRATA_POLY_Q35_ALPHA_BETA_WINDOW=1  # reuse F32 alpha/beta weights across 2-4 token windows
+STRATA_POLY_MTP_FFN_NORM_Q8=1  # fuse draft FFN residual add, RMS norm and Q8 quantization

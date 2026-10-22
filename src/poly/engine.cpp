@@ -92,6 +92,13 @@ bool mtp_head_norm_q8_on() {
     }();
     return on;
 }
+bool mtp_ffn_norm_q8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_FFN_NORM_Q8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool graph_runahead_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_GRAPH_RUNAHEAD");
@@ -4887,9 +4894,14 @@ void Engine::draft_step(int32_t token, int i) {
     float* own = hn_ + n_embd_;   // the block's output, which stands in for the model's from the second guess on
     float* x = draft_input(&token, pos_ + i, i == 0 ? hn_ : own, 1);
     block_attend(pos_ + i, 1);
-    axpy(ao_, 1.f, x, n_embd_, true, st_);
-    rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
-    kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+    if (mtp_ffn_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0)
+        kernels::native_add_rms_norm_q8_1(x, ao_, fp(L.ffn_norm), xn_, xq_, n_embd_, 1,
+                                          rms_eps_, sum_threads(n_embd_), st_);
+    else {
+        axpy(ao_, 1.f, x, n_embd_, true, st_);
+        rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
+        kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+    }
     moe_router(L, 1);
     router_record();
     moe_shared(L, n_layer_, 1);
@@ -4994,9 +5006,14 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 rms_norm(x, fp(L.attn_norm), xn_, n_embd_, 1, rms_eps_, st_);
                 kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
                 block_attend(row, 1);
-                axpy(ao_, 1.f, x, n_embd_, true, st_);
-                rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
-                kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+                if (mtp_ffn_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0)
+                    kernels::native_add_rms_norm_q8_1(x, ao_, fp(L.ffn_norm), xn_, xq_, n_embd_, 1,
+                                                      rms_eps_, sum_threads(n_embd_), st_);
+                else {
+                    axpy(ao_, 1.f, x, n_embd_, true, st_);
+                    rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
+                    kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
+                }
                 moe_router(L, 1);
                 if (!route_card_publish(n_layer_, 1, d_ids_, d_wts_, d_partial_x_, d_partial_ids_,
                                         d_partial_wts_, partial_device_words_, nullptr)) {
