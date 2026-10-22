@@ -4,7 +4,7 @@ template<int NC, int ROWS>
 __launch_bounds__(128)
 __global__ void poly_dense_q40_rows_kernel(const Q40Block* __restrict__ w,
                                           const Q81Block* __restrict__ x,
-                                          float* __restrict__ y, int n_in, int n_out, bool vector_load, bool broadcast_scale) {
+                                          float* __restrict__ y, int n_in, int n_out, bool vector_load, bool broadcast_scale, bool transpose_sum) {
     using F = SmallTraits<Q40Block, 4>;
     using Fragment = PolyDenseFragment<F>;
     const int row0 = (4 * int(blockIdx.x) + int(threadIdx.y)) * ROWS;
@@ -34,6 +34,7 @@ __global__ void poly_dense_q40_rows_kernel(const Q40Block* __restrict__ w,
             }
         }
     }
+    if (poly_dense_tsum<NC, ROWS>(sum, y, n_out, row0, lane, transpose_sum)) return;
 #pragma unroll
     for (int col = 0; col < NC; ++col) {
 #pragma unroll
@@ -53,10 +54,10 @@ void poly_dense_q40_rows_n(const Q40Block* w, const Q81Block* x, float* y,
     const dim3 threads(32, 4);
     if (rows == 1) {
         const dim3 grid(unsigned((size_t(n_out) + 3) / 4));
-        poly_dense_q40_rows_kernel<NC, 1><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on());
+        poly_dense_q40_rows_kernel<NC, 1><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on());
     } else {
         const dim3 grid(unsigned((size_t(n_out) + 15) / 16));
-        poly_dense_q40_rows_kernel<NC, 4><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on());
+        poly_dense_q40_rows_kernel<NC, 4><<<grid, threads, 0, stream>>>(w, x, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on());
     }
 }
 

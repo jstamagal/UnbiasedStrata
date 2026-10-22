@@ -2,6 +2,7 @@
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 #include "poly_dense_weights.cuh"
 #include "poly_dense_xscale.cuh"
+#include "poly_dense_tsum.cuh"
 template<typename F> struct PolyDenseFragment;
 
 template<> struct PolyDenseFragment<SmallTraits<Q40Block, 4>> {
@@ -53,7 +54,7 @@ template<typename F, int NC>
 __launch_bounds__(128)
 __global__ void poly_dense_wave_kernel(const typename F::Block* __restrict__ w,
                                       const Q81Block* __restrict__ x,
-                                      float* __restrict__ y, int n_in, int n_out, bool vector_load, bool broadcast_scale) {
+                                      float* __restrict__ y, int n_in, int n_out, bool vector_load, bool broadcast_scale, bool transpose_sum) {
     using Fragment = PolyDenseFragment<F>;
     const int row0 = (4 * int(blockIdx.x) + int(threadIdx.y)) * 2;
     if (row0 >= n_out) return;
@@ -82,6 +83,7 @@ __global__ void poly_dense_wave_kernel(const typename F::Block* __restrict__ w,
             }
         }
     }
+    if (poly_dense_tsum<NC, 2>(sum, y, n_out, row0, lane, transpose_sum)) return;
 #pragma unroll
     for (int col = 0; col < NC; ++col) {
 #pragma unroll
@@ -127,14 +129,14 @@ bool poly_dense_wave(const void* weights, const void* x, float* y,
         const dim3 grid(unsigned((size_t(n_out) + 7) / 8));
         const dim3 threads(32, 4);
         switch (ncols) {
-        case 1: poly_dense_wave_kernel<F, 1><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 2: poly_dense_wave_kernel<F, 2><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 3: poly_dense_wave_kernel<F, 3><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 4: poly_dense_wave_kernel<F, 4><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 5: poly_dense_wave_kernel<F, 5><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 6: poly_dense_wave_kernel<F, 6><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 7: poly_dense_wave_kernel<F, 7><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
-        case 8: poly_dense_wave_kernel<F, 8><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on()); break;
+        case 1: poly_dense_wave_kernel<F, 1><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 2: poly_dense_wave_kernel<F, 2><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 3: poly_dense_wave_kernel<F, 3><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 4: poly_dense_wave_kernel<F, 4><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 5: poly_dense_wave_kernel<F, 5><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 6: poly_dense_wave_kernel<F, 6><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 7: poly_dense_wave_kernel<F, 7><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
+        case 8: poly_dense_wave_kernel<F, 8><<<grid, threads, 0, stream>>>(w, q, y, n_in, n_out, poly_dense_weight_vector_on(), poly_dense_xscale_on(), poly_dense_tsum_on()); break;
         }
         return true;
     }
