@@ -11,7 +11,7 @@ STRATA_POLY_MMVQ_SET=1  # fuse projections sharing an input, area B
 STRATA_POLY_HEAD_2WAVE=1  # two-wave Q6_K head, area B
 STRATA_POLY_HEAD_WAVE=1  # one-wave Q6_K head, area B
 STRATA_POLY_VRAM_TRACE=1  # report per-card cache budget, allocations and remaining free VRAM, area D
-STRATA_POLY_VRAM_UNCAP=1  # reserve expert virtual addresses beyond reported total; physical free budget still applies, area D
+# RETIRED after Q4_1 diagnosis: STRATA_POLY_VRAM_UNCAP=1  # reserve expert virtual addresses beyond reported total; physical free budget still applies, area D
 STRATA_POLY_PIPELINE_WINDOWS=2  # corrected confidence-gated next-window speculation and rollback, area D
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_TRACE=1  # report pipeline discard reasons, area D
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_THETA=0.2  # minimum whole-window-plus-bonus confidence, area D
@@ -19,8 +19,6 @@ STRATA_POLY_PARTIAL_GRAPH=1  # whole-stage graph: cached picks on GPU, every mis
 STRATA_POLY_CACHE_LAYERS=1  # complete-layer packing and stage graphs; measured lower hit rate, area C
 STRATA_POLY_CPUS='host=0,hip=1,pool=8-15,aux=2-7'  # physical-core placement, area D
 STRATA_POLY_WORKER_SPINS=0  # disable expert-worker idle spinning; unset retains 20000 iterations, area D
-STRATA_POLY_YARN=1 --rope-scaling yarn --rope-scale 4  # Qwen YaRN, area E
-STRATA_POLY_KV_RESIDENT=1 STRATA_POLY_YARN=1 --kv q8_0 --kv-resident 32768 --max-context 1048576 --rope-scaling yarn --rope-scale 4  # pinned host KV with resident VRAM window, area E
 # STRATA_POLY_EXPERT_FUSE retired: measured slower; baseline activation and quantization restored
 STRATA_GDN_HEAD=1  # DEFAULT on gfx103x in strata; main RDNA2 port
 STRATA_GDN_PP=2  # DEFAULT on gfx103x in strata; main RDNA2 port
@@ -69,6 +67,7 @@ STRATA_GFX103X_EXPERIMENTAL=0  # disable experimental half of main-engine gfx103
 STRATA_ROCBLAS_TUNING=/home/admin/work/lanes/ub/tools/hip/gfx1030-rocblas-5.8.0.3d8f334b.txt  # rocBLAS solution table; loader checks architecture/version
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_CPUS='host=0,hip=1,pool=8-15,aux=2-7' STRATA_POLY_WORKER_SPINS=0  # rebuilt: two pipeline pools use disjoint core halves; staging uses aux
 # Built successfully: make build HIP=1 HIP_ARCH=gfx1030 -> build/bin/strata, build/bin/strata-poly, build/bin/unbiased-strata; llama.cpp patches 0001-0003 applied; GPU runs pending coordinator
-STRATA_POLY_CACHE_REFILL=1 STRATA_POLY_VRAM_TRACE=1  # poly-only build: reserve all expert VA and refill spare VRAM after both cards load; print before/after counts, area D
+# RETIRED after Q4_1 diagnosis: STRATA_POLY_CACHE_REFILL=1 STRATA_POLY_VRAM_TRACE=1  # poly-only build: reserve all expert VA and refill spare VRAM after both cards load; print before/after counts, area D
 STRATA_POLY_PIPELINE_WINDOWS=2 STRATA_POLY_PIPELINE_TRACE=1  # rebuilt: next-window length uses measured draft latency, area D
 STRATA_POLY_PARTIAL_GRAPH=1  # rebuilt: coherent mapped input/IDs/weights, abort release and replay counter recovery, areas C/D
+# Merge b1de5f3c built with make build: all three binaries; Qwen YaRN/1M controls removed; target --max-context 262144

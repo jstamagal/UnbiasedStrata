@@ -4386,9 +4386,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const char* v = std::getenv("STRATA_COLD_OVERLAP");
         return v == nullptr || v[0] == '\0' ? -1 : std::clamp(std::atoi(v), 0, 4);
     }();
-    // This engine's ExpertJobMulti has no per-job native layout, which the zero-copy modes require.
-    // Keep the synchronous or background-read modes and compute every expert from a complete blob.
-    d.cold_mode = cold_env >= 0 && cold_env <= 2 ? cold_env : 0;
+    d.cold_mode = cold_env >= 0 ? cold_env : (d.src != nullptr && d.src->linux_file_defaults() ? 4 : 0);
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
@@ -4663,7 +4661,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
+                const uint8_t* zp[3] = {nullptr, nullptr, nullptr};
+                const bool zc = d.cold_mode >= 3 && native && d.src->zc_roles(d.layers, e, zp);
+                const uint8_t* b = zc ? zp[0] : d.src->blob(d.layers, e);
                 if (b == nullptr) {
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
@@ -4676,6 +4676,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
+                nj.fmt = nullptr;
+                if (zc) {   // 149-cold mode 3: the gate rows are the blob; up and down at their distance in the mapping
+                    if (d.zc_fmt.size() < d.jobs_multi.size()) d.zc_fmt.resize(d.jobs_multi.size());
+                    strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
+                    f = lay.fmt[(size_t) d.layers];
+                    f.up_off = (size_t) ((uintptr_t) zp[1] - (uintptr_t) zp[0]);     // modular: the tensors' order
+                    f.down_off = (size_t) ((uintptr_t) zp[2] - (uintptr_t) zp[0]);   // in the file does not matter
+                    nj.fmt = &f;
+                    ++d.cold_zc;
+                }
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
             jb.act[jb.nt] = &d.act_multi[(size_t) t];

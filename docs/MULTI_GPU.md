@@ -1,4 +1,4 @@
-# PolyStrata on two or more GPUs (layer split)
+# Strata on two or more GPUs (layer split)
 
 One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
 the first card runs layers 0 to K-1, the next card runs K onward, and so on; the last card also runs the output head
@@ -11,30 +11,44 @@ verify window (a few hundred KB through pinned RAM), not twice per layer. No NVL
 needed; cards on x4 or x1 slots work, and the PCIe share of each card is probed on its own link. A `--pcie-frac` you give
 is every card's share and skips those probes; there is no per-card setting yet.
 
-Most of this page is about the engine of Qwen3.8-Flash-Next. The models of the strata-poly engine (Qwen3.6, Gemma 4,
-Ornith, Tiel Coder, GLM 5.3 Flash) split their layers as well, more simply: see
-[The strata-poly models](#the-strata-poly-models).
+**Two models on two cards (the app).** A layer split puts one model on several cards. The other way to use two cards is two
+models, one per card, each answering on its own. In the app, turn on **Run multiple models** on the Models page: the card
+list then says which card a loaded model uses ("Already used by ..."), preselects a free card for the next model, and
+explains a failed start on a card that is taken. Measured on a PC with Radeon AI PRO R9700 cards (two of four, Linux): Q2_0 on
+one card and IQ3_XXS on another both loaded (33 s and 59 s with the files cached, 114 s the first time), both answered chats
+(about 60 tokens/s each), the Monitor listed both, and unloading one left the other answering. This was run with the AMD build only;
+the same app code drives NVIDIA cards, but we have not run two models on two NVIDIA cards.
+
+**One make of card per engine.** An engine drives one make of card (NVIDIA, AMD or Intel). The app, `strata launch` and setup
+offer only the cards the engine can drive, never split a model across two makes, say in one plain line when the other make has
+the bigger card, and say that two models at once on two makes is not supported.
 
 ## Using it
 
 **Nothing to type.** `START-HERE.bat` (Linux: `./setup.sh`) lists your NVIDIA cards and says for each one whether
-PolyStrata can use it:
+Strata can use it:
 
 ```
   Your NVIDIA GPUs:
     GPU 0: NVIDIA GeForce RTX 5080, 16 GB VRAM - can be used
-    GPU 1: NVIDIA GeForce GTX 1080 Ti, 11 GB VRAM - not supported - older than the RTX 20 series (compute capability 6.1; PolyStrata needs 7.5 or newer)
+    GPU 1: NVIDIA GeForce GTX 1080 Ti, 11 GB VRAM - not supported - older than the RTX 20 series (compute capability 6.1; Strata needs 7.5 or newer)
     GPU 2: NVIDIA GeForce RTX 3090, 24 GB VRAM - can be used
   ...
-  1) GPU 0 (NVIDIA GeForce RTX 5080, 16 GB) + GPU 2 (NVIDIA GeForce RTX 3090, 24 GB) together   (recommended)
-  2) GPU 2 (NVIDIA GeForce RTX 3090, 24 GB) only
-  3) GPU 0 (NVIDIA GeForce RTX 5080, 16 GB) only
+  1) RTX 3090 + RAM: fits: needs 44 GB of the 70 GB available   (recommended)
+  2) RTX 3090 + RTX 5080 + RAM (layer split): fits: needs 44 GB of the 84 GB available
+       prompts are read about 20% faster; the cards share the layers (docs/MULTI_GPU.md)
+  3) RTX 5080 + RAM: fits: needs 44 GB of the 66 GB available
 Which GPUs? [1]:
 ```
 
-When two or more cards can share the model, the two best together are recommended (the newest generation first:
-it becomes the main card). A model installed on one card asks once, at its next start, whether to use both from
-now on; the answer is kept.
+**Which cards a model uses (one rule, in setup, `strata launch` and the app).** Strata first tries the model on your
+**largest** card plus the computer's memory, the normal hybrid mode, and recommends that when it fits (with some RAM to
+spare). Only when it does not fit one card, or would be too tight, the layer split over the two largest cards is
+recommended instead. Every option is listed with plain numbers (what the model needs and what the cards and RAM give;
+how much would be read from the SSD when it does not fit) and the choice is yours. The cards that count: not an
+integrated chip (it shares the system memory and adds nothing beside a real card), at least 4 GB of graphics memory, and
+8 GB or more to share a model. The arithmetic is the app's `fitOn` (strata_control/gpu_fit.py keeps its constants equal);
+each extra card of a split costs an estimated 2 GB of its own buffers.
 
 **Choosing yourself** (at setup or at any start):
 
@@ -115,6 +129,10 @@ helped (~360 MB at 3.3K tokens). The rows it computes round like a different MMQ
 bit-identical to the default's (it is repeatable: same prompt, same output), which is why it is **opt-in**:
 `STRATA_PREFILL_HELP=1` turns it on. Native packs on the MMQ prompt path only (not with the fused prompt kernels,
 `STRATA_PF_FUSED=1`, nor with `--peer-device`). With it on, `STRATA_PREFILL_HELP_FRAC=f` fixes the share.
+On two Radeon AI PRO R9700 (each limited to 16 GB with `--vram-reserve-mib 17084`, Q2_0 pack, layer split auto, 5 interleaved pairs,
+noise arm within 0.2%), `STRATA_PREFILL_HELP=1` gave prompt tok/s without -> with: 700 tokens 638 -> 672 (x1.053, 5/5), 1.5K 839 -> 809
+(x0.964), 3K 1,105 -> 929 (x0.840), 6K 1,284 -> 1,211 (x0.943): the PCIe 4.0 x16 links of this box (28.4 GB/s each) make the share lose
+from 1.5K tokens up, so it stays off (`STRATA_PREFILL_HELP_FRAC` was not tuned for it).
 
 The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D1[,D2..]` (the later stages'
 devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
@@ -439,6 +457,62 @@ off beside `--pipeline-windows 2` only when `STRATA_PIPELINE_ADAPT_ASYNC=0` is s
 printed once at start ("is off: ..."). `--remote-expert-opt` does something only with a helper cache
 (`--expert-cache-device1..3`); on a plain layer split it is inert, and setup no longer writes it there (#1447).
 
+**Copied text stays on lookup windows (`STRATA_PL_LOOKUP_STREAK=N`, opt-in).** In the pipelined loop a lookup window
+(`--suffix-draft`) starts only at a window built after a verdict, with one lookup guess behind it; the guesses after
+that come from the draft layer again (windows of `--spec`, named about 4 ms after the verdict), and a draft layer
+that disagrees with the lookup's tokens stops the guessing although the lookup window was accepted whole. With `N`
+of 1 or more, when a guess holds and the window now on the last card is a lookup window, the next guess is the
+lookup's continuation past it (up to `--spec` + 2 tokens, or up to `--spec` with `--mtp-max-t` set), made at the
+verdict; the draft layer then only catches up on the verified window. `N` of 2 or more also starts a lookup guess
+behind a draft-layer window when the lookup's match is at least `N` tokens long and the draft policy's rates favour
+it. The windows only choose which drafts are verified: the text is the same. Measured on 2x Radeon PRO V620
+(gfx1030, layer split 24/24, IQ3_S, `--pipeline-windows 2 --spec-min-p 0.7`, one probe of three chat questions and
+one copy-heavy edit, 400 tokens each, same text hashes in every row):
+
+| setting | chat, greedy (tok/s) | chat, sampled (tok/s) | copy-heavy edit (tok/s) |
+|---|---|---|---|
+| `--spec 3` | 116.2 | 107.1 | 175.7 |
+| `--spec 3`, `STRATA_PL_LOOKUP_STREAK=1` | 116.4 | 107.1 | 267.0 |
+| `--spec 8 --mtp-max-t 3` (lookup windows up to 8 tokens) | 116.2 | 107.0 | 205.7 |
+| `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=1` | 116.1 | 107.1 | 289.2 |
+| `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=12` | 116.4 | 107.0 | 302.8 |
+| `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=4` | 114.4 | 107.0 | 298.5 |
+
+In the copied stretch of that edit every window is then a lookup window of 8 tokens verified 23 ms after the one
+before (both cards 91-92% busy). The last setting ran three times: 302.8, 302.7 and 302.8 tok/s on the edit. Q4_0 on
+the same box, the same probe: the edit 152.4 and 154.4 tok/s without the switch (two runs), 229.8 with `--spec 3` and
+`STRATA_PL_LOOKUP_STREAK=12`, 223.8 with `--spec 8 --mtp-max-t 3` as well; chat within the spread of the two runs
+without it (102.1-105.0 greedy, 102.5-106.1 sampled; 105.2-106.3 and 105.5-107.4 with it). Q4_0's chat text differed
+between those two runs of one setting, so only the edit's text could be compared there (the same in all four). Not
+measured: other cards, three or more stages, NVIDIA.
+
+**Experimental recovery and longer copies.** `STRATA_PL_LOOKUP_RESYNC=1` remembers the source position when a
+copy run breaks. After at least 24 accepted lookup tokens, a mismatch opens a recovery interval of 32 tokens.
+Two matching suffix tokens near the old source position can restart lookup, including tokens proposed by the
+fresh draft layer. Every proposed token still goes through verification.
+
+`STRATA_PL_LOOKUP_MAX_T=9` through `12` allows longer lookup windows in the pipelined suffix path with native
+experts. Fresh windows stay at eight tokens or fewer. Longer windows require 24 accepted lookup tokens and a
+source match of at least 32 tokens. The draft layer keeps its usual window size. Both switches are off by default;
+`STRATA_PL_LOOKUP_STREAK` must also be enabled to continue lookup guesses. Either switch also limits the last
+lookup window to the requested output length and avoids starting guesses past that length. These switches are
+experimental.
+
+On 2x Radeon PRO V620 (gfx1030), the supplied IQ3_S config with a 24/24 layer split, `--spec 8 --mtp-max-t 3`
+and `STRATA_PL_LOOKUP_STREAK=12`, two alternating warm probe runs measured 346.20 tok/s on the copied edit
+without resync and 353.65 with it (+2.15%). Greedy/sampled chat was 126.77/115.77 and 126.80/115.77 tok/s;
+all text hashes matched. Twelve-row lookup reached 351.10 tok/s in two runs, but its mean chat rate was about
+0.2% lower than its paired baseline. Eight-row resync was faster on the copy. See the [measurement report](../cx/report.md)
+for raw results, the prompt-speed discrepancy and controlled checks, failed approaches, and untested backends.
+
+`STRATA_PL_FRESH_T` / `STRATA_PL_FRESH_MIN_P` and `STRATA_PL_GUESS_T` / `STRATA_PL_GUESS_MIN_P` (opt-in) give the
+window built after a verdict and the guessed window their own size cap and draft threshold (unset: `--spec` and
+`--spec-min-p` for both). On the same box and probe none beat `--spec 3 --spec-min-p 0.7` for both: guesses capped at
+2 tokens 112.5 / 106.3 tok/s (greedy / sampled chat), fresh windows up to 5 with `--spec 5` 111.4 / 103.8, a fresh
+threshold of 0.5 115.4 greedy, a guess threshold of 0.85 115.7 / 107.3. `STRATA_SPEC_DEPTH=1` prints the pipelined
+loop's drafts accepted by their index in the window, for both kinds, and how often the guess of a window's bonus
+token was right.
+
 Measured on 2x RTX 3090 (sm_86, 250 W limits; GPU0 PCIe 4.0 x16, GPU1 x4, no NVLink; Ryzen 7 9800X3D, 32 GB RAM),
 Qwen3.8-Flash-Next GSQ-RCO IQ3_S, `--resident-experts`, KV int8, `--spec 4 --mtp`, `"layer_split": "29"` for the
 `--pipeline-windows` rows (without `--remote-expert-opt`); the others are setup's config (`auto`). Decode is the mean of
@@ -468,86 +542,3 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
-
-## The strata-poly models
-
-Qwen3.6, Gemma 4, Ornith, Tiel Coder and GLM 5.3 Flash run on the strata-poly engine, which splits a model's layers
-across cards too. Each card runs a range of layers and keeps the routed experts of those layers in its VRAM, as many
-as fit. The last card also runs the output and the draft block, or Gemma 4's draft model. After its layers a card
-copies the rows of the tokens it read into pinned RAM, and the next card reads them from there: one row of the
-model's width a token, 8 KB for Qwen3.6. No NVLink or peer-to-peer access is needed.
-
-A prompt read in several calls keeps the cards busy together when every routed expert is in VRAM, or when the
-prompt is shorter than `--stage-ahead` tokens: the next card runs its layers for a call on a thread of its own while
-this card runs the call after it. A longer prompt with experts outside VRAM is read a layer at a time for all its
-calls, so that each layer's experts are copied in once, and there the cards take turns. Having them overlap would
-mean reading the prompt in parts, which copies every layer's experts once a part, and the copy is most of the time
-such a read takes. An answer is written a token at a time, and the cards take turns on it too. So with no expert in
-VRAM two cards read a long prompt no faster than one. What a split adds there is VRAM: two cards hold more of the
-experts, and an expert on a card is not computed by the processor.
-
-Setup asks which cards as it does for Qwen3.8-Flash-Next (`--gpus 0,1`, or the list it shows) and writes
-`"gpu": [0, 1]` and `"layer_split": "auto"` into the config. With `"auto"` each card gets a share of the layers'
-bytes by its free VRAM less 1.5 GiB, and the last card's share is smaller by the output and the draft block. A list
-of numbers is the first layer of each later card, as above, and the last card keeps two layers at least. The server
-puts the faster card last, as it does for the other engine. The engine's flag is `--layer-split auto|N[,N...]`; it
-splits across the cards `CUDA_VISIBLE_DEVICES` shows it, in that order. The log names each card's layers:
-
-```
-strata-poly: layers 0 to 21 on card 0: 5632 of 5632 routed experts in VRAM (7.2 GiB)
-strata-poly: layers 22 to 39 on card 1: 4864 of 4864 routed experts in VRAM (6.5 GiB)
-```
-
-Measured on two RTX 3080 (10 GB each, 320 W) with a Xeon Platinum 8255C under Linux, the engine built with CUDA
-12.4: a prompt of 2,727 tokens read with nothing cached, and 256 tokens written after a short prompt, in three
-starts of each. The engine of 2026-10-11 ran it again, three starts on one card and three on both in turn, and read
-at 1,567-1,582 and 3,425-3,562 tokens/s and wrote at 165-177 and 217-221. A cell has the higher of the two passes.
-
-| Qwen3.6 UD-Q3_K_M | Experts in VRAM | Reads the prompt | Writes |
-| --- | ---: | ---: | ---: |
-| one RTX 3080 | 4,606 of 10,496 | 1,570-1,700 tokens/s | 165-177 tokens/s |
-| both | 10,496 of 10,496 | 3,420-3,560 tokens/s | 217-221 tokens/s |
-
-With the cards taking turns on the prompt, as they did before, both read it at 3,070-3,090 tokens/s in two starts
-of the same test, and wrote as fast.
-
-Gemma 4 UD-Q3_K_M: a prompt of 3,527 tokens at 2,190 tokens/s on one card in one start, and at 3,600 on both in
-two starts (3,110-3,160 with the cards taking turns); writing at 178 and 189 tokens/s in one start each. The engine
-of 2026-10-11, two starts of each in turn, read it at 2,170 and 3,540-3,590 and wrote at 182-187 and 191-193. One
-card already held 2,042 of its 3,840 experts, which were most of what an answer used.
-
-With no expert in VRAM (`--vram-reserve-mib 20000`) and `--cpu-share 0`, and with every expert on the processor
-(`--no-gpu-experts`), both cards gave the same greedy tokens as one card, for Qwen3.6 and for Gemma 4, through a
-prompt read in several calls, the prompt cache, a checkpoint, the conversation cache and a request stopped in the
-middle. With no expert in VRAM and the CPU's share at its default, Gemma 4 still did, and two of Qwen3.6's eight
-answers came out other: the share follows how long the calls before took, so which experts the processor computes
-changes from one run to the next. With experts in VRAM the answers can differ a little, as they do between two
-starts on one card: which experts run on a card and which on the processor changes the rounding.
-
-GLM 5.3 Flash REAP50-Q3_K_M (79 GB) ran on the same two cards with 80 GB of RAM. One 10 GB card cannot hold the
-weights outside the routed experts, about 12 GB, so there is no one-card row. With `"auto"` the cards took layers 0
-to 27 and 28 to 44 and held 602 of the 6,192 routed experts (6.7 GiB). A prompt of 6,087 tokens read at 397-398
-tokens/s and 256 tokens were written at 20-21 tokens/s, in two starts; with no expert in VRAM, 367-384 and 16-16.5.
-The engine of 2026-10-11 read it at 398-399 and wrote at 20-22 in two starts, and with no expert in VRAM at 386
-and 14-16 in four.
-With no expert in VRAM and `--cpu-share 0` the split at layer 28 and the split at layer 30 gave the same greedy
-tokens for a short prompt, a long one read in several calls, the prompt cache and a checkpoint; with the share at
-its default, six of the eight answers differed. The conversation cache was not compared:
-with the RAM nearly full it parked nothing in the runs split at layer 28. Of eight starts of that test, one failed
-its long prompt with `pinned memory: invalid argument` and one stopped without a message while reading it. Both
-come from the container's memory: its limit is 80 GiB and the file is 73.4 GiB. With the whole file read into
-the page cache before the start, so that the container was within 2% of its limit, the engine was ended by
-SIGKILL in 3 of 6 starts of the speed test, each 17 s into the first long prompt, with no OOM kill counted by
-the kernel for the container or for the host; the 6 starts in turn with no expert in VRAM, which copy nothing
-to the cards, all ran through. The starts that lived wrote at 6 tokens/s where 20, the experts read from the
-disk again. With the cache empty at the start, the same test ran through at about the speeds above. The five
-`pinned memory: invalid argument` all came at load within five minutes, while a 78 GB download was filling the
-same container's cache; the engine now asks four times, a quarter of a second apart, before it gives up, and
-says at load when the container has less than the model's files and 8 GiB. This pod has less than setup asks
-for REAP50 beside 6.7 GiB of experts in VRAM, about 82 GB.
-
-Not done yet:
-
-- Only two cards under Linux have run it. Three cards and Windows were not tried.
-- A long prompt with experts outside VRAM, and an answer, have the cards take turns (above). The other engine's
-  chunk pipeline, `--pipeline-windows`, `"split_skip_if_fits"` and its `STRATA_*` variables are not in strata-poly.

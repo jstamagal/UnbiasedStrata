@@ -7,7 +7,8 @@
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
-// HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
+// HIP builds (S6): the same checks for the RDNA4 / RDNA3 matrix-core kernel (STRATA_HIP_WMMA) and, on gfx103x, for the
+// dot4 kernel (STRATA_PA_DOT4); skipped (77) on other AMD cards.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -195,7 +196,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         const int code = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
         return (double) (code - 8) * h2f(sc);
     };
-    pl.page_table = up(table);
+    // QA_MASK=n: every n-th page reads as not resident (-1, what KV streaming leaves when a block cannot be made
+    // resident): both kernels must drop its cells, and the FP64 reference below drops them too
+    std::vector<int32_t> utable(table);
+    if (const char* mk = std::getenv("QA_MASK")) {
+        const int64_t every = std::max(2, std::atoi(mk));
+        int64_t masked = 0;
+        for (int64_t pg = every - 1; pg < pages; pg += every) { utable[(size_t) pg] = -1; ++masked; }
+        std::printf("QA_MASK: %lld of %lld pages not resident\n", (long long) masked, (long long) pages);
+    }
+    pl.page_table = up(utable);
     const int32_t* d_ids = up(ids);
     const int32_t* d_steps = up(steps);
     const float* d_q = up(q);
@@ -249,6 +259,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             double mx = -1e300;
             for (int64_t c = 0; c < w; ++c) {
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
+                if (utable[(size_t) (cell / PS)] < 0) { sco[c] = -1e300; continue; }   // QA_MASK: not resident
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
                     const double kv = fmt == 2 ? q4v(k4, row, d)
@@ -259,7 +270,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 mx = std::max(mx, sco[c]);
             }
             double l = 0;
-            for (auto& x : sco) { x = std::exp(x - mx); l += x; }
+            for (auto& x : sco) { x = x <= -1e299 ? 0.0 : std::exp(x - mx); l += x; }
             for (int64_t d = 0; d < HD; ++d) {
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
@@ -350,15 +361,25 @@ int main(int argc, char** argv) {
         int dev = 0;
         hipDeviceProp_t prop{};
         if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return 2;
-        if (std::strncmp(prop.gcnArchName, "gfx12", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx11", 5) != 0) {
-            std::printf("SKIP: %s is not gfx11 / gfx12 (the matrix-core prompt attention)\n", prop.gcnArchName);
+        if (std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
+            // RDNA2: the dot4 kernel (STRATA_PA_DOT4, opt-in in the engine); STRATA_PA_DOT4=2 in the environment
+            // tests the two-digit variant, which is not expected to hold the FP32-level bounds below
+#if defined(_WIN32)
+            if (std::getenv("STRATA_PA_DOT4") == nullptr) _putenv_s("STRATA_PA_DOT4", "1");
+#else
+            setenv("STRATA_PA_DOT4", "1", 0);
+#endif
+        } else if (std::strncmp(prop.gcnArchName, "gfx12", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx11", 5) != 0) {
+            std::printf("SKIP: %s is not gfx103x / gfx11 / gfx12 (no prompt attention kernel of its own)\n", prop.gcnArchName);
             return 77;
         }
+        else {
 #if defined(_WIN32)
-        _putenv_s("STRATA_HIP_WMMA", "1");
+            _putenv_s("STRATA_HIP_WMMA", "1");
 #else
-        setenv("STRATA_HIP_WMMA", "1", 1);
+            setenv("STRATA_HIP_WMMA", "1", 1);
 #endif
+        }
     }
 #endif
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;

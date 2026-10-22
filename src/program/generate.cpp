@@ -2137,6 +2137,9 @@ strata::kernels::cpu::PoolAffinity measure_pool_affinity(strata::core::ExpertSou
     return take_p ? cpu::PoolAffinity::PCores : cpu::PoolAffinity::All;
 }
 
+// HIP: the thread that warms hipBLAS's libraries while the expert arena loads (see warm_gemm_libraries); joined at exit.
+std::thread g_warm_thr;
+struct WarmJoin { ~WarmJoin() { if (g_warm_thr.joinable()) g_warm_thr.join(); } } g_warm_join;
 
 // 0.1.42, CUDA single-GPU serve, no --pcie-frac: the share refined from what the CPU pool measures in the first decode
 // windows.  The balance share of the missed experts is link / (link + CPU rate).  The link is the start-up probe; the CPU
@@ -5442,6 +5445,8 @@ int main(int argc, char** argv) {
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
+        // the first prompt's one-time hipBLAS library loads (about 2.5 s), done on a thread while the expert arena loads
+        if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
         // (RDNA4's matrix-core prompt attention is the default since 148-amd: the engine says so once, at its first prompt;
         // STRATA_HIP_WMMA=0 turns it off.)
 #if defined(_WIN32)
@@ -5767,6 +5772,9 @@ int main(int argc, char** argv) {
                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
                  o.pool_tasks ? " (capped by rows)" : " (automatic)",
                  pool.workers() + (pool.host_works() ? 1 : 0));
+    if (pool.plan_limit()[0] != '\0')   // the default count: what it was bounded by (a configured count is never changed)
+        std::fprintf(stderr, "strata generate: CPU pool: %d workers by default (%d physical cores, %d logical processors; bounded by %s)\n",
+                     pool.workers(), pool.plan_cores(), pool.plan_logical(), pool.plan_limit());
     if (pool.is_hybrid() && pool.affinity() != strata::kernels::cpu::PoolAffinity::All) {
         const char* aff_str = pool.affinity() == strata::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
                               pool.affinity() == strata::kernels::cpu::PoolAffinity::All ? "all" : "auto";
@@ -10707,6 +10715,19 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+        // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
+        // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
+        // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
+        if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) {
+            ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            sp.on_routes = [&](int64_t l, const int32_t* ids, int64_t n) {
+                if (l < 0 || l >= g.n_layers || n <= 0) return;
+                const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
+                float* sd = ram_adapt2.seed.data() + l * g.n_expert;
+                for (int64_t i = 0; i < n; ++i)
+                    if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
+            };
+        }
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {

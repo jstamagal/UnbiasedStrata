@@ -12,7 +12,7 @@ namespace strata::core {
 namespace {
 bool arch_is_gfx103x(const char* gcn) {
     return strata::kernels::gfx_arch_is(gcn, "gfx1030") || strata::kernels::gfx_arch_is(gcn, "gfx1031") ||
-           strata::kernels::gfx_arch_is(gcn, "gfx1032") || strata::kernels::gfx_arch_is(gcn, "gfx1034");
+           strata::kernels::gfx_arch_is(gcn, "gfx1032");
 }
 }  // namespace
 

@@ -42,8 +42,6 @@ enum class KvFmt { kFp16 = 0, kQ8_0 = 1 };
 struct Options {
     std::string model;
     int max_context = 8192;
-    std::string rope_scaling = "none";
-    double rope_scale = 1.0;
     int threads = 0;              ///< 0: the CPUs this process may use
     int vram_reserve_mib = -1;    ///< left free after the expert cache is filled; below 0: by the card's size
     std::string profile;          ///< expert use counts; orders the expert cache, and save_profile() adds to it

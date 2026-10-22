@@ -1,12 +1,57 @@
 # Something went wrong?
 
-The common problems and what to do. Back to the [README](../README.md#something-went-wrong). The full table of
+The common problems and what to do, for the desktop app, the Terminal (`strata launch`) and the installer. Back to the [README](../README.md#something-went-wrong). The full table of
 error messages, with the older engine fixes, is in the [details](DETAILS.md#troubleshooting).
+
+## The desktop app and the Terminal
+
+**A warning says Strata "couldn't find an engine for this computer".**
+The engine is the part that talks to your graphics card. Strata only warns and still downloads the
+model, and the model files stay on your computer, but the model may not run until the right engine is installed. The usual
+reasons are that no engine is installed yet and the update source has none for your card, that the engine found is for
+another make of card, or that the graphics driver is too old. In the app, open Settings, then Engine. In the Terminal, the
+message names the next step: run `strata update --feed <address>` with the update source you were given (or ask whoever sent
+you Strata for the engine that matches your card), then run `strata launch` again.
+
+**"This model needs a newer engine." (the app), or a button called Update engine.**
+Some models need an engine newer than the one installed: Gyro needs 0.1.45.1 or newer, NVFP4 needs 0.1.44, and NVFP4 (NVIDIA,
+trained for FP4) needs 0.1.45. In the app, open Settings, then Engine, and press Update engine. It asks first, keeps your
+model files and settings, and wants running models unloaded. In the Terminal: `strata update --check` says what would
+change, `strata update` installs it (it switches to the new engine only after a test start). If the engine you
+installed is the newest and the message stays, the update source has no newer engine for your card yet.
+
+**On a Mac: "Strata is damaged and can't be opened", "cannot be opened", or "unidentified developer".**
+Nothing is wrong with the file. macOS marks everything a browser downloads, and only lets a marked program run if Apple
+has checked it. Strata's release builds are checked by Apple ("notarised"): drag Strata onto Applications and open it; the
+first time, macOS asks "Are you sure you want to open it?" and you press Open. A test build that is not notarised says
+"damaged". Do not move it to the Trash. Open the Terminal app and remove the mark, with the line that matches what you have
+(drag the file from Finder into the Terminal window to type its path):
+
+    xattr -dr com.apple.quarantine ~/Downloads/<the .dmg file>        # the .dmg, before opening it
+    xattr -dr com.apple.quarantine /Applications/Strata.app           # the app, after dragging it over
+    xattr -dr com.apple.quarantine <the folder you unzipped>          # an unzipped Terminal folder
+
+Then open it again. If macOS says only "the developer cannot be verified", you can instead try to open it once, then open
+System Settings > Privacy & Security and press "Open Anyway" next to the message about Strata. Installs made with
+`curl ... | sh` carry no mark and need none of this. To see which kind you have: `spctl -a -vv /Applications/Strata.app`
+answers "accepted" and "Notarized Developer ID" for a notarised build. (How the builds are signed: `packaging/mac/README.md`.)
+
+**Checking what is installed: `strata doctor`.**
+It is a read-only check of the installed engine parts (it changes nothing): which engine and helper files a saved model
+needs, and whether they are there. `strata doctor --live` also asks the computer which graphics cards it sees and compares
+them with the cards the model is set to use; `--output json` prints the same as data. Put its output into a bug report.
+
+**Sending logs for a bug report.**
+In the app: Settings, Engine, Diagnostics, View logs, then Save logs. It writes one text file,
+`strata-diagnostics-<date>.txt`, into your Downloads folder and shows where. It holds the engine's messages, the failed
+steps and the end of each model's server log. In the Terminal, send the output of `strata doctor`. If the Linux app window
+crashes or will not open, run the AppImage with `--save-logs` in a terminal instead; it writes the crash log and the other
+logs to one file in Downloads. Look through a log before you send it, and never send an API key.
 
 ## While installing or starting
 
-**My PC froze, or got very slow, the first time PolyStrata started.**
-That's normal while it starts, most of all the first time. PolyStrata loads 35-55 GB into your RAM, locks part of it for
+**My PC froze, or got very slow, the first time Strata started.**
+That's normal while it starts, most of all the first time. Strata loads 35-55 GB into your RAM, locks part of it for
 the graphics card, and works out how much of the model fits on your GPU. The mouse can freeze for a few minutes.
 **Wait, and don't close the window.** The next starts are much faster. Still frozen after 10 minutes? Restart the
 PC, close other programs (browsers use a lot of RAM) and try again. If it keeps happening, pick a smaller size (Q2_0
@@ -20,12 +65,12 @@ Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), 
 `START-HERE.bat` again.
 
 **It says port 8080 is already in use.**
-PolyStrata is already running. Look for its window. Or another program uses the port: `START-HERE.bat --port 8081`.
+Strata is already running. Look for its window. Or another program uses the port: `START-HERE.bat --port 8081`.
 Only an address that is really taken says "already in use". Any other reason (Windows keeps the port reserved, or
 the config's `"host"` is not an address of this PC) is printed as what the OS said, with what to change (#769).
 
-**"Windows blocked the PolyStrata engine (or the image encoder) ... Smart App Control".**
-On a clean Windows 11, Smart App Control refuses programs that are not signed, and PolyStrata's `strata.exe` and
+**"Windows blocked the Strata engine (or the image encoder) ... Smart App Control".**
+On a clean Windows 11, Smart App Control refuses programs that are not signed, and Strata's `strata.exe` and
 `strata-vision.exe` are not (#735). Turn it off (Windows Security > App & browser control > Smart App Control
 settings; it cannot be turned back on without a reset of Windows), or, if only the image encoder is blocked, run
 `START-HERE.bat --setup --vision no`.
@@ -39,7 +84,7 @@ The repository's history was cleaned up on 2026-10-06, so a clone made before th
 The 0.1.40.2 scripts handle it: when no tracked file is edited they keep your old commits in the branch
 `pre-cleanup-backup` and move the clone to the new history; otherwise they print the two commands for you. Your models,
 settings and engine are untracked files and are never touched. An older UPDATE.bat / update.sh (before 0.1.40.2) cannot
-do this itself: run these once in the PolyStrata folder, then use UPDATE.bat as usual (add `git stash` first if `git status`
+do this itself: run these once in the Strata folder, then use UPDATE.bat as usual (add `git stash` first if `git status`
 lists edited files):
 
     git fetch origin
@@ -75,7 +120,7 @@ Setup checks the downloaded ready-made engine against the SHA-256 GitHub publish
 Your PC is out of free RAM. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
 
 **An answer stopped with "the engine stopped unexpectedly".**
-Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: PolyStrata starts the
+Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: Strata starts the
 engine by itself. If it keeps happening, close other programs or pick a smaller size.
 
 **It says the prompt exceeds the context.**
@@ -120,7 +165,7 @@ are the same, only the copies of the pageable part to the GPU go through the CPU
 `STRATA_PIN_RESERVE_GIB=N` sets the RAM that must stay free (default: `STRATA_RESIDENT_HEADROOM_GIB`, 4 GiB).
 
 **The Windows display driver resets, then the PC blue-screens (0x141, then 0x116 in `nvlddmkm`) during an answer (#961).**
-This is the NVIDIA driver, not PolyStrata: the report shows the same wedge with other CUDA programs on that driver (610.88,
+This is the NVIDIA driver, not Strata: the report shows the same wedge with other CUDA programs on that driver (610.88,
 RTX 4080 SUPER). Try another driver (a Studio one, or an older one) and a lower power limit; if it only happens with
 `--spec 4`, `--spec 0` avoids the verify window while you wait for a driver fix.
 
@@ -131,18 +176,23 @@ with 13.0. If you compile it yourself, use CUDA 13.0, 13.1 or 13.2.2 (13.2.2, nv
 setup warns when it finds 13.2.0 or 13.2.1 for such a card, and takes an older 13.x when one is installed.
 
 **Pictures are refused, or slow.**
-"this server was started without the vision encoder": the model was set up for text only - run setup again with
-`--vision gpu` (or `--vision cpu`). Pictures that take several seconds (about 3 s at 300 image tokens on 8 cores, more with more tokens) are read by the encoder on the CPU; `--vision gpu`
-(NVIDIA, ~1.4 GB of VRAM) makes it 0.1-0.5 s.
+"this server was started without the vision encoder": the model was set up for text only (someone chose "No", or the
+engine has no picture reader) - run setup again with `--vision yes` (or `--vision gpu` / `--vision cpu`), or switch pictures
+on in the app or on the Pictures step of `strata launch`. Pictures are on by default wherever a model can read them. The
+reader runs on the CPU under 24 GB of graphics memory and on the card from 24 GB, on NVIDIA and AMD cards. Pictures that take
+several seconds (about 3 s at 300 image tokens on 8 cores, more with more tokens) are read by the encoder on the CPU;
+`--vision gpu` (NVIDIA and AMD, ~1.4 GB of VRAM) makes it 0.1-0.5 s. On AMD the card's reader is `strata-vision-hip`; if it
+cannot start, the server prints "the GPU picture reader did not start (...); pictures are read on the CPU" and goes on with
+the CPU reader. The Mac app and the Mac Terminal have no picture reader yet. On Intel Arc, pictures are off by default for now (`--vision yes` turns them on).
 
 ## AMD cards
 
 **"No AMD GPU found (the amdgpu driver's KFD topology is empty)" on Linux.**
 The kernel's amdgpu driver is not loaded for the card. Integrated Radeon GPUs are listed as not supported; setup
-lists every card it found and whether PolyStrata can use it.
+lists every card it found and whether Strata can use it.
 
 **The engine stops at start with the card's name, its architecture and the build's list.**
-The engine was compiled for another card (for example after moving the PolyStrata folder to another PC). Run
+The engine was compiled for another card (for example after moving the Strata folder to another PC). Run
 `./setup.sh --setup --backend hip`: it compiles the engine for this card's architecture.
 
 **On Windows the engine exits with `0xC0000005` in `amdhip64_7.dll` before it prints anything (#654).**
@@ -155,11 +205,11 @@ folder such as `C:\Temp`.
 **Windows AMD: the driver resets (VIDEO_ENGINE_TIMEOUT_DETECTED / screen flicker / the engine dies mid-answer).**
 Windows gives a GPU about 2 seconds to answer; when a graphics card does not, it resets the driver (a TDR): the screen
 flickers, the engine dies, and the Event Viewer shows `VIDEO_ENGINE_TIMEOUT_DETECTED` (#613, with #579 and #541 on
-Linux). PolyStrata 0.1.39 and newer say "the GPU stopped responding" in the log. It was seen with KV streaming on
+Linux). Strata 0.1.39 and newer say "the GPU stopped responding" in the log. It was seen with KV streaming on
 (`--kv-resident 32768`, which setup turns on from 64K context) while reading a long prompt on a gfx1201 card. Try these
 in order, one at a time, and tell us what changed:
-1. **Send us the evidence.** The last ~80 lines of `strata-<model>.log` in the PolyStrata folder (the server window shows
-   the same lines), your AMD driver version (AMD Software > System), your card and Windows version, the PolyStrata
+1. **Send us the evidence.** The last ~80 lines of `strata-<model>.log` in the Strata folder (the server window shows
+   the same lines), your AMD driver version (AMD Software > System), your card and Windows version, the Strata
    version, and the exact steps (context size, how long the prompt was, which app sent it). If Windows wrote a
    dump, the newest `.dmp` in `C:\Windows\LiveKernelReports\WATCHDOG` (or `C:\Windows\Minidump`) helps; it holds no
    chats, only the driver state.
@@ -175,7 +225,7 @@ in order, one at a time, and tell us what changed:
 6. **Optional, your decision: give Windows more time (`TdrDelay`).** The default is 2 seconds. In the registry,
    `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`, a DWORD `TdrDelay` of `10` (seconds)
    lets a long GPU job finish before Windows resets the driver; restart the PC. It hides the symptom and does not fix
-   a GPU that has really hung, and a hung GPU then freezes the screen for those 10 seconds. PolyStrata changes no Windows
+   a GPU that has really hung, and a hung GPU then freezes the screen for those 10 seconds. Strata changes no Windows
    setting itself; to undo it, delete the value.
 7. **Driver:** use the newest AMD Software release for your card (Adrenalin, not a Windows Update driver) and restart
    after installing. If it started after a driver update, tell us both versions; going back one version is a fair
@@ -192,4 +242,7 @@ R9700) in the `env` block of the server JSON, then a restart. Experimental, one 
 ## Still stuck?
 
 Look in the [full troubleshooting table](DETAILS.md#troubleshooting), or open an
-[issue](https://github.com/VecSzn/PolyStrata/issues) and attach `strata-<model>.log` from the PolyStrata folder.
+[issue](https://github.com/Niko1221/Strata/issues) and attach the log: in the app, the file Save logs writes (see
+[above](#the-desktop-app-and-the-terminal)); in the Terminal, the output of `strata doctor`; with the installer,
+`strata-<model>.log` from the Strata folder. Say which one you use (app, Terminal or the installer), your Strata and
+engine versions and your card.

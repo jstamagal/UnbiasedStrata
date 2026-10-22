@@ -1082,8 +1082,6 @@ void usage() {
     std::fprintf(stderr,
                  "usage: strata-poly --model FILE.gguf (--serve | --tokens ID,ID,... [--max-new N])\n"
                  "  --max-context N        tokens the attention caches hold (default 8192)\n"
-                 "  --rope-scaling TYPE    none (default), yarn or linear; requires STRATA_POLY_YARN=1\n"
-                 "  --rope-scale N         context scaling factor (default 1)\n"
                  "  --threads N            CPU threads for the experts that are not in VRAM (default: all usable)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
@@ -1195,8 +1193,6 @@ int main(int argc, char** argv) {
         if (a == "--model") o.model = val();
         else if (a == "--serve") want_serve = true;
         else if (a == "--max-context") o.max_context = std::atoi(val());
-        else if (a == "--rope-scaling") o.rope_scaling = val();
-        else if (a == "--rope-scale") o.rope_scale = std::atof(val());
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--expert-profile") o.profile = val();

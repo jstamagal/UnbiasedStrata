@@ -78,26 +78,6 @@ void Qwen35::load_geometry() {
     }
     sections_ = covered;
     theta_scale_ = std::pow(shape_f("rope.freq_base"), -2.f / (float) n_rot_);
-    if (opt_.rope_scaling != "none" || opt_.rope_scale != 1.0) {
-        const char* enabled = std::getenv("STRATA_POLY_YARN");
-        need(enabled && std::string(enabled) == "1", "RoPE scaling requires STRATA_POLY_YARN=1");
-        strata::kernels::RopeScaling sc;
-        if (opt_.rope_scaling == "yarn") sc.type = strata::kernels::RopeScalingType::YaRN;
-        else if (opt_.rope_scaling == "linear") sc.type = strata::kernels::RopeScalingType::Linear;
-        else throw std::runtime_error("--rope-scaling must be yarn or linear when --rope-scale is set");
-        sc.factor = opt_.rope_scale;
-        sc.freq_base = shape_f("rope.freq_base");
-        sc.orig_ctx = shape_i("context_length");
-        if (const auto* original = find("rope.scaling.original_context_length")) sc.orig_ctx = original->u;
-        sc.ext_factor = sc.type == strata::kernels::RopeScalingType::YaRN ? 1.0 : 0.0;
-        if (const char* why = strata::kernels::rope_scaling_invalid(sc)) throw std::runtime_error(why);
-        rope_args_ = sc.kernel_args(n_rot_);
-        rope_scaled_ = true;
-        std::fprintf(stderr, "poly: RoPE %s x%.6g, original context %.0f\n",
-                     opt_.rope_scaling.c_str(), sc.factor, sc.orig_ctx);
-    }
-
-
     // this architecture puts no limit on a SwiGLU's inputs
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
@@ -400,7 +380,7 @@ void Qwen35::attn_store(Block& B, int64_t pos, int n) {
     const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens from what at_ holds
     lin(B.wk, xn_, kraw_, n, xq_);
     head_norm_rope(kraw_, head_dim_, fp(B.k_norm), k_, head_dim_, n_kv_, n_rot_, theta_scale_, first, n, rms_eps_, st_,
-                   nullptr, axes, sections_, at ? at + 1 : nullptr, rope_scaled_ ? &rope_args_ : nullptr);
+                   nullptr, axes, sections_, at ? at + 1 : nullptr);
     lin(B.wv, xn_, v_, n, xq_);
     if (opt_.kv_format == KvFmt::kQ8_0) {
         if (at) {
@@ -435,7 +415,7 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
     const long long* at = recording_ ? at_ : nullptr;
     lin(B.wq, xn_, qg_, n, xq_);
     head_norm_rope(qg_, 2 * head_dim_, fp(B.q_norm), q_, head_dim_, n_head_, n_rot_, theta_scale_, first, n, rms_eps_,
-                   st_, nullptr, axes, sections_, at ? at + 1 : nullptr, rope_scaled_ ? &rope_args_ : nullptr);
+                   st_, nullptr, axes, sections_, at ? at + 1 : nullptr);
     attn_store(B, pos, n);
     const float scale = 1.f / std::sqrt((float) head_dim_);
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
@@ -484,9 +464,9 @@ void Qwen35::attn_rows(Block& B, int n) {
         const long long* ai = at + 2 * i;
         // a row at a time: the turn takes one position and counts on from it, which suits a window's rows only
         head_norm_rope(qg_ + 2 * i * hq, 2 * head_dim_, fp(B.q_norm), q_ + i * hq, head_dim_, n_head_, n_rot_,
-                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1, rope_scaled_ ? &rope_args_ : nullptr);
+                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
         head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, 1,
-                       rms_eps_, st_, nullptr, nullptr, sections_, ai + 1, rope_scaled_ ? &rope_args_ : nullptr);
+                       rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
         Kvq8 kq{}, vq{};
         uint16_t *kc = nullptr, *vc = nullptr;
         if (q8) {
