@@ -105,7 +105,7 @@ void bf16_widening_is_exact() {
 /// and the type lookup all have to be right for every format, not only for IQ4_NL.
 uint32_t gguf_type_id(const char* name) {
     static const struct { const char* name; uint32_t id; } ids[] = {
-        {"IQ4_NL", 20}, {"Q4_0", 2}, {"Q4_1", 3}, {"Q5_0", 6}, {"Q5_1", 7}, {"Q8_0", 8}, {"BF16", 30}, {"F8_E4M3", 24}};
+        {"IQ4_NL", 20}, {"Q4_0", 2}, {"Q4_1", 3}, {"Q5_0", 6}, {"Q5_1", 7}, {"Q8_0", 8}, {"BF16", 30}, {"F8_E4M3", 24}, {"NVFP4", 24}};
     for (const auto& e : ids)
         if (std::strcmp(e.name, name) == 0) return e.id;
     return 0xFFFFFFFFu;
@@ -129,11 +129,11 @@ std::string write_format_table(const std::string& dir, const k::PleFormatInfo& f
         const float scale = 0.75f;
         uint32_t sb;
         std::memcpy(&sb, &scale, 4);
-        head += str("strata.ple.format") + le(8u, 4) + str("f8_e4m3");
+        head += str("strata.ple.format") + le(8u, 4) + str(f.id == k::PleFormat::NVFP4 ? "nvfp4x16" : "f8_e4m3");
         head += str("strata.ple.scale") + le(6u, 4) + le(sb, 4);       // 6 = FLOAT32
     }
     head += str("per_layer_token_embd.weight") + le(2u, 4);
-    head += le((uint64_t) k::PLE_HEAD_DIM, 8) + le(claimed_rows != 0 ? claimed_rows : (uint64_t) rows, 8);
+    head += le(f.id == k::PleFormat::NVFP4 ? (uint64_t) f.row_bytes : (uint64_t) k::PLE_HEAD_DIM, 8) + le(claimed_rows != 0 ? claimed_rows : (uint64_t) rows, 8);
     head += le(gguf_type_id(f.name), 4) + le(0ull, 8);
     while (head.size() % 32) head += '\0';
     out.write(head.data(), (std::streamsize) head.size());
@@ -329,7 +329,9 @@ void all_formats_round_trip(const std::string& dir) {
     for (int i = 0; i < k::ple_format_count(); ++i) {
         const k::PleFormatInfo& f = k::ple_formats()[i];
         CHECK((int) f.id == i, "%s: the table is not in PleFormat order", f.name);
-        CHECK(k::ple_format_for_type(f.gguf_type) == &f, "%s: type lookup", f.name);
+        // NVFP4 and F8_E4M3 are both I8 bytes: the type finds the FP8 entry, `strata.ple.format` picks NVFP4 in PleTable::open
+        const k::PleFormatInfo* want = f.id == k::PleFormat::NVFP4 ? &k::ple_format_info(k::PleFormat::F8_E4M3) : &f;
+        CHECK(k::ple_format_for_type(f.gguf_type) == want, "%s: type lookup", f.name);
         format_round_trip(dir, f, 2000);
     }
     CHECK(k::ple_format_for_type("Q6_K") == nullptr, "Q6_K must not be a PLE format");
@@ -404,6 +406,49 @@ int selftest(const std::string& dir, uint32_t rb) {
         check_rows(rd, rows, N, rb, "delayed");
         CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
         CHECK(rd.stats().late_injected > 0, "no read was held back");
+    }
+    // STRATA_PL_PLE_PREFETCH / STRATA_PL_PLE_LATE: rows read ahead into the row cache, tickets attached to read-
+    // ahead reads still in flight (some land before the ticket, some after), `ready` polled without blocking - every
+    // ticket's bytes must still be the table's
+    for (bool thr : {false, true})
+    for (uint64_t cache : {0ull, 4096ull})
+    for (uint32_t inflight : {1u, 8u, 64u}) {
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, inflight, cache, err, thr, rb), "open: %s", err.c_str());
+        for (int t = 0; t < 100; ++t) {
+            std::vector<uint32_t> rows(16);
+            for (auto& r : rows) r = rng() % N;
+            rd.prefetch(rows.data(), rows.size());
+            if (t % 3 == 0) rd.prefetch(rows.data(), 8);   // again: rows in flight or cached are skipped
+            if (t % 2 == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
+            std::vector<uint32_t> want = rows;              // + a row not read ahead, a duplicate, one out of range
+            want.push_back(rng() % N);
+            want.push_back(rows[0]);
+            want.push_back(N + 3);
+            std::vector<uint8_t> out(want.size() * rb, 0xCC);
+            const auto tk = rd.issue(want.data(), want.size(), out.data());
+            uint64_t epoch = ~0ull;
+            const double t0 = now_us();
+            while (!rd.ready(tk, &epoch)) {
+                if (now_us() - t0 > 5e6) { CHECK(false, "read ahead: the ticket never became ready"); break; }
+            }
+            CHECK(rd.collect(tk, err), "read ahead: collect: %s", err.c_str());
+            std::vector<uint8_t> w(rb);
+            for (size_t i = 0; i < want.size(); ++i) {
+                if (want[i] >= N) std::memset(w.data(), 0, rb);
+                else expected_row(want[i], rb, w.data());
+                CHECK(!std::memcmp(w.data(), &out[i * rb], rb), "read ahead: row %u (index %zu) differs", want[i], i);
+            }
+        }
+        std::vector<uint32_t> pf(64);                       // read ahead and asked for later
+        for (auto& r : pf) r = rng() % N;
+        rd.prefetch(pf.data(), pf.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        check_rows(rd, pf, N, rb, "read ahead, asked for later");
+        const ng::ReaderStats s = rd.snapshot();
+        CHECK(s.prefetch_rows > 0 && s.prefetch_reads > 0, "read ahead: nothing was read ahead");
+        if (cache > 0 && thr) CHECK(s.cache_hits + s.attached_rows > 0, "read ahead: no ticket row came from a read ahead");
     }
     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the
     // window after the last issue has passed, starts again with the next issue (even one the row cache serves),

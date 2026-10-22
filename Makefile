@@ -1,4 +1,5 @@
-# UnbiasedStrata 2 build.  Needs CMake 3.24+, a C++20 compiler, a C compiler and a CUDA 12.x toolkit with its driver.
+# UnbiasedStrata 2 build.  Needs CMake 3.24+, a C++20 compiler, a C compiler and a CUDA 12.x toolkit with its driver,
+# or, on an AMD box, ROCm (HIP) in ROCM_PATH: with no nvcc and a ROCm there, `make build` builds for AMD (HIP_ARCHS).
 # Nothing is downloaded: ggml, llama, common and mtmd come from the third_party/llama.cpp submodule.
 #
 #   git clone <repo> && cd <repo>
@@ -13,9 +14,14 @@ BUILD_DIR  ?= build
 CUDA_ARCHS ?= 61;75;86;89
 # nvcc: on PATH, else the toolkit's usual place (RunPod images and distro packages differ).  NVCC=/path overrides.
 NVCC ?= $(or $(shell command -v nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc))
-ifeq ($(NVCC),)
+# AMD: no nvcc, and ROCm's clang in ROCM_PATH.  HIP_ARCHS: the cards to build for (gfx1030 = RX 6800/6900, PRO V620;
+# gfx1031/1032 = RX 6700/6600; gfx1100 = RX 7900; gfx1201 = RX 9070, R9700).  CUDA=1 insists on CUDA.
+ROCM_PATH ?= /opt/rocm
+HIP_ARCHS ?= gfx1030
+HIP := $(if $(NVCC)$(CUDA),,$(wildcard $(ROCM_PATH)/llvm/bin/clang++))
+ifeq ($(NVCC)$(HIP),)
   ifneq ($(filter build configure,$(MAKECMDGOALS)),)
-    $(error nvcc not found on PATH or in /usr/local/cuda/bin; install a CUDA 12.x toolkit or set NVCC=/path/to/nvcc)
+    $(error nvcc not found on PATH or in /usr/local/cuda/bin, and no ROCm in $(ROCM_PATH); install a CUDA 12.x toolkit or ROCm, or set NVCC=/path/to/nvcc or ROCM_PATH=/path/to/rocm)
   endif
 endif
 # Everything below that runs nvcc is skipped when there is none (a laptop running `make frontend` or `make test`).
@@ -46,22 +52,31 @@ COMPILER_FLAGS := $(if $(HOSTCXX),-DCMAKE_C_COMPILER=$(HOSTCC) -DCMAKE_CXX_COMPI
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
 # what `make build` produces; upstream's `all` also builds about 70 parity and bench programs
-TARGETS    := strata strata-poly strata_kq unbiased-strata
+TARGETS    := strata strata-poly $(if $(HIP),,strata_kq) unbiased-strata
 
 .PHONY: build configure clean test
 
 configure:
 	@test -f third_party/llama.cpp/ggml/CMakeLists.txt || \
 	  { echo "third_party/llama.cpp is empty: run 'git submodule update --init' first"; exit 1; }
+ifneq ($(HIP),)
+	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
+	      -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_BUILD_TESTS=OFF \
+	      "-DCMAKE_HIP_ARCHITECTURES=$(HIP_ARCHS)" -DCMAKE_HIP_COMPILER=$(HIP) -DCMAKE_HIP_COMPILER_ROCM_ROOT=$(ROCM_PATH) \
+	      -DCMAKE_PREFIX_PATH=$(ROCM_PATH) -DGGML_CCACHE=OFF $(PORTABLE_FLAG) \
+	      -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))/bin \
+	      -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))/bin $(CMAKE_EXTRA)
+else
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
 	      -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
 	      "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(SM60_FLAG) $(PORTABLE_FLAG) $(COMPILER_FLAGS) -DCMAKE_CUDA_COMPILER=$(NVCC) \
 	      -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))/bin \
 	      -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$(abspath $(BUILD_DIR))/bin $(CMAKE_EXTRA)
+endif
 
 build: configure
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target $(TARGETS)
-	@echo "built:"; ls -1 $(BUILD_DIR)/bin/strata $(BUILD_DIR)/bin/strata-poly $(BUILD_DIR)/bin/libstrata_kq.so $(BUILD_DIR)/bin/unbiased-strata
+	@echo "built:"; ls -1 $(BUILD_DIR)/bin/strata $(BUILD_DIR)/bin/strata-poly $(if $(HIP),,$(BUILD_DIR)/bin/libstrata_kq.so) $(BUILD_DIR)/bin/unbiased-strata
 
 # The front end alone, without CUDA: for a laptop or a CI box. Needs only a C++20 compiler and CMake.
 .PHONY: frontend

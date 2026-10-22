@@ -119,6 +119,11 @@ bool native_q8_0_packed_eligible(int n_in, int n_out);
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
 void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out);
 void native_q8_0_packed_unregister(const void* gguf_weights);
+/// STRATA_Q8_SM60=1 (opt-in, Pascal GP100): every Q8_0 dense matrix is packed as above whatever its shape, and the
+/// Q8_0 decode GEMVs run a kernel written for compute capability 6.0 (q8_sm60.cuh; not bitwise the exact kernels).
+/// native_q8_0_sm60_pack packs a device matrix here (the head) and owns the copy until native_q8_0_sm60_release.
+bool native_q8_0_sm60_pack(const void* weights, int n_in, int n_out, const char* what);
+void native_q8_0_sm60_release(const void* weights);
 
 /// STRATA_Q6_PACKED=1 (opt-in): a packed copy of a Q6_K matrix (the output heads) - the same bytes as ql / qh /
 /// scales / d planes - that native_q6_k_mmvq calls on `weights` read instead (bitwise equal outputs). The copy is
@@ -199,5 +204,23 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 int native_mmvq_il_rows_for(int cc, int ggml_type, int ncols, int n_out);
 // Tests and benchmarks: every native_mmvq_il call takes `rows` a warp (0: the table).
 void native_mmvq_il_tune(int rows);
+// STRATA_MMVQ_ROW (wave32 HIP): tests and benchmarks pick the layout: rows a wavefront (1, 2, 4) and wavefronts a
+// block (1, 2, 4, 8); rows 0 = the default kernels whatever the environment says, -1 = the environment again.
+void native_mmvq_row_tune(int rows, int warps);
+// STRATA_MMVQ_SET=1 (wave32 HIP, opt-in): 2 or 3 matrices that read the same q8_1 activations (n_in, ncols) in one
+// launch; each y[c * n_out + r] is bitwise its own native_mmvq call's.  False (nothing launched, call native_mmvq for
+// each) when the switch is off, a type is not Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K / IQ4_XS, n_in is not a multiple of 256,
+// or a matrix has a packed copy registered.
+struct NativeMmvqItem { int type; const void* weights; float* y; int n_out; };
+bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream);
+// Same eligibility and arithmetic, explicitly enabled by a caller (no process-wide tuning change).
+bool native_mmvq_set_explicit(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream);
+// Tests: 1 / 0 = on / off whatever the environment says, -1 = the environment again.
+void native_mmvq_set_tune(int on);
+// STRATA_QSA_GATE_Q8 (HIP): native_qsa_gate_apply(attn, q_full, out, n_head, head_dim) followed by
+// native_quantize_q8_1(out, x_q8_1, n_head * head_dim, 1) as one launch: the same floats in `out`, the same q8_1 bytes.
+// False (nothing launched) off HIP or for arguments the pair of calls would refuse.
+bool native_gate_quantize_q8_1(const float* attn, const float* q_full, float* out, void* x_q8_1, int n_head,
+                               int head_dim, void* stream);
 
 } // namespace strata::kernels

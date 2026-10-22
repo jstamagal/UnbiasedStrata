@@ -49,20 +49,21 @@ inline constexpr int PLE_ROW_BYTES_FP8 = PLE_HEAD_DIM;                   // 160:
 inline constexpr int PLE_ROW_BYTES_Q5_1 = (PLE_HEAD_DIM / 32) * 24;     // 120: a Q5_1 row (a Q5_K_M finetune)
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;     // 170: a Q8_0 row (UD-Q6_K_XL, Swift-1.5 Q4_K_L)
 inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;             // 320: a BF16 row, two bytes a value
+inline constexpr int PLE_ROW_BYTES_NVFP4 = PLE_HEAD_DIM / 2 + PLE_HEAD_DIM / 16;   // 90: 80 B of E2M1 codes + 10 E4M3 block scales
 inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;             // the widest row any format in `ple_formats()` has
 
 /// THE FORMATS OF THE TABLE, ONE ROW EACH. A table type is one entry here (its GGUF type name, the bytes of one
 /// 160-value row, how to turn a row into floats) and nothing else: `PleTable::open`, `format()`, the reader's row size,
 /// the error string and the buffers' size all read this list, so a new format cannot be in one switch and missing from
 /// another. A row is always `PLE_HEAD_DIM` = 160 values = 5 blocks of 32 for the block formats.
-enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16 };
+enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16, NVFP4 };
 
 struct PleFormatInfo {
     PleFormat id;
     const char* name;          ///< what `PleTable::format()` returns
     const char* gguf_type;     ///< `TensorInfo::type_name()` of the table tensor ("I8" for F8_E4M3: GGUF has no FP8 type)
     uint32_t row_bytes;        ///< bytes of one 160-value row in the file
-    bool needs_scale;          ///< the table has one scale in the GGUF metadata (`strata.ple.scale`), F8_E4M3 only
+    bool needs_scale;          ///< the table has one scale in the GGUF metadata (`strata.ple.scale`): F8_E4M3 and NVFP4
     void (*dequant)(const uint8_t* row, float scale, float* out160);
 };
 
@@ -186,6 +187,29 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// STRATA_PL_PLE_LATE: `gather_batch` in two halves with a HANDLE, so several batches can be in flight at once
+    /// (the pipelined decode's two stage-0 verifiers each stage a window ahead of its launch).  Each handle owns its row
+    /// list and raw buffer, apart from `prefetch_rows`' slots.  `gather_issue_t` starts the reads (Direct mode; the
+    /// mapped mode reads in `gather_collect_t`) and returns the handle, -1 on an error (`err`); `gather_ready` never
+    /// blocks; `gather_collect_t` writes `out` (the same bytes as `gather_batch`) and frees the handle; `gather_drop`
+    /// frees one that will never be collected (a window staged ahead and never launched) - its buffer is reused only
+    /// once its reads have landed.
+    int gather_issue_t(const uint32_t* rows, size_t n_tokens, std::string& err);
+    bool gather_ready(int h);
+    bool gather_collect_t(int h, float* out, std::string& err);
+    void gather_drop(int h);
+    /// STRATA_PL_PLE_PREFETCH (Direct mode): start reading the rows of `n` tokens into the reader's row cache - token
+    /// i's 16 rows from its two predecessors, (prev0, prev1) for token 0 then the tokens themselves, as a verify
+    /// window's staging hashes them.  Nothing waits for them; a later request for the same rows finds them cached, or
+    /// waits for their read in flight instead of reading them again.  `consts` null: the artifact's.
+    void prefetch_tokens(const int32_t* toks, int n, int32_t prev0, int32_t prev1, const PleConsts* consts = nullptr);
+    /// The reader's counters (Direct mode; zeros otherwise), for per-request deltas in the decode timing.
+    struct IoCounters {
+        uint64_t requests = 0, cache_hits = 0, attached = 0, reads = 0, prefetch_rows = 0, prefetch_skipped = 0,
+                 prefetch_reads = 0;
+        double wait_us = 0;
+    };
+    IoCounters io_counters() const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

@@ -8,10 +8,12 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/memory.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #if !defined(_WIN32)
 #include <sys/mman.h>
@@ -153,6 +155,20 @@ void bf16_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+// NVIDIA's FP4-Local table: a row of 160 values is 80 bytes of E2M1 codes (element 2i in the low nibble, 2i+1 in the
+// high one) followed by 10 E4M3 block scales (one per 16 values, sign bit always 0); one F32 scales the whole table.
+// value = e2m1(code) * e4m3(block scale) * table scale, exactly what vLLM's nvfp4 PLE lookup computes.
+void nvfp4_row_dequant(const uint8_t* row, float scale, float* out160) {
+    static const float kE2M1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    for (int j = 0; j < PLE_HEAD_DIM; ++j) {
+        const uint8_t byte = row[j >> 1];
+        const uint8_t code = (j & 1) ? (uint8_t) (byte >> 4) : (uint8_t) (byte & 15);
+        const float v = kE2M1[code & 7];
+        const float s = kFp8.v[row[PLE_HEAD_DIM / 2 + (j >> 4)]];
+        out160[j] = ((code & 8) ? -v : v) * s * scale;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // THE FORMAT TABLE (see PleFormatInfo). One entry per table type; the block formats decode 5 blocks of 32.
 namespace {
@@ -163,6 +179,7 @@ void dequant_blocks(const uint8_t* row, float /*scale*/, float* out160) {
 void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_row(row, out160); }
 void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
+void dequant_nvfp4(const uint8_t* row, float scale, float* out160) { nvfp4_row_dequant(row, scale, out160); }
 
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
@@ -176,6 +193,9 @@ const PleFormatInfo kPleFormats[] = {
     // BF16 (#586): the checkpoint's own table at full precision, 320-byte rows; self-describing, so no scale and no
     // metadata to trust (tools/ple_fp8_pack.py writes the FP8 form of the same table)
     {PleFormat::BF16, "BF16", "BF16", PLE_ROW_BYTES_BF16, false, dequant_bf16},
+    // NVFP4 x16 (NVIDIA's Qwen3.8-Flash-Next-FP4-Local, tools/nvfp4_local_pack.py ple): 90-byte rows, I8 bytes marked
+    // strata.ple.format = nvfp4x16 with strata.ple.scale. The tensor is [90, rows]: ne0 is the row's byte count.
+    {PleFormat::NVFP4, "NVFP4", "I8", PLE_ROW_BYTES_NVFP4, true, dequant_nvfp4},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace
@@ -193,7 +213,7 @@ std::string ple_format_list() {
     for (int i = 0; i < kPleFormatCount; ++i) {
         const PleFormatInfo& f = kPleFormats[i];
         if (i > 0) out += i + 1 == kPleFormatCount ? " or " : ", ";
-        out += std::strcmp(f.gguf_type, "I8") == 0 ? "FP8 (I8)" : f.name;
+        out += std::strcmp(f.gguf_type, "I8") == 0 ? (f.id == PleFormat::NVFP4 ? "NVFP4 (I8)" : "FP8 (I8)") : f.name;
     }
     return out;
 }
@@ -225,6 +245,27 @@ struct PleTable::Impl {
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
+    // gather_issue_t / gather_ready / gather_collect_t / gather_drop: the handles (indices).  A deque, so a new handle
+    // never moves the ones whose raw buffers the reader is writing into.
+    struct Batch {
+        bool used = false;      // handed out, until collected or dropped (and, dropped, until its reads have landed)
+        bool dropped = false;
+        strata::ngram::PleReader::Ticket ticket;
+        std::vector<uint32_t> rows;
+        std::vector<uint8_t> raw;
+        uint64_t epoch = ~0ull; // the reader's completion count at the last not-ready look (PleReader::ready)
+    };
+    std::deque<Batch> batches;
+    /// The dropped handles whose reads have all landed are free again.
+    void reap() {
+        for (Batch& b : batches)
+            if (b.used && b.dropped && reader.ready(b.ticket)) {
+                std::string e;
+                (void) reader.collect(b.ticket, e);   // returns at once; releases the reader's ticket
+                b.used = false;
+                b.dropped = false;
+            }
+    }
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -248,8 +289,12 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.
-    if (t->shape.size() != 2 || t->shape[0] != (uint64_t) PLE_HEAD_DIM) {
+    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous. The NVFP4 table
+    // is I8 bytes with ne0 = 90 (the row's byte count), marked strata.ple.format = nvfp4x16.
+    const MetaValue* fmt_key = impl_->file->get("strata.ple.format");
+    const bool nvfp4x16 = std::strcmp(t->type_name(), "I8") == 0 && fmt_key != nullptr && fmt_key->s == "nvfp4x16";
+    const uint64_t want_ne0 = nvfp4x16 ? (uint64_t) PLE_ROW_BYTES_NVFP4 : (uint64_t) PLE_HEAD_DIM;
+    if (t->shape.size() != 2 || t->shape[0] != want_ne0) {
         err = "per_layer_token_embd.weight has an unexpected shape";
         close();
         return false;
@@ -257,7 +302,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     // The table's type is looked up in the format list (ple_formats()): IQ4_NL (ISTA-DASLab's shard 2, the original's
     // own GGUF), Q5_0 (#296: OrcaRouter's GGUF), or the FP8 table as shipped: I8 bytes marked strata.ple.format =
     // f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
-    const PleFormatInfo* fmt = ple_format_for_type(t->type_name());
+    const PleFormatInfo* fmt = nvfp4x16 ? &ple_format_info(PleFormat::NVFP4) : ple_format_for_type(t->type_name());
     if (fmt == nullptr) {
         err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not " + ple_format_list();
         close();
@@ -266,8 +311,9 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     if (fmt->needs_scale) {
         const MetaValue* f = impl_->file->get("strata.ple.format");
         const MetaValue* s = impl_->file->get("strata.ple.scale");
-        if (f == nullptr || f->s != "f8_e4m3" || s == nullptr || !(s->num() > 0.0)) {
-            err = "per_layer_token_embd.weight is I8 without strata.ple.format = f8_e4m3 and a positive strata.ple.scale";
+        const char* want = nvfp4x16 ? "nvfp4x16" : "f8_e4m3";
+        if (f == nullptr || f->s != want || s == nullptr || !(s->num() > 0.0)) {
+            err = std::string("per_layer_token_embd.weight is I8 without strata.ple.format = ") + want + " and a positive strata.ple.scale";
             close();
             return false;
         }
@@ -428,6 +474,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
 void PleTable::close() {
     wait_prefetches();
     impl_->reader.close();
+    impl_->batches.clear();   // after the reader's close: no read is left writing into them
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
     impl_->mode = PleIo::Mmap;
@@ -592,6 +639,97 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         for (size_t i = w; i < e; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     }
     return true;
+}
+
+int PleTable::gather_issue_t(const uint32_t* rows, size_t n_tokens, std::string& err) {
+    Impl& m = *impl_;
+    if (m.mode == PleIo::Direct) m.reap();
+    size_t h = 0;
+    while (h < m.batches.size() && m.batches[h].used) ++h;
+    if (h == m.batches.size()) {
+        if (m.batches.size() >= 64) { err = "PleTable::gather_issue_t: 64 batches in flight"; return -1; }
+        m.batches.emplace_back();
+    }
+    Impl::Batch& b = m.batches[h];
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    b.used = true;
+    b.dropped = false;
+    b.epoch = ~0ull;
+    b.rows.assign(rows, rows + n);
+    if (m.mode == PleIo::Direct) {
+        b.raw.resize(n * m.rb);
+        b.ticket = m.reader.issue(b.rows.data(), n, b.raw.data());
+    }
+    return (int) h;
+}
+
+bool PleTable::gather_ready(int h) {
+    Impl& m = *impl_;
+    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used || m.mode != PleIo::Direct) return true;
+    Impl::Batch& b = m.batches[(size_t) h];
+    return m.reader.ready(b.ticket, &b.epoch);
+}
+
+bool PleTable::gather_collect_t(int h, float* out, std::string& err) {
+    Impl& m = *impl_;
+    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used || m.batches[(size_t) h].dropped) {
+        err = "PleTable::gather_collect_t: not a batch in flight";
+        return false;
+    }
+    Impl::Batch& b = m.batches[(size_t) h];
+    b.used = false;
+    const size_t n = b.rows.size();
+    if (m.mode == PleIo::Direct) {
+        if (!m.reader.collect(b.ticket, err)) return false;
+        for (size_t i = 0; i < n; ++i) m.decode(b.raw.data() + i * m.rb, out + i * PLE_HEAD_DIM);
+        m.bytes_read += (uint64_t) n * m.rb;
+        return true;
+    }
+    for (size_t i = 0; i < n; ++i) read_row(b.rows[i], out + i * PLE_HEAD_DIM);
+    return true;
+}
+
+void PleTable::gather_drop(int h) {
+    Impl& m = *impl_;
+    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used) return;
+    Impl::Batch& b = m.batches[(size_t) h];
+    if (m.mode != PleIo::Direct) { b.used = false; return; }
+    b.dropped = true;   // its reads may still be writing into `raw`: free once they have landed (`reap`)
+    m.reap();
+}
+
+void PleTable::prefetch_tokens(const int32_t* toks, int n, int32_t prev0, int32_t prev1, const PleConsts* consts) {
+    if (impl_->mode != PleIo::Direct || n <= 0 || !impl_->reader.is_open()) return;
+    static const PleConsts artifact = ple_artifact_consts();
+    const PleConsts& c = consts != nullptr ? *consts : artifact;
+    constexpr int kChunk = 8;
+    uint32_t rows[kChunk * PLE_N_HEADS];
+    int32_t prev[2] = {prev0, prev1};
+    for (int done = 0; done < n;) {
+        const int k = std::min(kChunk, n - done);
+        for (int t = 0; t < k; ++t) {   // as a verify window's staging hashes them, token by token
+            ngram_rows(&toks[done + t], prev, 1, c, rows + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = toks[done + t];
+        }
+        impl_->reader.prefetch(rows, (size_t) k * PLE_N_HEADS);
+        done += k;
+    }
+}
+
+PleTable::IoCounters PleTable::io_counters() const {
+    IoCounters c;
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return c;
+    const strata::ngram::ReaderStats s = impl_->reader.snapshot();
+    c.requests = s.requests;
+    c.cache_hits = s.cache_hits;
+    c.attached = s.attached_rows;
+    c.reads = s.reads;
+    c.prefetch_rows = s.prefetch_rows;
+    c.prefetch_skipped = s.prefetch_skipped;
+    c.prefetch_reads = s.prefetch_reads;
+    c.wait_us = s.wait_us;
+    return c;
 }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }

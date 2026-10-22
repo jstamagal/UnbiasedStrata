@@ -16,6 +16,8 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import bisect
+import codecs
+import threading
 import json
 import pathlib
 import sys
@@ -162,6 +164,7 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        self.max_special_len = max(map(len, self.special_tokens), default=1)
         # Initialize once, rather than allocating a default dict and looking it up
         # through __dict__.setdefault on each encoded segment or decoded token.
         self._piece_ids: dict[str, list[int]] = {}

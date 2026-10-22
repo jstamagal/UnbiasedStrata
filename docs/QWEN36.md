@@ -1,24 +1,23 @@
 # Qwen3.6-35B-A3B: pictures, several requests at once and speed
 
-PolyStrata runs [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (35B mixture of experts, 3B active, 256 experts, top-8) from
-[Unsloth's GGUFs with the MTP layer](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0)
-on the Strata project's own engine path (`src/qwen35`; `strata` switches to it from the file's architecture). Pick it in
-setup (`--family qwen36-strata`); `--family qwen36` runs the same model on strata-poly instead
-([BACKENDS.md](BACKENDS.md#qwen36-on-two-engines)). Besides text it
+Strata runs [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (35B mixture of experts, 3B active, 256 experts, top-8) from
+[Unsloth's GGUFs with the MTP layer](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0) on its own
+engine path (`src/qwen35`; `strata` switches to it from the file's architecture). Pick it in the app's model list, in `strata launch` or in setup (`--family qwen36`). Besides text it
 reads **pictures** and serves **several requests at once**, the same two options the Flash-Next models have.
 
-Measured by the Strata project on an AMD Radeon AI PRO R9700 32 GB (HIP, Linux, UD-Q4_K_XL, every expert in VRAM) and on an RTX 3060 12 GB (CUDA, 20 threads,
+Measured on an AMD Radeon AI PRO R9700 32 GB (HIP, Linux, UD-Q4_K_XL, every expert in VRAM) and on an RTX 3060 12 GB (CUDA, 20 threads,
 UD-Q4_K_XL in the hybrid mode: 22-37 of 256 experts per layer in VRAM, the rest on the CPU), llama.cpp 972b5fc on the same files.
 
 ## Pictures
 
 The vision encoder is Unsloth's `mmproj-F16.gguf` (0.9 GB, pinned revision, SHA-256 checked by setup): a 27-layer ViT with a 2x2 merger,
-the same projector family as the Flash-Next models' (`qwen3vl_merger`; only its output width differs: 2048 here, 2560 there). PolyStrata runs
+the same projector family as the Flash-Next models' (`qwen3vl_merger`; only its output width differs: 2048 here, 2560 there). Strata runs
 it with the same helper (`strata-vision`, llama.cpp's `mtmd`), so the encoder choices are the Flash-Next ones
-([Images](DETAILS.md#images-vision)): **setup asks "Do you want images?"**, the default answer is yes on an NVIDIA card of 16 GB or more
-(GPU encoder, ~1.2 GB of VRAM at up to 1,024 image tokens) and on AMD under Linux (CPU encoder, no VRAM); `--vision yes|no|gpu|cpu`
-and `--vision-tokens N` work as there. A card under 16 GB is recommended the CPU encoder (the GPU one takes room from the experts);
-`--vision gpu` is kept as asked, with a note.
+([Images](DETAILS.md#images-vision)). Pictures are on by default, the same rule as for every model on NVIDIA and AMD cards:
+the CPU reader under 24 GB of graphics memory (a few seconds per picture, no VRAM), the card's reader from 24 GB (GPU encoder,
+~1.2 GB of VRAM at up to 1,024 image tokens; on AMD it is `strata-vision-hip`, with the CPU reader as its fallback).
+`--vision yes|no|gpu|cpu` and `--vision-tokens N` work as there; what you ask for is kept, with a note. The Mac engine does
+not run this model.
 
 | Encoder | Time per picture (640x400 = 260 tokens / 800x450 = 350 tokens) | VRAM |
 | --- | --- | --- |
@@ -34,7 +33,7 @@ A picture becomes up to 1,024 tokens of the context (the CPU default is 300). Th
 llama.cpp gives fed to both so the logits are compared step by step, 24 steps; the "floor" is llama.cpp's CPU backend against its own
 HIP run, the noise two correct engines have on this model):
 
-| Picture and question | Prompt tokens | First token | Mean KL, llama.cpp HIP vs PolyStrata | Floor (llama.cpp CPU vs HIP) |
+| Picture and question | Prompt tokens | First token | Mean KL, llama.cpp HIP vs Strata | Floor (llama.cpp CPU vs HIP) |
 | --- | ---: | --- | ---: | ---: |
 | 640x400, text in the image | 288 | same | 0.029 | 0.056 |
 | 640x400, list the shapes | 294 | same | 0.035 | 0.039 |
@@ -53,7 +52,7 @@ picture); a different picture starts that conversation again.
 
 ## Several requests at once
 
-`"parallel": N` in the model's config (`strata-qwen36s-<size>.json`, or `--parallel N` at setup) makes the engine keep N conversations open
+`"parallel": N` in the model's config (`strata-qwen36-<size>.json`, or `--parallel N` at setup) makes the engine keep N conversations open
 (`--batch N`, up to 8) and decode them together: every window carries one token of each conversation, so the dense weights, the head and
 every routed expert two conversations share are read once for all of them. The server needs no change: it speaks the same engine protocol
 as for Flash-Next ([BATCHING.md](BATCHING.md)). A request that arrives while another is read waits only for that read: the prompt of a
@@ -65,9 +64,9 @@ A request that runs alone (the solo path, with its MTP drafts) and is moved into
 alone again, gives the text it gives running alone (the server's hand-over reuses the held state).
 
 Aggregate decode speed, N requests at once, same prompts, greedy, 128 new tokens each, wall time from the first request to the last
-answer, **R9700 32 GB, UD-Q4_K_XL, llama.cpp `llama-server -np N`** (5 interleaved pairs, median; PolyStrata `--batch 8 --mtp 0`):
+answer, **R9700 32 GB, UD-Q4_K_XL, llama.cpp `llama-server -np N`** (5 interleaved pairs, median; Strata `--batch 8 --mtp 0`):
 
-| Requests at once | PolyStrata | llama.cpp | Ratio | Pairs faster |
+| Requests at once | Strata | llama.cpp | Ratio | Pairs faster |
 | ---: | ---: | ---: | ---: | ---: |
 | 1 | 83.9 tok/s | 73.8 | 1.14 | 5/5 |
 | 2 | 173.5 | 107.4 | 1.61 | 5/5 |
@@ -78,7 +77,7 @@ answer, **R9700 32 GB, UD-Q4_K_XL, llama.cpp `llama-server -np N`** (5 interleav
 `llama-server -np N -ncmoe 28 -t 8`, the best split of a sweep on this card; 5 interleaved pairs, medians; the box was shared with other
 jobs between runs, never during one):
 
-| Requests at once | PolyStrata | llama.cpp | Ratio | Pairs faster |
+| Requests at once | Strata | llama.cpp | Ratio | Pairs faster |
 | ---: | ---: | ---: | ---: | ---: |
 | 1 | 64.0 tok/s | 41.1 | 1.56 | 5/5 |
 | 2 | 85.1 | 52.5 | 1.62 | 5/5 |
@@ -173,7 +172,7 @@ prompt state: KL against the 512 chunk on six real 1.5-3.2K-token documents (48 
 4096 3.6e-3 (per prompt 2.3e-3 .. 5.9e-3), top-1 agreement 44-48 of 48 rows - the size of the llama.cpp CPU-vs-HIP difference on the same
 file (4.2e-3), not a quality loss. Greedy 64 tokens after those six documents: the default chunk gives the base engine's text for 2 of 6,
 `--prefill 512` for 6 of 6. A prompt shorter than the chunk (every chat turn after the first) is one chunk either way: unchanged.
-The new default's goldens are `phaseA-tests/q36speed/golden/` (six documents, greedy 64): later changes are checked against them.
+The maintainers keep the new default's reference outputs (six documents, greedy 64) and check later changes against them.
 
 **Tried and dropped.** The MTP drafts' head over a subset of the vocabulary (`--draft-vocab N`, kept as an opt-in; the answer never
 changes): the first 16K-131K rows gain 5-8% on English and code but lose 10-15% on Chinese / Russian / Arabic / Hindi (70% of a Chinese

@@ -5,7 +5,8 @@
 | What | Where | Version |
 | --- | --- | --- |
 | Engines (`strata`, `strata-poly`), tools, docs | https://github.com/VecSzn/PolyStrata | tag `v0.1.45-poly.1`, commit `d0cd84dc6bd009d1d9e2191e4e28cc76b80f1ee3` |
-| ggml, llama, common, mtmd, cpp-httplib | https://github.com/robertkarl/llama.cpp, branch `UnbiasedStrata`, as the submodule `third_party/llama.cpp` | commit `385445fad49e42fa718b5e1f71668f35b7a08559`: ggml-org `3cf03257f219afbe7334045ff7c6a06ac68c627d` (the commit upstream pins) plus the six parser commits below |
+| ggml, llama, common, mtmd, cpp-httplib | https://github.com/jstamagal/llama.cpp, branch `UnbiasedStrata-rdna2`, as the submodule `third_party/llama.cpp` | commit `ef6397989d257c7aa224e4bc2b7cee4daae5c319`: robertkarl/llama.cpp `UnbiasedStrata` `385445fa` (ggml-org `3cf03257` plus the six parser commits below) plus one RDNA2 commit |
+| The `strata` engine's sources (RDNA2) | https://github.com/jstamagal/Strata, branch `ornith-122b` | commit `9f3770ea`, merged into this tree (below) |
 
 Commit `0197ae86` ("Import PolyStrata v0.1.45-poly.1 (d0cd84dc) unmodified") is the upstream tree, every tracked
 file, with the same tree hash as upstream's commit. `git diff 0197ae86 HEAD` is the whole story of this fork;
@@ -138,6 +139,41 @@ One test-only hunk since (2026-10-19, correctness checks of DeepSeek V4 Flash an
 `--tokens`, `--eos-ids` and `--follow` accept `@FILE` (the comma-separated ids read from that file), because a 31K-id
 list is over Linux's 128 KiB single-argument limit. `tools/qwen35/q36_llama_dump.cpp` (upstream's llama.cpp-side parity
 program, not part of the build) takes the same `@FILE` for `--tokens` and `--force`. Nothing on the serve path changes.
+
+## The `strata` engine replaced by jstamagal/Strata's RDNA2 engine (2026-10-22)
+
+The fork's target widens to AMD Radeon cards on Linux (ROCm/HIP; measured on 2x Radeon PRO V620, gfx1030). The
+`strata` engine's sources are those of jstamagal/Strata `ornith-122b` (`9f3770ea`), an RDNA2 fork of Niko1221/Strata:
+merged with git (`git merge`), its history kept, PolyStrata's `v0.1.45-poly.1` commit grafted under `0197ae86` only to
+find the common ancestor (`477ac13c`) for the merge. What that brings: the gfx103x kernels and the switches the engine
+turns on by itself on a gfx103x card (its `docs/RDNA2.md`), the rocBLAS solution table for gfx1030
+(`tools/hip/gfx1030-rocblas-5.8.0.3d8f334b.txt`), the q36 path for Qwen3.5/3.6/Ornith-shaped `qwen35moe` files
+(`src/qwen35`), and every upstream Strata change from `477ac13c` to `9f3770ea`. Not vetted against llama.cpp as step 12
+vetted the engines before it. `strata-poly` (`src/poly`) is PolyStrata's, unchanged by the merge, but compiles kernel
+files from `src/kernels` that the merge changed.
+
+The four rules still decide what the merge may bring. Removed from it, as above: the Terminal (`strata_cli`), the
+desktop app (`apps`), `strata_control`, `packaging`, `docker`, `integrations`, `serve`, `strata.py`, `.github`, `bin`,
+`CONTRIBUTING.md`, the files this fork had deleted, their tests (`tests/terminal`, `tests/desktop`, `tests/tuning`,
+`tests/time_skip`, `tests/sycl/test_setup_intel_prefill.py`, `tools/test_setup_*.py`), the downloaders
+(`tools/hf_pin_fetch.py`, `metal/setup_mac.py`), the tools that drive the Python server (`tools/minimal_*_smoke.py`,
+`tools/portable_monitor_*`, `tools/monitor_soak.py`, `tools/test_vision_reader.py`, `tools/test_pool_plan.py`,
+`tools/test_picture_defaults.py`), `bench/results/`, and the documents of removed components (Terminal, Docker, app,
+management protocol, release notes, safety, the community benchmark protocol). `sycl/serve` and `sycl/setup_intel.py`
+stay as this fork had them. `README.md` and `.gitignore` are this fork's.
+
+- **`STRATA_MMQ_TQ_OVERLAY` off by default** (`CMakeLists.txt`): upstream writes patched copies of llama.cpp's
+  ggml-cuda headers at configure time for the Gyro trellis types; that is a component replaced at build time. Off,
+  the Gyro trellis prompt kernels are not built. `-DSTRATA_MMQ_TQ_OVERLAY=ON` builds them.
+- **`include/strata/artifact/gguf_reader.hpp`**: both sides added IQ1_S (type 19) with the same block size; one kept.
+- **`Makefile`**: with no nvcc and a ROCm in `ROCM_PATH` (default `/opt/rocm`), `make build` configures for HIP
+  (`HIP_ARCHS`, default `gfx1030`) and builds `strata`, `strata-poly` and `unbiased-strata` (`strata_kq` is a CUDA
+  library). `CUDA=1` insists on CUDA. The CUDA path is unchanged.
+- **llama.cpp**: one commit on top of `385445fa`, on jstamagal/llama.cpp `UnbiasedStrata-rdna2` (`ef639798`):
+  `ggml-cuda/HIP: Strata's RDNA2 MMQ patches 0001 and 0002`, the K-quant MMQ scale as a float multiply on HIP and the
+  RDNA wide-LDS activation window (`third_party/llama.cpp-patches/000{1,2}`). `0003` (per-expert weight pointers for
+  MMQ, `STRATA_PF_DIRECT`) does not apply to this llama.cpp's `mmq.cuh` and is not in it; the engine checks
+  `MMQ_X_EACH_MAX` and keeps the copy path without it.
 
 ## Removed
 
