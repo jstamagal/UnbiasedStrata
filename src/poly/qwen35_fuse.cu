@@ -106,6 +106,71 @@ __global__ void alpha_beta_pair_kernel(const float* aw, const float* bw, const f
     }
 }
 
+// One head's alpha/beta weights serve the entire short window. Each row keeps the scalar kernel's
+// lane stride, wave reduction and ordered wave-partial sum before the same optional gate transforms.
+template <bool Gates, int TOKENS>
+__global__ void alpha_beta_window_kernel(const float* aw, const float* bw, const float* x, const float* dt,
+                                         const float* ssm_a, float* a, float* b, int n_in, int n_out) {
+    __shared__ float part_a[TOKENS][32], part_b[TOKENS][32];
+    const int out = blockIdx.x;
+    const float* ar = aw + size_t(out) * n_in;
+    const float* br = bw + size_t(out) * n_in;
+    float alpha[TOKENS] = {}, beta[TOKENS] = {};
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) {
+        const float wa = ar[i], wb = br[i];
+#pragma unroll
+        for (int row = 0; row < TOKENS; ++row) {
+            const float xi = x[size_t(row) * n_in + i];
+            alpha[row] += wa * xi;
+            beta[row] += wb * xi;
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < TOKENS; ++row) {
+        alpha[row] = q35_warp_sum(alpha[row]);
+        beta[row] = q35_warp_sum(beta[row]);
+        if ((threadIdx.x & 31) == 0) {
+            part_a[row][threadIdx.x >> 5] = alpha[row];
+            part_b[row][threadIdx.x >> 5] = beta[row];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int row = 0; row < TOKENS; ++row) {
+            float av = 0.0f, bv = 0.0f;
+            for (int wave = 0; wave < int(blockDim.x) / 32; ++wave) {
+                av += part_a[row][wave];
+                bv += part_b[row][wave];
+            }
+            if constexpr (Gates) {
+                const float g = av + dt[out];
+                av = expf((g > 20.0f ? g : logf(1.0f + expf(g))) * ssm_a[out]);
+                bv = 1.0f / (1.0f + expf(-bv));
+            }
+            a[size_t(row) * n_out + out] = av;
+            b[size_t(row) * n_out + out] = bv;
+        }
+    }
+}
+
+template <bool Gates>
+bool alpha_beta_window(const float* aw, const float* bw, const float* x, const float* dt, const float* ssm_a,
+                        float* a, float* b, int n_in, int n_out, int rows, int threads, void* stream) {
+    static const bool on = [] {
+        const char* value = std::getenv("STRATA_POLY_Q35_ALPHA_BETA_WINDOW");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!on || rows < 2 || rows > 4) return false;
+    const auto launch = [&](auto kernel) {
+        kernel<<<n_out, threads, 0, (cudaStream_t) stream>>>(aw, bw, x, dt, ssm_a, a, b, n_in, n_out);
+    };
+    if (rows == 2) launch(alpha_beta_window_kernel<Gates, 2>);
+    else if (rows == 3) launch(alpha_beta_window_kernel<Gates, 3>);
+    else launch(alpha_beta_window_kernel<Gates, 4>);
+    return true;
+}
+
 bool alpha_beta_pair_on() {
     static const bool on = [] {
         const char* value = std::getenv("STRATA_POLY_Q35_ALPHA_BETA_PAIR");
@@ -201,6 +266,9 @@ __global__ void conv_norm1_kernel(const float* x, float* state, const float* w, 
 
 void qwen35_alpha_beta(const float* alpha_w, const float* beta_w, const float* x,
                        float* alpha, float* beta, int n_in, int n_out, int rows, int threads, void* stream) {
+    if (alpha_beta_window<false>(alpha_w, beta_w, x, nullptr, nullptr, alpha, beta,
+                                   n_in, n_out, rows, threads, stream))
+        return;
     if (alpha_beta_pair_on())
         alpha_beta_pair_kernel<false><<<dim3(n_out, rows), threads, 0, (cudaStream_t) stream>>>(
             alpha_w, beta_w, x, nullptr, nullptr, alpha, beta, n_in, n_out);
@@ -212,6 +280,9 @@ void qwen35_alpha_beta(const float* alpha_w, const float* beta_w, const float* x
 void qwen35_alpha_beta_gates(const float* alpha_w, const float* beta_w, const float* x,
                              const float* dt, const float* a, float* alpha, float* beta,
                              int n_in, int n_out, int rows, int threads, void* stream) {
+    if (alpha_beta_window<true>(alpha_w, beta_w, x, dt, a, alpha, beta,
+                                  n_in, n_out, rows, threads, stream))
+        return;
     if (alpha_beta_pair_on())
         alpha_beta_pair_kernel<true><<<dim3(n_out, rows), threads, 0, (cudaStream_t) stream>>>(
             alpha_w, beta_w, x, dt, a, alpha, beta, n_in, n_out);
