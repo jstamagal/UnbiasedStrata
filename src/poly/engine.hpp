@@ -134,7 +134,7 @@ struct Layer {
 /// A routed expert is run from the VRAM cache or on the CPU when tokens come a few at a time, as an answer's do
 /// (gpu_experts, cpu_experts), and in a prompt batch from the cache or the staging buffer (batch_*).
 struct Stats {
-    int64_t tokens = 0, gpu_experts = 0, cpu_experts = 0, batch_cached = 0, batch_staged = 0;
+    int64_t tokens = 0, gpu_experts = 0, cpu_experts = 0, pcie_experts = 0, batch_cached = 0, batch_staged = 0;
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
     double cpu_ms = 0, route_wait_ms = 0;
@@ -562,7 +562,7 @@ protected:
     uint32_t* router_host_seq_ = nullptr;   ///< eight mapped pinned words, one per router event
     uint32_t* router_device_seq_ = nullptr;
     uint32_t router_expected_[8] = {};
-    uint32_t* partial_host_words_ = nullptr;   ///< ready, done, abort: mapped coherent graph handshake
+    uint32_t* partial_host_words_ = nullptr;   ///< ready, done, abort, DMA ready: mapped coherent graph handshake
     uint32_t* partial_device_words_ = nullptr;
     uint32_t partial_expected_ = 0;
     float* h_partial_x_ = nullptr;                 ///< one coherent mapped allocation: input, ids, weights
@@ -573,6 +573,16 @@ protected:
     float* d_partial_wts_ = nullptr;
     float* h_partial_cpu_ = nullptr;
     float* d_partial_cpu_ = nullptr;
+    float pcie_frac_ = 0.f;                  ///< optional share of unique cache misses copied to GPU
+    void* dma_st_ = nullptr;                 ///< copies for the partial-stage graph
+    uint8_t* h_dma_stage_ = nullptr;        ///< bounded pinned expert copies
+    uint8_t* d_dma_stage_ = nullptr;
+    void** h_dma_slots_ = nullptr;          ///< null except for copied experts
+    void** d_dma_slots_ = nullptr;
+    size_t dma_slot_bytes_ = 0;
+    static constexpr int kDmaSlots = 4;
+    int dma_slots_cap_ = 0;
+    bool dma_stage_synced_ = false;
     bool partial_capture_ = false;
     void router_record();
     void router_wait();

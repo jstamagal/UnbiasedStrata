@@ -398,6 +398,7 @@ Engine::~Engine() {
         follower_.join();
     }
     if (swap_st_) cudaStreamSynchronize(cs(swap_st_));
+    if (dma_st_) cudaStreamSynchronize(cs(dma_st_));
     if (up_) cudaStreamSynchronize(cs(up_));
     if (rs_) cudaStreamSynchronize(cs(rs_));
     if (st_) cudaStreamSynchronize(cs(st_));
@@ -422,6 +423,7 @@ Engine::~Engine() {
     for (void* g : graphs_) cudaGraphExecDestroy((cudaGraphExec_t) g);
     blas_destroy(blas_);
     if (swap_st_) cudaStreamDestroy(cs(swap_st_));
+    if (dma_st_) cudaStreamDestroy(cs(dma_st_));
     if (up_) cudaStreamDestroy(cs(up_));
     if (rs_) cudaStreamDestroy(cs(rs_));
     if (st_) cudaStreamDestroy(cs(st_));
@@ -1951,13 +1953,13 @@ void Engine::load(const Options& o) {
     }
     if (partial_graph_on()) {
 #if defined(STRATA_USE_HIP)
-        ck(hipHostMalloc((void**) &partial_host_words_, 3 * sizeof(uint32_t),
+        ck(hipHostMalloc((void**) &partial_host_words_, 4 * sizeof(uint32_t),
                          hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable), "partial graph doorbell");
 #else
-        ck(cudaHostAlloc((void**) &partial_host_words_, 3 * sizeof(uint32_t),
+        ck(cudaHostAlloc((void**) &partial_host_words_, 4 * sizeof(uint32_t),
                          cudaHostAllocMapped | cudaHostAllocPortable), "partial graph doorbell");
 #endif
-        std::memset(partial_host_words_, 0, 3 * sizeof(uint32_t));
+        std::memset(partial_host_words_, 0, 4 * sizeof(uint32_t));
         ck(cudaHostGetDevicePointer((void**) &partial_device_words_, partial_host_words_, 0),
            "partial graph doorbell");
     }
@@ -1967,6 +1969,28 @@ void Engine::load(const Options& o) {
     // allocation each (kv_alloc()) and the expert cache still gives VRAM to other programs and takes it back
     // (mind_vram()): refilled in one allocation instead, it only ever got smaller.
     ck(cudaGetDevice(&device_), "cudaGetDevice");
+    if (partial_graph_on()) {
+        // A comma list follows the HIP-visible device order.  Missing entries reuse the last value.
+        if (const char* spec = std::getenv("STRATA_POLY_PCIE_FRAC")) {
+            std::vector<float> fractions;
+            const char* at = spec;
+            while (*at) {
+                char* end = nullptr;
+                const float value = std::strtof(at, &end);
+                if (end == at || !std::isfinite(value) || value < 0.f || value > 1.f ||
+                    (*end != ',' && *end != '\0'))
+                    throw std::runtime_error("STRATA_POLY_PCIE_FRAC must contain fractions in [0,1]");
+                fractions.push_back(value);
+                if (*end == '\0') break;
+                at = end + 1;
+                if (*at == '\0') throw std::runtime_error("STRATA_POLY_PCIE_FRAC has an empty final entry");
+            }
+            if (fractions.empty()) throw std::runtime_error("STRATA_POLY_PCIE_FRAC is empty");
+            pcie_frac_ = fractions[std::min((size_t) device_, fractions.size() - 1)];
+        }
+        if (pcie_frac_ > 0.f)
+            std::fprintf(stderr, "strata-poly: PCIe share %.3f on card %d (partial graph)\n", pcie_frac_, device_);
+    }
     CUdevice dev = 0;
     int vmm = 0;
     if (cuDeviceGet(&dev, device_) == CUDA_SUCCESS &&
@@ -2260,6 +2284,19 @@ void Engine::alloc() {
         stage_bytes_ = std::max(std::min((size_t) opt_.stage_mib << 20, (size_t) n_expert_ * one_expert), one_expert);
         chunk_bytes_ = std::max(kChunkBytes, one_expert);
         stage_ = (uint8_t*) dmalloc(stage_bytes_ + 256 + kTail, "the expert staging buffer");
+        if (pcie_frac_ > 0.f) {
+            dma_slot_bytes_ = (one_expert + kTail + 255) & ~(size_t) 255;
+            dma_slots_cap_ = std::min(kDmaSlots, (int) ((stage_bytes_ + 256 + kTail) / dma_slot_bytes_));
+            if (dma_slots_cap_ < 1) throw std::logic_error("PCIe stage cannot hold one expert");
+            d_dma_stage_ = stage_;   // decode and prompt staging never run together
+            h_dma_stage_ = (uint8_t*) hmalloc((size_t) dma_slots_cap_ * dma_slot_bytes_, "PCIe expert stage");
+            h_dma_slots_ = (void**) hmalloc((size_t) n_expert_ * sizeof(void*), "PCIe expert slots");
+            d_dma_slots_ = (void**) dmalloc((size_t) n_expert_ * sizeof(void*), "PCIe expert slots");
+            ck(cudaMemset(d_dma_slots_, 0, (size_t) n_expert_ * sizeof(void*)), "PCIe expert slots");
+            cudaStream_t dma = nullptr;
+            ck(cudaStreamCreateWithFlags(&dma, cudaStreamNonBlocking), "PCIe copy stream");
+            dma_st_ = dma;
+        }
         for (int b = 0; b < 2; ++b) h_stage_[b] = (uint8_t*) hmalloc(chunk_bytes_, "pinned memory");
         for (void** e : {&ev_stage_[0], &ev_stage_[1], &ev_ahead_, &ev_free_}) {
             cudaEvent_t ev = nullptr;
@@ -2389,6 +2426,7 @@ const Stats& Engine::stats() const {
         const Stats& s = e->stats_;
         all_stats_.gpu_experts += s.gpu_experts;
         all_stats_.cpu_experts += s.cpu_experts;
+        all_stats_.pcie_experts += s.pcie_experts;
         all_stats_.batch_cached += s.batch_cached;
         all_stats_.batch_staged += s.batch_staged;
         all_stats_.swapped_experts += s.swapped_experts;
@@ -2722,6 +2760,9 @@ bool Engine::moe_card(Layer& L, int il, int n) {
 // downs after them.  The two pinned buffers take turns, so the workers fill one while the other uploads.  `alone`:
 // stagers_ fill them, while the workers compute experts.
 void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone) {
+    if (pcie_frac_ > 0.f && dma_stage_synced_)
+        ck(cudaStreamSynchronize(cs(st_)), "PCIe stage to prompt");
+    dma_stage_synced_ = false;
     staged_il_ = -1;   // whatever the buffer held
     const size_t gu2 = 2 * L.gu_bytes, down_at = pad((size_t) m * gu2);
     const int per = (int) (chunk_bytes_ / (gu2 + L.d_bytes));
@@ -3258,6 +3299,13 @@ void Engine::run(const int32_t* tokens, int n) {
     }
     partial &= any_partial_layer;
     if (partial) {
+        if (pcie_frac_ > 0.f && !dma_stage_synced_) {
+            // A prompt may have left an upload on up_; the stage is now reserved for decode.
+            ck(cudaStreamSynchronize(cs(up_)), "PCIe stage from prompt");
+            staged_il_ = -1;
+            staged_.clear();
+            dma_stage_synced_ = true;
+        }
         std::vector<int> key{-2, n};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
@@ -3272,9 +3320,8 @@ void Engine::run(const int32_t* tokens, int n) {
                 if (!route_card(il, n, d_ids_, d_wts_))
                     throw std::logic_error("partial graph needs device routing");
                 const int rr = n * n_used_;
-                copy2(xn_, d_partial_x_, n * n_embd_, d_ids_, d_partial_ids_, rr, st_);
-                copy2(d_wts_, d_partial_wts_, rr, nullptr, nullptr, 0, st_);
-                partial_graph_ring(partial_device_words_, st_);
+                partial_graph_publish(xn_, d_ids_, d_wts_, d_partial_x_, d_partial_ids_, d_partial_wts_,
+                                      n * n_embd_, rr, partial_device_words_, st_);
                 moe_shared(L, il, n);
                 const void* const* table = d_slots_ + (size_t) il * n_expert_;
                 const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_),
@@ -3287,6 +3334,22 @@ void Engine::run(const int32_t* tokens, int n) {
                                             kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
+                if (pcie_frac_ > 0.f) {
+                    // The copy stream publishes word 3 only after both the expert bytes and its pointer table land.
+                    partial_graph_wait(partial_device_words_, partial_device_words_ + 3,
+                                       partial_device_words_ + 2, st_);
+                    const kernels::MmvqIds dma_gu{(const void* const*) d_dma_slots_, d_ids_, 0, xq_,
+                                                  kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
+                                                  2 * (size_t) n_ff_exp_};
+                    kernels::native_mmvq_ids_partial(2, dma_gu, rr, n_embd_, 2 * n_ff_exp_, st_);
+                    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
+                    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
+                    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
+                    const kernels::MmvqIds dma_down{(const void* const*) d_dma_slots_, d_ids_,
+                        2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_};
+                    kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
+                    moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
+                }
                 partial_graph_wait(partial_device_words_, partial_device_words_ + 1,
                                    partial_device_words_ + 2, st_);
                 axpy(d_partial_cpu_, 1.f, fo_, n * n_embd_, true, st_);
@@ -3304,6 +3367,7 @@ void Engine::run(const int32_t* tokens, int n) {
         if (launched != cudaSuccess) {
             __atomic_store_n(partial_host_words_ + 2, 1u, __ATOMIC_RELEASE);
             cudaStreamSynchronize(cs(st_));
+            if (dma_st_) cudaStreamSynchronize(cs(dma_st_));
             ck(launched, "partial layer graph");
         }
         try {
@@ -3331,7 +3395,27 @@ void Engine::run(const int32_t* tokens, int n) {
                 }
                 stats_.route_wait_ms += ms_since(wait_start);
                 CpuExpert host[kCpuRows * kMaxUsed];
-                int n_host = 0, n_gpu = 0;
+                std::vector<int> dma_ids;
+                if (pcie_frac_ > 0.f) {
+                    std::vector<uint8_t> seen((size_t) n_expert_, 0);
+                    std::vector<int> missing;
+                    missing.reserve((size_t) n * n_used_);
+                    for (int j = 0; j < n * n_used_; ++j) {
+                        const int e = h_partial_ids_[j];
+                        if (e < 0 || e >= n_expert_) throw std::runtime_error("partial graph router invalid expert");
+                        if (!L.slot[(size_t) e] && !seen[(size_t) e]) {
+                            seen[(size_t) e] = 1;
+                            missing.push_back(e);
+                        }
+                    }
+                    const int count = std::min({dma_slots_cap_, (int) missing.size(),
+                                                (int) std::ceil(pcie_frac_ * missing.size())});
+                    dma_ids.assign(missing.begin(), missing.begin() + count);
+                    std::fill_n(h_dma_slots_, n_expert_, nullptr);
+                    for (int k = 0; k < count; ++k)
+                        h_dma_slots_[(size_t) dma_ids[(size_t) k]] = d_dma_stage_ + (size_t) k * dma_slot_bytes_;
+                }
+                int n_host = 0, n_gpu = 0, n_dma = 0;
                 for (int row = 0; row < n; ++row)
                     for (int k = 0; k < n_used_; ++k) {
                         const int j = row * n_used_ + k;
@@ -3340,24 +3424,55 @@ void Engine::run(const int32_t* tokens, int n) {
                         ++use_[(size_t) il * n_expert_ + (size_t) e];
                         if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + (size_t) e] += 1.f;
                         if (L.slot[(size_t) e]) { ++n_gpu; continue; }
+                        if (pcie_frac_ > 0.f && h_dma_slots_[(size_t) e]) { ++n_dma; continue; }
                         const size_t ie = (size_t) e;
                         host[n_host++] = {L.exp_gate + ie * L.gu_stride, L.exp_up + ie * L.gu_stride,
                                           L.exp_down + ie * L.d_bytes, h_partial_wts_[j], row};
                     }
                 stats_.gpu_experts += n_gpu;
+                stats_.pcie_experts += n_dma;
                 stats_.cpu_experts += n_host;
+                std::exception_ptr dma_failed;
+                const std::function<void()> dma_launch = [&] {
+                    try {
+                        if (split_) ck(cudaSetDevice(device_), "PCIe copy device");
+                        for (size_t k = 0; k < dma_ids.size(); ++k) {
+                            const size_t e = (size_t) dma_ids[k];
+                            uint8_t* slot = h_dma_stage_ + k * dma_slot_bytes_;
+                            std::memcpy(slot, L.exp_gate + e * L.gu_stride, L.gu_bytes);
+                            std::memcpy(slot + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
+                            std::memcpy(slot + 2 * L.gu_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+                            std::memset(slot + 2 * L.gu_bytes + L.d_bytes, 0,
+                                        dma_slot_bytes_ - 2 * L.gu_bytes - L.d_bytes);
+                        }
+                        if (!dma_ids.empty())
+                            ck(cudaMemcpyAsync(d_dma_stage_, h_dma_stage_, dma_ids.size() * dma_slot_bytes_,
+                                               cudaMemcpyHostToDevice, cs(dma_st_)), "PCIe expert copy");
+                        ck(cudaMemcpyAsync(d_dma_slots_, h_dma_slots_, (size_t) n_expert_ * sizeof(void*),
+                                           cudaMemcpyHostToDevice, cs(dma_st_)), "PCIe expert table");
+                        partial_graph_ring(partial_device_words_ + 3, dma_st_);
+                        ck(cudaGetLastError(), "PCIe copy ready");
+                    } catch (...) { dma_failed = std::current_exception(); }
+                };
                 const Clock::time_point cpu_start = Clock::now();
                 if (n_host)
                     cpu_experts(*workers_, host, n_host, n, (int) L.gu_type, (int) L.d_type,
-                                n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) il], gelu_, h_partial_cpu_, nullptr);
-                else std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
+                                n_embd_, n_ff_exp_, h_partial_x_, clamp_exp_[(size_t) il], gelu_, h_partial_cpu_,
+                                pcie_frac_ > 0.f ? &dma_launch : nullptr);
+                else {
+                    std::fill(h_partial_cpu_, h_partial_cpu_ + (size_t) n * n_embd_, 0.f);
+                    if (pcie_frac_ > 0.f) dma_launch();
+                }
+                if (dma_failed) std::rethrow_exception(dma_failed);
                 stats_.cpu_ms += ms_since(cpu_start);
                 __atomic_store_n(partial_host_words_ + 1, expected, __ATOMIC_RELEASE);
             }
         } catch (...) {
             __atomic_store_n(partial_host_words_ + 2, 1u, __ATOMIC_RELEASE);
             cudaStreamSynchronize(cs(st_));
+            if (dma_st_) cudaStreamSynchronize(cs(dma_st_));
             partial_expected_ = __atomic_load_n(partial_host_words_, __ATOMIC_ACQUIRE);
+            __atomic_store_n(partial_host_words_ + 3, partial_expected_, __ATOMIC_RELEASE);
             throw;
         }
         return;

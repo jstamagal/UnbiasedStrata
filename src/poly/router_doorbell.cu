@@ -14,6 +14,24 @@ __global__ void publish_kernel(uint32_t* word, uint32_t value) {
 #endif
 }
 
+__global__ void partial_publish_kernel(const float* x, const int32_t* ids, const float* wts,
+                                       float* host_x, int32_t* host_ids, float* host_wts,
+                                       int x_count, int route_count, uint32_t* ready) {
+    const int t = threadIdx.x;
+    for (int i = t; i < x_count; i += blockDim.x) host_x[i] = x[i];
+    for (int i = t; i < route_count; i += blockDim.x) {
+        host_ids[i] = ids[i];
+        host_wts[i] = wts[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(ready);
+        *p = *p + 1;
+        __threadfence_system();
+    }
+}
+
 __global__ void partial_ring_kernel(uint32_t* ready) {
     __threadfence_system();
     volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(ready);
@@ -34,6 +52,13 @@ __global__ void partial_wait_kernel(const uint32_t* ready, const uint32_t* done,
 
 void router_doorbell_publish(uint32_t* device_word, uint32_t value, void* stream) {
     publish_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(device_word, value);
+}
+
+void partial_graph_publish(const float* x, const int32_t* ids, const float* wts,
+                           float* host_x, int32_t* host_ids, float* host_wts,
+                           int x_count, int route_count, uint32_t* ready, void* stream) {
+    partial_publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
+        x, ids, wts, host_x, host_ids, host_wts, x_count, route_count, ready);
 }
 
 void partial_graph_ring(uint32_t* ready, void* stream) {
