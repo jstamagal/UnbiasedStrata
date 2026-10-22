@@ -3,6 +3,7 @@
 #pragma once
 
 #include "poly_q40_expert_block.cuh"
+#include "poly_expert_reuse.cuh"
 
 #if defined(__HIPCC__)
 template<typename Weight, typename S, bool PARTIAL = false>
@@ -128,7 +129,7 @@ inline bool poly_q40_expert_enabled(int n_in, int n_out) {
         const char* v = std::getenv("STRATA_POLY_Q40_EXPERT_WAVE");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    return (on || poly_q40_expert_pair_on() || poly_q40_expert_rows_mode() != 0 || poly_q40_expert_block_on()) &&
+    return (on || poly_q40_expert_pair_on() || poly_q40_expert_rows_mode() != 0 || poly_q40_expert_block_on() || poly_expert_reuse_pair_on()) &&
            ((n_in == 3072 && n_out == 2048) ||
             (n_in == 1024 && n_out == 3072));
 }
@@ -153,6 +154,12 @@ inline void poly_q4_expert_slots(const S& slots, int count,
         if (size_t((n_out + 15) / 16) * size_t(count) >= 512) rows = 4;
     }
     if (rows == 0) rows = poly_q40_expert_pair_on() ? 2 : 1;
+    if constexpr (std::is_same_v<S, MmvqIds>) {
+        if (poly_expert_reuse_pair_on()) {
+            poly_expert_reuse_pair<Weight, PARTIAL>(slots, count, n_in, n_out, rows, stream);
+            return;
+        }
+    }
     if (poly_q40_expert_block_on()) {
         poly_q40_expert_block_slots<Weight, S, PARTIAL>(slots, count, n_in, n_out, rows, stream);
         return;
