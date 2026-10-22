@@ -100,6 +100,7 @@ __global__ void poly_dense_wave_kernel(const typename F::Block* __restrict__ w,
 #include "poly_dense_q80_rows.cuh"
 #include "poly_dense_q40_rows.cuh"
 #include "poly_dense_prefetch.cuh"
+#include "poly_dense_lds.cuh"
 
 template<typename F>
 bool poly_dense_wave(const void* weights, const void* x, float* y,
@@ -119,6 +120,8 @@ bool poly_dense_wave(const void* weights, const void* x, float* y,
         }();
         if (ncols < 1 || ncols > 8 || (ncols > 1 && !g_multi_exact)) return false;
         if (!(ncols <= 4 ? enabled : wide)) return false;
+        // Explicit LDS staging takes priority over register lookahead for its bounded input shapes.
+        if (poly_dense_lds<F>(weights, x, y, n_in, n_out, ncols, stream)) return true;
         if (poly_dense_prefetch<F>(weights, x, y, n_in, n_out, ncols, stream)) return true;
         if constexpr (q80) {
             if (poly_dense_q80_rows(weights, x, y, n_in, n_out, ncols, stream)) return true;

@@ -169,3 +169,4 @@ STRATA_POLY_PIPELINE_SAVE_LOAD=1 STRATA_POLY_PARTIAL_GRAPH=1 STRATA_POLY_PIPELIN
 STRATA_POLY_EXPERT_REUSE_META=1 STRATA_POLY_EXPERT_REUSE_META_BALLOT=1  # parallelize metadata generation inside route publication
 STRATA_POLY_MTP_ATTN_NORM_Q8=1  # fuse draft projection-output attention norm and Q8 quantization
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_EXPERT_REUSE_GROUP4=1  # reuse expert weights across up to four routed occurrences
+STRATA_POLY_DENSE_X_LDS=1  # stage dense Q8 activations once per CTA, 1-4 columns and K<=3072; precedes PREFETCH
