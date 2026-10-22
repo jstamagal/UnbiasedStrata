@@ -9,6 +9,7 @@
 #include "picture_cache.hpp"
 
 #include "server-common.h"
+#include "server-chat.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -1460,6 +1461,28 @@ void strata_context::init_routes(server_http_context & http) {
         return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
     };
 
+    // Anthropic Messages (Claude Code and other Anthropic clients): converted to an OpenAI chat request as
+    // llama-server does (server_chat_convert_anthropic_to_oai), answered in Anthropic's shape and SSE events
+    auto post_anthropic_messages = [I, parse_chat](const server_http_req & req) {
+        std::vector<raw_buffer> files;
+        std::vector<std::pair<size_t, size_t>> plain;
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json body_parsed = parse_chat(body, files, plain);
+        return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_ANTHROPIC, plain);
+    };
+
+    // what the request's prompt would count, without running it (Claude Code asks before long turns)
+    auto post_anthropic_count_tokens = [I, parse_chat](const server_http_req & req) {
+        auto res = I->create_response();
+        std::vector<raw_buffer> files;
+        std::vector<std::pair<size_t, size_t>> plain;
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json body_parsed = parse_chat(body, files, plain);
+        const llama_tokens tokens = common_tokenize(I->vocab, body_parsed.at("prompt").get<std::string>(), true, true);
+        res->ok(json{{"input_tokens", (int64_t) tokens.size()}});
+        return res;
+    };
+
     auto post_completions_oai = [I](const server_http_req & req) {
         std::vector<raw_buffer> files;
         const json body = json::parse(req.body);
@@ -1535,6 +1558,8 @@ void strata_context::init_routes(server_http_context & http) {
     http.post("/v1/completions",      ex_wrapper(post_completions_oai));
     http.post("/chat/completions",    ex_wrapper(post_chat_completions));
     http.post("/v1/chat/completions", ex_wrapper(post_chat_completions));
+    http.post("/v1/messages",         ex_wrapper(post_anthropic_messages));
+    http.post("/v1/messages/count_tokens", ex_wrapper(post_anthropic_count_tokens));
     http.post("/tokenize",            ex_wrapper(post_tokenize));
     http.post("/detokenize",          ex_wrapper(post_detokenize));
     http.post("/apply-template",      ex_wrapper(post_apply_template));
