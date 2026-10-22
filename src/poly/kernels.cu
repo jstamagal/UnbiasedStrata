@@ -1,6 +1,7 @@
 // src/poly/kernels.cu - see the header.  The reference for every formula is llama.cpp's graph of the model and the
 // ggml ops it builds.  Where a kernel takes several tokens, blockIdx.y is the token unless it says otherwise.
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -897,6 +898,37 @@ __global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __re
     out[size_t(blockIdx.y) * n + i] = gelu(row[i]) * row[n + i];
 }
 
+struct ExpertQ81Block { half2 ds; int8_t qs[32]; };
+static_assert(sizeof(ExpertQ81Block) == 36);
+
+template<bool GELU>
+__global__ void expert_activation_q8_kernel(const float* __restrict__ gate_up,
+                                            ExpertQ81Block* __restrict__ out,
+                                            int n, int rows, float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * rows) return;
+    const int row = i / n, col = i - row * n;
+    const float* gu = gate_up + size_t(row) * 2 * n;
+    float v;
+    if constexpr (GELU) {
+        v = gelu(gu[col]) * gu[n + col];
+    } else {
+        const float g = fminf(gu[col], limit);
+        const float u = fminf(fmaxf(gu[n + col], -limit), limit);
+        v = g / (1.0f + expf(-g)) * u;
+    }
+    float amax = fabsf(v), sum = v;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o, 32));
+        sum += __shfl_xor_sync(0xffffffff, sum, o, 32);
+    }
+    const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+    ExpertQ81Block& block = out[i / 32];
+    block.qs[i & 31] = strata::kernels::q8_1_quant(v, d, amax);
+    if ((i & 31) == 0) block.ds = strata::kernels::q8_1_ds(d, sum);
+}
+
 // A warp a token, a lane every 32nd expert.  The pick is the host's: the n_used largest of the probabilities plus
 // the bias, the lower expert first among equals, one after the other.
 constexpr int ROUTE_PER = 16;   // experts a lane: up to 512
@@ -991,11 +1023,12 @@ __global__ void add_bias_kernel(const float* __restrict__ b, float* __restrict__
 // One block per head and token.  The pairs of the rotation are i and i + n_rot / 2 for i below n_rot / 2.  With
 // axes, a token has a position on each of three axes, and pair j turns by the one on axis (j % sections) % 3.
 // With `at`, the first token's position is what the card holds there when the launch runs.
+template <bool SCALED>
 __global__ void head_norm_rope_kernel(const float* __restrict__ x, int x_stride, const float* __restrict__ w,
                                       float* __restrict__ y, int dim, int heads, int n_rot, float theta_scale,
                                       const float* __restrict__ freq, long long pos, float eps,
                                       const int* __restrict__ axes, int sections,
-                                      const long long* __restrict__ at) {
+                                      const long long* __restrict__ at, strata::kernels::RopeKernelArgs rope) {
     __shared__ float part[8];
     const float* xr = x + size_t(blockIdx.x) * x_stride;
     float* yr = y + size_t(blockIdx.x) * dim;
@@ -1017,7 +1050,14 @@ __global__ void head_norm_rope_kernel(const float* __restrict__ x, int x_stride,
         const float theta = freq ? turn / freq[j] : turn;
         const float x0 = w ? xr[j] * scale * w[j] : xr[j] * scale;
         const float x1 = w ? xr[j + half] * scale * w[j + half] : xr[j + half] * scale;
+        if constexpr (SCALED) {
+            float c, s;
+            strata::kernels::rope_scaled_angle(theta, rope.freq_scale, rope.corr_low, rope.corr_high,
+                                               rope.ext_factor, rope.attn_factor, j, c, s);
+            yr[i] = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
+        } else {
         yr[i] = i < half ? x0 * cosf(theta) - x1 * sinf(theta) : x0 * sinf(theta) + x1 * cosf(theta);
+        }
     }
 }
 
@@ -2416,6 +2456,16 @@ void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream)
     geglu_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n);
 }
 
+void expert_activation_q8(const float* gate_up, void* out, int n, int rows, float limit,
+                          bool gelu, void* stream) {
+    if (n <= 0 || rows <= 0 || n % 32 != 0) throw std::invalid_argument("expert_activation_q8: invalid shape");
+    const unsigned blocks = grid((size_t) n * rows, 256);
+    if (gelu) expert_activation_q8_kernel<true><<<blocks, 256, 0, cs(stream)>>>(
+        gate_up, (ExpertQ81Block*) out, n, rows, limit);
+    else expert_activation_q8_kernel<false><<<blocks, 256, 0, cs(stream)>>>(
+        gate_up, (ExpertQ81Block*) out, n, rows, limit);
+}
+
 void route_rows(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale, const float* bias,
                 const float* escale, bool norm, float w_scale, int32_t* ids, float* w, void* stream) {
     if (rows <= 0) return;
@@ -2441,9 +2491,12 @@ void add_bias(const float* b, float* acc, int n, int rows, void* stream) {
 
 void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int dim, int heads, int n_rot,
                     float theta_scale, int64_t pos, int rows, float eps, void* stream, const float* freq,
-                    const int32_t* axes, int sections, const long long* at) {
-    head_norm_rope_kernel<<<rows * heads, dim >= 256 ? 256 : 128, 0, cs(stream)>>>(
-        x, x_stride, w, y, dim, heads, n_rot, theta_scale, freq, (long long) pos, eps, axes, sections, at);
+                    const int32_t* axes, int sections, const long long* at,
+                    const strata::kernels::RopeKernelArgs* rope) {
+    if (rope) head_norm_rope_kernel<true><<<rows * heads, dim >= 256 ? 256 : 128, 0, cs(stream)>>>(
+        x, x_stride, w, y, dim, heads, n_rot, theta_scale, freq, (long long) pos, eps, axes, sections, at, *rope);
+    else head_norm_rope_kernel<false><<<rows * heads, dim >= 256 ? 256 : 128, 0, cs(stream)>>>(
+        x, x_stride, w, y, dim, heads, n_rot, theta_scale, freq, (long long) pos, eps, axes, sections, at, {});
 }
 
 void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows, float* score,
@@ -2698,12 +2751,13 @@ void shortconv(const float* bcx, float* state, const float* w, float* out, int c
 
 void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const float* a, float* s, const float* z,
               const float* o_norm, float* out, int dim, int n_head, int k_heads, int rows, float norm_eps, void* stream,
-              float* snap, size_t stride, unsigned snaps) {
+              float* snap, size_t stride, unsigned snaps, bool qk_pre_normed, bool gates_precomputed) {
     if (dim % WARP != 0 || dim > 256) throw std::invalid_argument("gdn_step: a head of 32 to 256 values, in 32s");
     const size_t row_n = (2 * size_t(k_heads) + n_head) * dim;
     const int gates = rows * n_head, columns = std::min(dim, 1024 / WARP);   // a block's columns: a warp each
-    gdn_norm_kernel<<<rows * k_heads, dim, 0, cs(stream)>>>(qkv, dim, k_heads, row_n, norm_eps);
-    gdn_gates_kernel<<<grid(gates, 256), 256, 0, cs(stream)>>>(alpha, beta, dt, a, n_head, gates);
+    if (!qk_pre_normed) gdn_norm_kernel<<<rows * k_heads, dim, 0, cs(stream)>>>(qkv, dim, k_heads, row_n, norm_eps);
+    if (!gates_precomputed)
+        gdn_gates_kernel<<<grid(gates, 256), 256, 0, cs(stream)>>>(alpha, beta, dt, a, n_head, gates);
     const int blocks = n_head * ((dim + columns - 1) / columns), threads = columns * WARP;
     const unsigned sn = snap ? snaps : 0u;
     switch (dim / WARP) {

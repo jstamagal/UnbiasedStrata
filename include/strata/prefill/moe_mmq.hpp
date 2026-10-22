@@ -77,11 +77,25 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    // each (only where direct_blobs() said so; n <= kGatherGroupMax): expert e's rows [0, w_split) start at w0[e] and
+    // rows [w_split, w_rows) at w1[e], wherever they lie - `w` and `expert_bytes` are not read
+    bool each = false;
+    int64_t w_split = 0;
+    const void* w0[kGatherGroupMax] = {};
+    const void* w1[kGatherGroupMax] = {};
     const float* y_scale = nullptr;     ///< NVFP4 w4a4: the per-row activation scales (fp4_activations)
     /// set: expert z's matrix starts at tab->p[z] (w and expert_bytes are not used for addressing).  CUDA only,
     /// and only where `tab_fits` said so.
     const WeightTab* tab = nullptr;
 };
+
+/// HIP, gfx103x, STRATA_PF_DIRECT=1 (opt-in): a product of this weight type can read each expert from its own blob
+/// (Product::each), so a group need not be gathered into one buffer first.  Q4_0 / Q4_1 (Strata's own kernel): gate/up
+/// and down.  An MMQ type: gate/up only (`down` false) and only in a build whose llama.cpp has the per-channel weight
+/// pointers (third_party/llama.cpp-patches 0003) - MMQ reads K in steps of 256 values, so past each row of a
+/// 640-column down matrix and past the matrix's end for its last row, which only the group buffer's zeroed tail
+/// makes harmless.  false everywhere else.
+bool direct_blobs(int ggml_type, bool down);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
@@ -122,6 +136,10 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+/// swiglu (n_ff 640), then quantize() of its rows for a down product of `ggml_type`, in one pass: H never stored,
+/// the same bytes in hq.  Only where swiglu_quant_ok (gu 16-byte aligned; a down type whose rows are q8_1 D4).
+bool swiglu_quant_ok(int ggml_type);
+void swiglu_quant(const float* gu, void* hq, int64_t rows, bool interleaved, void* stream);
 /// swiglu of an NVFP4 group's gate/up rows (split halves) with scale_gu_rows' scales applied as they are read.
 void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
                    const float* tails, int64_t row0, void* stream);

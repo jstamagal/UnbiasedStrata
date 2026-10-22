@@ -6,6 +6,7 @@
 // The protocol is the one `strata --serve` speaks (src/program/generate.cpp): GEN, GENI for a prompt with pictures,
 // STOP and QUIT in, and RESUME, PP, T, DONE and ERR out.
 #include "conversations.hpp"
+#include "cpu_placement.hpp"
 #include "engine.hpp"
 #include "guesses.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -264,7 +265,7 @@ std::string take_pictures(const std::string& path, int32_t pad, int n_embd, std:
 // stdin on its own thread, so a STOP is seen while a request runs
 class Lines {
 public:
-    Lines() : th_([this] { read(); }) { th_.detach(); }
+    Lines() : th_([this] { strata::poly::cpu_placement::pin_aux(); read(); }) { th_.detach(); }
 
     std::string pop() {
         std::unique_lock<std::mutex> l(m_);
@@ -380,6 +381,7 @@ struct Session {
                     int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
                     OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr) {
         Result r;
+        engine.pipeline_cancel();
         const int64_t n = (int64_t) ids.size();
         Clock::time_point t0 = Clock::now(), shown = t0;   // bringing a parked conversation back is prompt time
         engine.images(pictures.at.data(), (int) pictures.at.size());
@@ -434,6 +436,7 @@ struct Session {
                     break;
                 }
             } else {
+                if (last) engine.end_read();   // the last token, as the answer's, with the whole expert cache
                 engine.eval(ids.data() + i, (int) m, last);
             }
             kept.read(ids.data() + i, m);
@@ -449,6 +452,7 @@ struct Session {
                 break;
             }
         }
+        engine.end_read();
         kept.prompt_was(n);
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
@@ -497,26 +501,79 @@ struct Session {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
                 };
                 strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
+                int last_draft_i = -1;
+                float draft_prob[strata::spec::DraftPolicy::kMaxT] = {};
                 if (ask) {
                     int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, kBlockWindow) - 1 && guesses.wants(n_d); from = d[n_d++]) {
                         float p = 0.f;
                         const Clock::time_point asked_at = Clock::now();
                         d[n_d] = engine.draft(from, n_d, &p);
+                        draft_prob[n_d] = p;
+                        last_draft_i = n_d;
                         if (!guesses.takes(n_d, p, ms_since(asked_at))) break;
                     }
                     use = policy.choose(1 + n_d, k, match);
                 }
                 if (use.t == 1) {
-                    engine.eval(&t, 1, true);
-                    kept.read(&t, 1);
-                    t = pick(engine.logits());
+                    if (engine.pipeline_match(&t, 1)) {
+                        engine.pipeline_window(&t, 1, nullptr, 0);
+                        const int32_t next = pick(engine.logits_of(0));
+                        engine.keep(1);
+                        kept.read(&t, 1);
+                        t = next;
+                    } else {
+                        engine.eval(&t, 1, true);
+                        kept.read(&t, 1);
+                        t = pick(engine.logits());
+                    }
                     policy.observe(false, 1, 0, 0, count(1, 1));
                     continue;
                 }
                 w[0] = t;
                 if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
-                engine.window(w, use.t);
+                // The next window is a guess until this one's sampled logits arrive.  Its first-card work can
+                // run while the second card verifies this one; a miss is discarded by keep().
+                const bool pipeline_candidate = engine.pipeline_windows() && ask && !use.lookup &&
+                                      last_draft_i == use.t - 2 &&
+                                      engine.pos() + 2 * use.t <= engine.max_context() &&
+                                      r.produced + use.t < max_new;
+                float p_accept = 1.f;
+                if (pipeline_candidate)
+                    for (int i = 0; i + 1 < use.t; ++i)
+                        p_accept *= std::clamp(draft_prob[i], 0.f, 1.f);
+                const bool pipeline = pipeline_candidate && engine.pipeline_gate(p_accept, "accept");
+                if (pipeline) {
+                    int32_t future[strata::spec::DraftPolicy::kMaxT];
+                    engine.pipeline_window(w, use.t, future, use.t, [&] {
+                        int32_t from = w[use.t - 1];
+                        float bonus_prob = 0.f;
+                        future[0] = engine.draft(from, use.t - 1, &bonus_prob);
+                        if (!engine.pipeline_gate(p_accept * std::clamp(bonus_prob, 0.f, 1.f), "bonus")) return 0;
+                        // Predict the next round's own drafting rule from a copy. The real policy and sampler
+                        // are updated only after this window's verifier supplies its logits.
+                        auto future_policy = policy;
+                        auto future_guesses = guesses;
+                        const double predicted_ms = future_policy.cost_ms(use.t);
+                        future_guesses.end(use.t, use.t, predicted_ms, false);
+                        future_policy.observe(false, use.t, use.t - 1, match, predicted_ms);
+                        if (!future_guesses.begin(true, future_policy)) return 1;
+                        int n_future = 0;
+                        from = future[0];
+                        for (; n_future < std::min(most, kBlockWindow) - 1 && future_guesses.wants(n_future); ++n_future) {
+                            float p = 0.f;
+                            const Clock::time_point asked_at = Clock::now();
+                            future[n_future + 1] = engine.draft(from, use.t + n_future, &p);
+                            if (!future_guesses.takes(n_future, p, ms_since(asked_at))) break;
+                            from = future[n_future + 1];
+                        }
+                        return 1 + n_future;
+                    });
+                } else if (engine.pipeline_match(w, use.t)) {
+                    engine.pipeline_window(w, use.t, nullptr, 0);
+                } else {
+                    engine.window(w, use.t);
+                }
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
                 int right = 0;
@@ -531,6 +588,7 @@ struct Session {
                 if (!more) break;
             }
         }
+        engine.pipeline_cancel();
         r.decode_ms = ms_since(t0);
         return r;
     }
@@ -1024,6 +1082,8 @@ void usage() {
     std::fprintf(stderr,
                  "usage: strata-poly --model FILE.gguf (--serve | --tokens ID,ID,... [--max-new N])\n"
                  "  --max-context N        tokens the attention caches hold (default 8192)\n"
+                 "  --rope-scaling TYPE    none (default), yarn or linear; requires STRATA_POLY_YARN=1\n"
+                 "  --rope-scale N         context scaling factor (default 1)\n"
                  "  --threads N            CPU threads for the experts that are not in VRAM (default: all usable)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
@@ -1052,6 +1112,8 @@ void usage() {
                  "                         as a CUDA graph and replayed)\n"
                  "  --kv-whole             give the attention caches VRAM for the whole context at load (default: as\n"
                  "                         the conversation grows, the expert cache having the rest until then)\n"
+                 "  --kv-resident N        with STRATA_POLY_KV_RESIDENT=1 and --kv q8_0, keep about N recent\n"
+                 "                         attention rows in VRAM and the rest in mapped pinned RAM\n"
                  "  --kv fmt               the K and V attention caches' format: fp16 (default, unchanged) or q8_0\n"
                  "                         (ggml Q8_0 blocks: half the KV VRAM, slightly different answers); opt-in\n"
                  "  --expert-swaps N       while an answer is written, up to N experts it keeps using are on their way\n"
@@ -1133,6 +1195,8 @@ int main(int argc, char** argv) {
         if (a == "--model") o.model = val();
         else if (a == "--serve") want_serve = true;
         else if (a == "--max-context") o.max_context = std::atoi(val());
+        else if (a == "--rope-scaling") o.rope_scaling = val();
+        else if (a == "--rope-scale") o.rope_scale = std::atof(val());
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--expert-profile") o.profile = val();
@@ -1140,6 +1204,7 @@ int main(int argc, char** argv) {
         else if (a == "--any-node") o.stay_near = false;
         else if (a == "--no-graphs") o.graphs = false;
         else if (a == "--kv-whole") o.kv_grow = false;
+        else if (a == "--kv-resident") o.kv_resident = std::atoi(val());
         else if (a == "--kv") {
             const std::string fmt = val();
             if (fmt == "fp16") o.kv_format = KvFmt::kFp16;
@@ -1207,6 +1272,13 @@ int main(int argc, char** argv) {
                              "with tokens left of --tokens\n");
         return 2;
     }
+    if (o.kv_resident < 0 || (o.kv_resident > 0 &&
+        (o.kv_format != KvFmt::kQ8_0 || !std::getenv("STRATA_POLY_KV_RESIDENT") ||
+         std::strcmp(std::getenv("STRATA_POLY_KV_RESIDENT"), "1") != 0))) {
+        std::fprintf(stderr, "strata-poly: --kv-resident N needs N >= 0, --kv q8_0 and "
+                             "STRATA_POLY_KV_RESIDENT=1\n");
+        return 2;
+    }
     // over --tail-skip, as Strata's engine reads it: =0 turns a model's default off
     if (const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP")) o.tail_skip = std::atoi(v);
     const long long most = 1LL << 24;   // MiB: 16 TiB
@@ -1217,10 +1289,23 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    const char* cpu_spec = std::getenv("STRATA_POLY_CPUS");
+    std::string cpu_error;
+    if (!strata::poly::cpu_placement::configure(cpu_spec, cpu_error)) {
+        std::fprintf(stderr, "strata-poly: %s\n", cpu_error.c_str());
+        return 2;
+    }
+    if (cpu_spec && *cpu_spec) {
+        o.stay_near = false;   // the explicit placement owns the host/pool decision
+        if (o.threads <= 0) o.threads = strata::poly::cpu_placement::configured_threads();
+        std::fprintf(stderr, "strata-poly: STRATA_POLY_CPUS=%s\n", cpu_spec);
+    }
+
     std::unique_ptr<Engine> loaded;
     try {
         const Clock::time_point t0 = Clock::now();
         loaded = Engine::open(o);
+        strata::poly::cpu_placement::sweep();
         Engine& engine = *loaded;
         std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",
                      ms_since(t0) / 1000.0, engine.cached_experts(), engine.total_experts(), engine.cached_gib(),

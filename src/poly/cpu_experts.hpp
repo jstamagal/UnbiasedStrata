@@ -19,7 +19,7 @@ namespace strata::poly {
 /// inside fn does its work on the thread it is on.
 class Workers {
 public:
-    explicit Workers(int threads);
+    explicit Workers(int threads, int partition = -1);
     ~Workers();
     Workers(const Workers&) = delete;
     Workers& operator=(const Workers&) = delete;

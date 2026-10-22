@@ -49,6 +49,14 @@ struct FusedGrArgs {
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
     const float* s_down = nullptr;
     const float* s_up = nullptr;
+    /// STRATA_NODE_FUSE (fused_gr_read_multi only, with apply): bo_prev is not read but made here first, as the MoE
+    /// combine native_moe_combine_multi would have written to it (its k = 10 float4 kernel: parts [10][n_embd] of this
+    /// token, its 10 routing weights, the shared expert's row), and stored to bo_prev for the read's later kernels.
+    /// All tokens set, or none; 16-byte aligned.  Inside the split read's register norm (STRATA_GR_NORM_FAST); any
+    /// other read launches the combine first (the same values, one node more).
+    const float* cmb_parts = nullptr;
+    const float* cmb_w = nullptr;
+    const float* cmb_shared = nullptr;
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
@@ -65,13 +73,22 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four
 /// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
+// Per-kernel limit; fused_gr_read_multi splits lookup windows of up to 12 rows.
 constexpr int kFusedGrMaxT = 8;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
-
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
+/// The bench only: STRATA_HC_WIDE's bit mask (1 = the one-block-per-row down, 2 = the 8-lanes-a-row up); -1 = the
+/// environment's.
+void fused_gr_set_wide(int mask);
+/// Tests: STRATA_HC_WIDE8 on (1) or off (0) whatever the environment says; -1 = the environment again.
+void fused_gr_set_wide8(int on);
+/// Tests: STRATA_HC_UP_TSUM on (1) or off (0) whatever the environment says; -1 = the environment again.
+void fused_gr_set_up_tsum(int on);
+/// Tests: STRATA_HC_DOWN2 on (1) or off (0) whatever the environment says; -1 = the environment again.
+void fused_gr_set_down2(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
 /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
 /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm

@@ -29,6 +29,10 @@
 
 #include <algorithm>
 #include <climits>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -443,19 +447,32 @@ std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
     }
     std::string arch(properties.gcnArchName);
     if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
+    const int mp = properties.multiProcessorCount;   // RDNA: workgroup processors (40 on an RX 6900 XT)
+    namespace rt = strata::prefill::rocblas_tuning;
     std::filesystem::path file(path);
     std::error_code ec;
     if (std::filesystem::is_directory(file, ec)) {
-        // the table of this card and this rocBLAS build (its version string, trailing dots dropped)
-        std::string tag(version);
-        while (!tag.empty() && tag.back() == '.') tag.pop_back();
-        file /= arch + "-rocblas-" + tag + ".txt";
+        // the table of this card and this rocBLAS build (its version string, trailing dots dropped): one measured on
+        // this card (the per-device cache; tune_rocblas --to-cache), else one of this width (mp), else the architecture's
+        const std::string tag = rt::version_tag(version);
+        const std::string own = rt::cache_path(arch, mp, version, "");
+        const std::filesystem::path width = file / (arch + "-mp" + std::to_string(mp) + "-rocblas-" + tag + ".txt");
+        if (!own.empty() && std::filesystem::is_regular_file(own, ec)) file = own;
+        else if (std::filesystem::is_regular_file(width, ec)) file = width;
+        else file /= arch + "-rocblas-" + tag + ".txt";
     }
     std::string error;
     if (!state->table.load(file.string(), arch, version, error)) {
         std::fprintf(stderr, "prefill gemm: %s (%s); rocBLAS's default kernels run\n", error.c_str(),
                      file.string().c_str());
         return nullptr;
+    }
+    if (state->table.mp() > 0 && state->table.mp() != mp) {
+        std::fprintf(stderr,
+                     "prefill gemm: the rocBLAS table was measured on a card with %d multiprocessors and this one has "
+                     "%d; its solutions are valid here but may not be the fastest (tune_rocblas --to-cache measures "
+                     "this card)\n",
+                     state->table.mp(), mp);
     }
     // rocBLAS loads its kernel library on the first product through a handle; a solution-index call before that
     // fails (rocblas_status_internal_error) although the index is valid.  One tiny default product opens it.
@@ -473,8 +490,8 @@ std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
     }
     size_t tuned_rows = 0;
     for (const auto& row : state->table.rows()) tuned_rows += row.tuned ? 1 : 0;
-    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, rocBLAS %s)\n",
-                 state->table.rows().size(), tuned_rows, arch.c_str(), version);
+    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, mp %d, rocBLAS %s; %s)\n",
+                 state->table.rows().size(), tuned_rows, arch.c_str(), mp, version, file.string().c_str());
     return state;
 }
 
@@ -531,7 +548,80 @@ bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, 
 }
 #endif
 
+// STRATA_DENSE_TIMING (debug): Gemm::tmark / tdump.  Events on the stream, folded (after a synchronize) when 4096
+// are waiting and at tdump.
+struct DenseTimer {
+    struct Key {
+        std::string what; int64_t t, n, k;
+        bool operator<(const Key& o) const { return std::tie(what, t, n, k) < std::tie(o.what, o.t, o.n, o.k); }
+    };
+    struct Sum { uint64_t count = 0; double ms = 0; };
+    std::vector<cudaEvent_t> ev;
+    std::vector<Key> key;
+    size_t used = 0;
+    std::map<Key, Sum> sums;
+    void fold(cudaStream_t s) {
+        if (used < 2) return;
+        cudaStreamSynchronize(s);
+        for (size_t i = 0; i + 1 < used; ++i) {
+            float t = 0.0f;
+            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) {
+                Sum& a = sums[key[i + 1]];
+                ++a.count;
+                a.ms += t;
+            }
+        }
+        std::swap(ev[0], ev[used - 1]);
+        used = 1;
+    }
+    ~DenseTimer() { for (cudaEvent_t e : ev) cudaEventDestroy(e); }
+};
+bool dense_timing_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DENSE_TIMING"); return e && e[0] == '1'; }();
+    return on;
+}
+
 }  // namespace
+
+void Gemm::tmark(const char* what, int64_t T, int64_t N, int64_t K) {
+    if (!dense_timing_on()) return;
+    if (!dense_timer_) dense_timer_ = new DenseTimer();
+    auto* d = static_cast<DenseTimer*>(dense_timer_);
+    if (d->used >= 4096) d->fold((cudaStream_t) stream_);
+    if (d->used == d->ev.size()) {
+        cudaEvent_t e = nullptr;
+        cudaEventCreate(&e);
+        d->ev.push_back(e);
+        d->key.emplace_back();
+    }
+    d->key[d->used] = DenseTimer::Key{what, T, N, K};
+    cudaEventRecord(d->ev[d->used], (cudaStream_t) stream_);
+    ++d->used;
+}
+
+void Gemm::tdump(const char* tag) {
+    if (!dense_timing_on() || !dense_timer_) return;
+    auto* d = static_cast<DenseTimer*>(dense_timer_);
+    d->fold((cudaStream_t) stream_);
+    int dev = -1;
+    cudaGetDevice(&dev);
+    double total = 0;
+    for (const auto& [k, v] : d->sums) total += v.ms;
+    std::vector<std::pair<DenseTimer::Key, DenseTimer::Sum>> rows(d->sums.begin(), d->sums.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    std::fprintf(stderr, "strata dense timing (%s, device %d): %.1f ms marked\n", tag, dev, total);
+    for (const auto& [k, v] : rows) {
+        if (k.n > 0 && k.t > 0)
+            std::fprintf(stderr, "strata dense timing:   %-14s T=%-6lld N=%-6lld K=%-6lld x%-5llu %9.2f ms (%4.1f%%) %7.3f ms each, %7.1f GFLOP/s\n",
+                         k.what.c_str(), (long long) k.t, (long long) k.n, (long long) k.k, (unsigned long long) v.count,
+                         v.ms, 100.0 * v.ms / total, v.ms / v.count,
+                         v.ms > 0 ? 2.0 * k.t * k.n * k.k * v.count / (v.ms * 1e6) : 0.0);
+        else
+            std::fprintf(stderr, "strata dense timing:   %-14s %-27s x%-5llu %9.2f ms (%4.1f%%) %7.3f ms each\n", k.what.c_str(),
+                         "", (unsigned long long) v.count, v.ms, 100.0 * v.ms / total, v.ms / v.count);
+    }
+    d->sums.clear();
+}
 
 bool prompt_f16() {
 #if defined(__HIPCC__)
@@ -571,6 +661,7 @@ Gemm::~Gemm() {
 #if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
     delete static_cast<RocBlasState*>(rocblas_state_);
 #endif
+    delete static_cast<DenseTimer*>(dense_timer_);
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
@@ -920,6 +1011,9 @@ __global__ void f16_to_bf16_kernel(const __half* __restrict__ in, uint16_t* __re
 }
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta, int64_t ldx, bool x_f16) {
+    const bool want_f16 = keep_f16_;
+    keep_f16_ = false;
+    kept_f16_ = false;
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
@@ -941,8 +1035,12 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
+            tmark("other");
             bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
-            f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
+            tmark("w bf16->f16", T, n, K);
+            // one product only (a slice's halves start at its own columns); STRATA_DBG_NAN counts in the widening
+            kept_f16_ = want_f16 && n == N && std::getenv("STRATA_DBG_NAN") == nullptr;
+            f16_inplace(X, scratch_, Y + r0, T, n, K, ldy, kept_f16_);
         }
         return;
     }
@@ -1046,8 +1144,195 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
+#if defined(__HIPCC__)
+// ---- STRATA_HC_DOWNSK (opt-in; written for and measured on gfx1030): the hyper-connection [down; inject] product
+// (N 320 + 4, K 10240) as a split-K FP16 GEMM on v_dot2_f32_f16.  rocBLAS's best kernel for this shape runs it at
+// 17 TFLOP/s on a Radeon PRO V620: at 2048 tokens its 128-wide tiles make about 48 workgroups for 72 compute units, so
+// most of the card waits.  Here K is cut in S parts (blockIdx.z), each workgroup sums its part of K for a BM x BN tile
+// in FP32 and writes the partial sums; gr_silu_inj_sk adds the S parts in order.  The BF16 weights are read as they
+// are and converted per value in the kernel exactly as bf16_to_f16_rows does (no conversion pass, no FP16 copy).
+// Every output is one fixed sequence of FP32 operations: the same bits run to run.
+namespace {
+typedef _Float16 hcd_h2 __attribute__((ext_vector_type(2)));
+typedef _Float16 hcd_h4 __attribute__((ext_vector_type(4)));
+typedef _Float16 hcd_h8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ _Float16 hcd_bf_to_h(uint32_t b16) {   // bf16_to_f16_rows's conversion of one value
+    const float f = __uint_as_float(b16 << 16);
+    return __builtin_bit_cast(_Float16, __half_as_ushort(__float2half(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f))));
+}
+__device__ __forceinline__ float hcd_dot2(hcd_h2 a, hcd_h2 b, float c) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+#else   // compiled for other targets only so the file builds; Gemm::hc_down_sk runs on gfx103x devices alone
+    return fmaf((float) a[1], (float) b[1], fmaf((float) a[0], (float) b[0], c));
+#endif
+}
+// One BM x BN tile of P[z] = X[:, z Ks .. (z+1) Ks) . [W1; W2][:, same]^T.  A thread holds TM x TN sums: rows
+// tm + i GM, columns tn + j GN (interleaved).  Both tiles sit in LDS as rows of BK + 4 halves (an 8-byte read of 16
+// consecutive rows then falls on 16 distinct bank pairs); the inner loop reads 4 values of each row at a time.  The
+// next K step's tiles are loaded into registers while this one is summed.
+template <int BM, int BN, int TM, int TN, int BK>
+__global__ __launch_bounds__((BM / TM) * (BN / TN)) void hcd_sk_kernel(
+        const _Float16* __restrict__ X, const uint16_t* __restrict__ W1, int N1, const uint16_t* __restrict__ W2,
+        int N2, float* __restrict__ P, int T, int K, int Ks) {
+    constexpr int GM = BM / TM, GN = BN / TN, NT = GM * GN, LD = BK + 4, C8 = BK / 8;
+    constexpr int NA = (BM * C8 + NT - 1) / NT, NB = (BN * C8 + NT - 1) / NT;
+    __shared__ __attribute__((aligned(16))) _Float16 As[BM * LD];
+    __shared__ __attribute__((aligned(16))) _Float16 Bs[BN * LD];
+    const int tid = (int) threadIdx.x, tn = tid % GN, tm = tid / GN;
+    const int n0 = (int) blockIdx.x * BN, m0 = (int) blockIdx.y * BM, kb = (int) blockIdx.z * Ks, N = N1 + N2;
+    hcd_h8 ra[NA];
+    uint4 rb[NB];
+    auto gload = [&](int k0) {
+#pragma unroll
+        for (int q = 0; q < NA; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8;
+            hcd_h8 v = {};
+            if ((NA * NT == BM * C8 || c < BM * C8) && m0 + row < T) v = *(const hcd_h8*) (X + (int64_t) (m0 + row) * K + k0 + col);
+            ra[q] = v;
+        }
+#pragma unroll
+        for (int q = 0; q < NB; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8, n = n0 + row;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (NB * NT == BN * C8 || c < BN * C8) {
+                if (n < N1) v = *(const uint4*) (W1 + (int64_t) n * K + k0 + col);
+                else if (n < N) v = *(const uint4*) (W2 + (int64_t) (n - N1) * K + k0 + col);
+            }
+            rb[q] = v;
+        }
+    };
+    auto st8 = [](_Float16* p, hcd_h8 v) {   // rows of BK + 4 halves: 8-byte aligned
+        *(hcd_h4*) p = hcd_h4{v[0], v[1], v[2], v[3]};
+        *(hcd_h4*) (p + 4) = hcd_h4{v[4], v[5], v[6], v[7]};
+    };
+    auto sstore = [&]() {
+#pragma unroll
+        for (int q = 0; q < NA; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8;
+            if (NA * NT == BM * C8 || c < BM * C8) st8(As + row * LD + col, ra[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < NB; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8;
+            if (NB * NT == BN * C8 || c < BN * C8) {
+                const uint32_t w[4] = {rb[q].x, rb[q].y, rb[q].z, rb[q].w};
+                hcd_h8 h;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    h[2 * e] = hcd_bf_to_h(w[e] & 0xffffu);
+                    h[2 * e + 1] = hcd_bf_to_h(w[e] >> 16);
+                }
+                st8(Bs + row * LD + col, h);
+            }
+        }
+    };
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+    const int nk = Ks / BK;
+    gload(kb);
+    for (int kt = 0; kt < nk; ++kt) {
+        __syncthreads();
+        sstore();
+        __syncthreads();
+        if (kt + 1 < nk) gload(kb + (kt + 1) * BK);
+#pragma unroll
+        for (int kk = 0; kk < BK / 4; ++kk) {
+            hcd_h4 a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) a[i] = *(const hcd_h4*) (As + (tm + i * GM) * LD + kk * 4);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b[j] = *(const hcd_h4*) (Bs + (tn + j * GN) * LD + kk * 4);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    float s = acc[i][j];
+                    s = hcd_dot2(hcd_h2{a[i][0], a[i][1]}, hcd_h2{b[j][0], b[j][1]}, s);
+                    s = hcd_dot2(hcd_h2{a[i][2], a[i][3]}, hcd_h2{b[j][2], b[j][3]}, s);
+                    acc[i][j] = s;
+                }
+        }
+    }
+    float* p = P + (int64_t) blockIdx.z * T * N;
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int m = m0 + tm + i * GM;
+        if (m >= T) continue;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + tn + j * GN;
+            if (n < N) p[(int64_t) m * N + n] = acc[i][j];
+        }
+    }
+}
+// 128 tokens x 112 outputs per workgroup of 128 threads (16 x 7 sums each), K in steps of 64.  Of the shapes tried on
+// a PRO V620 at 2048 tokens, K in 8 parts (0.53 ms) beat 128 x 112 with 8 x 7 sums (0.56-0.58), 64 x 112 (0.61),
+// 256 x 112 (0.60), 128 x 168 (0.68), 128 x 84 (0.70) and 16-byte LDS reads (0.58); padding the 20480-byte row
+// strides of X and W changed nothing (within 2%).
+constexpr int kHcdBM = 128, kHcdBN = 112, kHcdTM = 16, kHcdTN = 7, kHcdBK = 64;
+bool gfx103x_device() {
+    static std::atomic<int> arch[64] = {};   // per device: 0 not known, 1 gfx103x, 2 another architecture
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
+    int v = arch[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        v = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 1 : 2;
+        arch[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+}  // namespace
+#endif
+
+bool Gemm::hc_down_sk(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* P,
+                      int64_t T, int64_t K, int S) {
+#if defined(__HIPCC__)
+    if (!f16_io_ || T <= 0 || N1 <= 0 || N2 < 0 || S < 1 || K % ((int64_t) S * kHcdBK) != 0 || T > INT_MAX / 2 ||
+        K > INT_MAX / 2 || N1 + N2 > 4096 || (((uintptr_t) X | (uintptr_t) W1 | (uintptr_t) W2) & 15) != 0 ||
+        !gfx103x_device())
+        return false;
+    tmark("other");
+    const dim3 grid((unsigned) ((N1 + N2 + kHcdBN - 1) / kHcdBN), (unsigned) ((T + kHcdBM - 1) / kHcdBM), (unsigned) S);
+    hcd_sk_kernel<kHcdBM, kHcdBN, kHcdTM, kHcdTN, kHcdBK>
+        <<<grid, (kHcdBM / kHcdTM) * (kHcdBN / kHcdTN), 0, (cudaStream_t) stream_>>>(
+            (const _Float16*) X, W1, (int) N1, W2, (int) N2, P, (int) T, (int) K, (int) (K / S));
+    tmark("gemm hcdsk", T, N1 + N2, K);
+    return true;
+#else
+    (void) X; (void) W1; (void) N1; (void) W2; (void) N2; (void) P; (void) T; (void) K; (void) S;
+    return false;
+#endif
+}
+
+bool Gemm::bf16_pair(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* Y,
+                     int64_t T, int64_t K, int64_t ldy) {
+#if defined(__HIPCC__)
+    const int64_t N = N1 + N2;
+    if (!f16_io_ || T <= 0 || N1 <= 0 || N2 <= 0 || ldy < N || N * K > scratch_elems_) return false;
+    tmark("other");
+    bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W1, (__half*) scratch_, N1 * K);
+    bf16_to_f16_rows<<<64, 256, 0, (cudaStream_t) stream_>>>(W2, (__half*) scratch_ + N1 * K, N2 * K);
+    tmark("w bf16->f16", T, N, K);
+    f16_inplace(X, scratch_, Y, T, N, K, ldy);
+    return true;
+#else
+    (void) X; (void) W1; (void) N1; (void) W2; (void) N2; (void) Y; (void) T; (void) K; (void) ldy;
+    return false;
+#endif
+}
+
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
+    const bool want_f16 = keep_f16_;   // STRATA_PF_NOWIDEN (via native): only the FP16-out call below honours it
+    keep_f16_ = false;
+    kept_f16_ = false;
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #ifdef STRATA_USE_HIP
@@ -1062,7 +1347,11 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     }
 #endif
 #if defined(__HIPCC__)
-    if (f16_io_ && beta == 0.0f) { f16_inplace(X, W, Y, T, N, K, ldy); return; }
+    if (f16_io_ && beta == 0.0f) {
+        kept_f16_ = want_f16 && std::getenv("STRATA_DBG_NAN") == nullptr;
+        f16_inplace(X, W, Y, T, N, K, ldy, kept_f16_);
+        return;
+    }
 #endif
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -1199,11 +1488,13 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     return true;
 }
 #endif
-void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                       bool keep_f16) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;
     bool done = false;
 #if defined(STRATA_ROCBLAS_AVAILABLE)
+    tmark("other");
     done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
 #endif
     if (!done) {
@@ -1212,8 +1503,11 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
            "cublasGemmEx f16 out");
     }
+    if (dense_timing_on()) tmark(done ? "gemm tuned" : "gemm default", T, N, K);
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
+    if (keep_f16) return;   // the reader takes the halves (STRATA_HC_GATED16)
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
+    tmark("widen", T, N, K);
     if (dbg_nan) {   // debug only: a sync per GEMM
         unsigned long long bad = 0, zero_count = 0;
         (void) hipStreamSynchronize((hipStream_t) stream_);
@@ -1224,12 +1518,15 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
         }
     }
 #else
-    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) keep_f16;
 #endif
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
+    const bool want_f16 = keep_f16_;   // keep_f16_next(): passed on only to the single f16() call at the end
+    keep_f16_ = false;
+    kept_f16_ = false;
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
@@ -1273,12 +1570,17 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+            tmark("other");
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            tmark("dequant", T, n, K);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;
     }
+    tmark("other");
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    tmark("dequant", T, N, K);
+    keep_f16_ = want_f16;
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 

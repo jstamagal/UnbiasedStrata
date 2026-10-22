@@ -1,11 +1,13 @@
 // src/poly/cpu_experts.cpp - see the header.
 #include "cpu_experts.hpp"
+#include "cpu_placement.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <mutex>
@@ -18,7 +20,16 @@ namespace {
 // idle at the end of every layer: 64 rows gave Tiel's 512-row experts 8 tasks each, and its down products 32 tasks.
 constexpr int kRowsPerTask = 32;
 constexpr int kRowsPerDownTask = 16;
-constexpr int kSpinsBeforeSleep = 20000;   // about a millisecond of pause instructions
+int spins_before_sleep() {
+    static const int spins = [] {
+        const char* v = std::getenv("STRATA_POLY_WORKER_SPINS");
+        if (!v || !*v) return 20000;   // about a millisecond of pause instructions
+        char* end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        return end != v && *end == '\0' && n >= 0 && n <= 100000000 ? (int) n : 20000;
+    }();
+    return spins;
+}
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
@@ -31,8 +42,10 @@ thread_local bool in_task = false;   // this thread is running a task of a batch
 
 }  // namespace
 
-Workers::Workers(int threads) {
-    for (int i = 1; i < threads; ++i) th_.emplace_back([this] { loop(); });
+Workers::Workers(int threads, int partition) {
+    threads = cpu_placement::pool_threads(threads, partition);
+    for (int i = 1; i < threads; ++i)
+        th_.emplace_back([this, i, partition] { cpu_placement::pin_pool(i - 1, partition); loop(); });
 }
 
 Workers::~Workers() {
@@ -87,7 +100,7 @@ void Workers::loop() {
             }
             seen = now;
         }
-        if (++idle < kSpinsBeforeSleep) {
+        if (++idle < spins_before_sleep()) {
             _mm_pause();
             continue;
         }

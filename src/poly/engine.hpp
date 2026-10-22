@@ -42,6 +42,8 @@ enum class KvFmt { kFp16 = 0, kQ8_0 = 1 };
 struct Options {
     std::string model;
     int max_context = 8192;
+    std::string rope_scaling = "none";
+    double rope_scale = 1.0;
     int threads = 0;              ///< 0: the CPUs this process may use
     int vram_reserve_mib = -1;    ///< left free after the expert cache is filled; below 0: by the card's size
     std::string profile;          ///< expert use counts; orders the expert cache, and save_profile() adds to it
@@ -67,6 +69,7 @@ struct Options {
     bool graphs = true;           ///< a token's fixed launches are recorded once, a CUDA graph a layer, and replayed
     bool kv_grow = true;          ///< the attention caches get VRAM as the sequence grows, where the card can map it
                                   ///< so; false: for the whole context at load, as the expert cache gets the rest
+    int kv_resident = 0;          ///< opt-in q8_0: recent rows in VRAM, older rows in mapped host memory
     KvFmt kv_format = KvFmt::kFp16;   ///< the K and V caches' format; fp16 by default (byte-identical path)
     int window = 0;               ///< the most tokens window() takes: the known one and guesses after it; 1: none;
                                   ///< 0: 8, or 4 where every guess keeps a copy of the recurrent state
@@ -212,6 +215,7 @@ public:
     /// window layer's rows among it.  The caller goes back to a state saved before (load_state()) or resets.
     bool read(const int32_t* tokens, int n, const Mark* marks = nullptr, int n_marks = 0,
               const std::function<bool(int, int)>* turn = nullptr);
+    void end_read() {}   // ub has no temporary prompt-read staging allocation
 
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
@@ -229,6 +233,13 @@ public:
     /// What a kept token computed is what eval() would have computed for it.
     int max_window() const { return opt_.window; }
     void window(const int32_t* tokens, int t);
+    /// Two-card, opt-in decode: verify this window on the last card while the first card runs a predicted next one.
+    bool pipeline_windows() const;
+    bool pipeline_match(const int32_t* tokens, int t) const;
+    void pipeline_window(const int32_t* tokens, int t, const int32_t* predicted, int predicted_n,
+                         const std::function<int()>& prepare = {});
+    bool pipeline_gate(float probability, const char* reason);
+    void pipeline_cancel();
     const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
     void keep(int n);
 
@@ -490,11 +501,18 @@ protected:
     struct Kv : Mapped {
         size_t bytes = 0;   ///< for every `per` rows
         int per = 1;
+        // With --kv-resident, base is a stable mixed host/VRAM address range.
+        // Each host chunk is also mapped at host_alias for evictions.
+        std::vector<unsigned long long> host_handles, hot_handles;
+        unsigned long long host_alias = 0;
+        size_t chunk = 0, hot_chunks = 0, hot_first = 0;
     };
     void vmm_reserve(Mapped& m, size_t bytes);
     void vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what);
     void vmm_unmap(Mapped& m, size_t bytes);
     void vmm_free(Mapped& m);
+    void kv_resident_advance(Kv& k, int64_t end);
+    void kv_resident_free(Kv& k);
     void shrink_cache(size_t bytes);
     int grow_cache(size_t bytes);
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
@@ -509,6 +527,7 @@ protected:
     std::unique_ptr<Shards> dg_;      ///< Options::draft_model, while the draft block is read from it
     const Shards* block_ = nullptr;   ///< the file the draft block is in: gg_ or dg_
     std::shared_ptr<Workers> workers_;   ///< on several cards, one for all of them: they take turns
+    int worker_partition_ = -1;          ///< 0/1: disjoint CPU pool halves for two pipelined cards
     int node_ = -1;
     // A layer split (open()).  The layers of the model are [lo_, hi_) here, and the engine of the next card has
     // the ones after.  A later card's engine reads its first layer's input from pass_, which the one before wrote:
@@ -534,6 +553,31 @@ protected:
     void* blas_ = nullptr; ///< cuBLAS on st_
     void* ev_ = nullptr;   ///< marks the router's copy to the host: ev_row_'s first, or a window's row's own
     void* ev_row_[8] = {}; ///< one for each token a window can have
+    float* pipe_saved_[2] = {};   ///< front card's recurrent state before current and predicted windows
+    float* pipe_pass_[2] = {};    ///< distinct pinned handoffs while both cards run
+    std::vector<int32_t> pipe_tokens_;
+    int pipe_n_ = 0, pipe_slot_ = 0;
+    bool pipe_ready_ = false, pipe_inflight_ = false;
+    uint64_t pipe_attempts_ = 0, pipe_hits_ = 0, pipe_discards_ = 0, pipe_rollbacks_ = 0;
+    uint64_t pipe_gated_ = 0, pipe_miss_bonus_ = 0, pipe_miss_length_ = 0, pipe_miss_draft_ = 0;
+    bool router_doorbell_ = false;
+    uint32_t* router_host_seq_ = nullptr;   ///< eight mapped pinned words, one per router event
+    uint32_t* router_device_seq_ = nullptr;
+    uint32_t router_expected_[8] = {};
+    uint32_t* partial_host_words_ = nullptr;   ///< ready, done, abort: mapped coherent graph handshake
+    uint32_t* partial_device_words_ = nullptr;
+    uint32_t partial_expected_ = 0;
+    float* h_partial_x_ = nullptr;                 ///< one coherent mapped allocation: input, ids, weights
+    int32_t* h_partial_ids_ = nullptr;
+    float* h_partial_wts_ = nullptr;
+    float* d_partial_x_ = nullptr;
+    int32_t* d_partial_ids_ = nullptr;
+    float* d_partial_wts_ = nullptr;
+    float* h_partial_cpu_ = nullptr;
+    float* d_partial_cpu_ = nullptr;
+    bool partial_capture_ = false;
+    void router_record();
+    void router_wait();
     std::vector<void*> dev_allocs_, host_allocs_;
     std::vector<void*> graphs_;   ///< every recorded graph, to destroy
     std::map<std::vector<int>, void*> passes_;   ///< a call's layers recorded as one (run()): by its tokens and

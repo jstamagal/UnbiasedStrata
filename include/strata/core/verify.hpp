@@ -27,6 +27,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -287,6 +288,17 @@ public:
         return true;
     }
     double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
+    /// STRATA_PL_PLE_LATE (stage 0): each pipelined window reads its PLE rows through a ticket of its own
+    /// (PleTable::gather_issue_t, so both verifiers of the stage can have a window staged) instead of the table's
+    /// shared prefetch slots, and `service` never waits for them: when layer 0 has been served before they have
+    /// landed, its flag goes up later, once they have, and the host serves the other windows meanwhile.  `run` and the
+    /// batch windows are unchanged.
+    void set_ple_ticketed(bool on) { ple_tk_ = on; }
+    /// set_ple_ticketed: tickets issued, collected at staging or launch (already landed), collected by `service`,
+    /// dropped (a window staged ahead and never launched); windows whose layer-0 flag waited for the rows, and that
+    /// wait (ms, host side)
+    int64_t ple_tk_issued = 0, ple_tk_now = 0, ple_tk_late = 0, ple_tk_dropped = 0, ple_tk_held = 0;
+    double ms_ple_held = 0;
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -365,13 +377,13 @@ private:
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[strata::kernels::kLookupMaxT] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[strata::kernels::kLookupMaxT] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
@@ -400,14 +412,14 @@ private:
             std::chrono::steady_clock::duration(b_last_.load(std::memory_order_acquire)));
     }
     std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
-    int32_t b_out_[8] = {};
+    int32_t b_out_[strata::kernels::kLookupMaxT] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[strata::kernels::kLookupMaxT] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
@@ -421,7 +433,17 @@ private:
     bool always_publish_ = false;
     bool adapt_gate_wait(int32_t layer, std::string& err);
     AdaptGate* adapt_gate_ = nullptr;     ///< 0.1.43: STRATA_ADAPT_OVERLAP's gate (null: off)
-    void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
+    bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
+    // set_ple_ticketed: the ticket of the window staged on this verifier (-1: none outstanding).  h_ple_ is written
+    // only by the collect of the ticket issued for the window staged here: at its staging or launch, or while it runs
+    // but before its layer-0 flag is up (layer 1 copies the rows after that flag).
+    bool ple_tk_ = false;
+    int ple_ticket_ = -1;
+    bool fl_ple_held_ = false;   ///< layer 0 served, its flag held until the window's rows have landed
+    double fl_ple_held_ms_ = 0;
+    /// The outstanding ticket's rows into h_ple_ if they have all landed (never blocks); -1 on an error (`err`), else
+    /// 0 (ple_ticket_ is -1 once they are in).  `late`: polled by `service` (counted apart from staging).
+    int ple_poll(std::string& err, bool late);
     cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
@@ -517,7 +539,7 @@ private:
     float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kLookupMaxT] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
@@ -528,8 +550,8 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    cudaGraphExec_t exec_[strata::kernels::kLookupMaxT + 1] = {};
+    cudaGraphExec_t exec_nr_[strata::kernels::kLookupMaxT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;
@@ -583,7 +605,7 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
-    int groups_[9] = {};
+    int groups_[strata::kernels::kLookupMaxT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
@@ -608,11 +630,26 @@ private:
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+    float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr
+                                  // unless some layer's gate/up is folded
+    const float* had_sx_ = nullptr;   // APR: device sign vectors for x (n_embd) and h (n_ff); nullptr = identity
+    const float* had_sh_ = nullptr;
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
+    // STRATA_HEAD_WIDE=1 (kernels/head_wide.hpp): the head, the greedy pick and the non-finite flag in two launches
+    void* head_wide_scratch_ = nullptr;        ///< the workgroups' picks (its own allocation; null: off)
+    uint32_t* route_done_ = nullptr;           ///< STRATA_ROUTE_PLAN=2: the fused router launch's row counter (device)
+    // STRATA_HEAD_SAMPLE=1 (sample_tokens_staged): a sampled request's draws as nodes of the window's graph
+    void* sp_scratch_ = nullptr;               ///< the split sampler's block lists (its own allocation; null: off)
+    int32_t* sp_dev_ = nullptr;                ///< the device copy of the staged SamplerParams
+    int32_t* h_sp_ = nullptr; int32_t* m_sp_ = nullptr;   ///< one SamplerParams, staged with the window's inputs
+    bool sp_in_graph_ = false;                 ///< the window staged last samples in its graph (no host-side sampling)
+public:
+    long long sp_graph_windows = 0;            ///< windows staged for the graph's sampler (STRATA_HEAD_SAMPLE)
+private:
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

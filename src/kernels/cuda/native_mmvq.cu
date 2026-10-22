@@ -183,6 +183,32 @@ __global__ void native_quantize_q8_1_kernel(const float* x_, Q81Block* y_, int n
     if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
 }
 
+// STRATA_QSA_GATE_Q8=1 (opt-in): a QSA layer's output gate (native_qsa.cu's `gate`: attn * sigmoid(the gate half of
+// the q|gate row)) and the q8_1 quantization of its result in one launch.  Thread i computes element i with `gate`'s
+// expression, stores it, and quantizes it with native_quantize_q8_1_kernel's statements; contraction is off in this
+// body so the product is rounded before the block sum reads it, as it is when it goes through memory.
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_gate_quantize_q8_1_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+                                                 float* __restrict__ out, Q81Block* __restrict__ y, int n_head,
+                                                 int head_dim) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_head * head_dim) return;   // a multiple of 32: only whole warps return
+    const int head = i / head_dim, channel = i % head_dim;
+    const float raw = q_full[std::size_t(head) * 2 * head_dim + head_dim + channel];
+    const float sigmoid = 1.0f / (1.0f + expf(-raw));
+    const float xi = attn[i] * sigmoid;
+    out[i] = xi;
+    const float amax = warp_max(fabsf(xi));
+    const float sum = warp_sum(xi);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    y[i / Q8K].qs[i % Q8K] = q;
+    if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
+}
+
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
                                                    const float* __restrict__ up,
@@ -256,8 +282,8 @@ __device__ __forceinline__ float q5_q8_dot_impl(
         const int v1i = vl1i | vh1i;
         const int dot1 = STRATA_DP4A(v0i, u[2 * i], STRATA_DP4A(v1i, u[2 * i + 1], 0));
         const int dot2 = STRATA_DP4A(0x01010101, u[2 * i], STRATA_DP4A(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * strata_smul(dot1, sc[i]);
+        sumf_m += d8[i] * strata_smul(dot2, m[i]);
     }
     const float2 dm5f = __half22float2(dm5);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
@@ -437,7 +463,7 @@ __device__ __forceinline__ float q3_q8_dot_impl(int vl, int vh, const int* __res
         const int vil = (vl >> (2 * i)) & 0x03030303;
         const int vih = ((vh >> i) << 2) & 0x04040404;
         const int vi = __vsubss4(vil, vih);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        sumf += d8[i] * strata_smul(STRATA_DP4A(vi, u[i], 0), sc);
     }
     return d3 * sumf;
 }
@@ -627,7 +653,7 @@ __device__ __forceinline__ float iq4_xs_q8_dot(const IQ4XSBlock* __restrict__ w,
     }
     const int ls = ((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) |
                    (((w->scales_h >> (iqs / 2)) & 0x03) << 4);
-    sumi *= ls - 32;
+    sumi = strata_smul(sumi, ls - 32);
     const float d = __half2float(w->d) * __low2float(x[iqs / 4].ds);
     return d * sumi;
 }
@@ -684,8 +710,8 @@ __device__ __forceinline__ float q4_q8_dot_impl(
         const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
         const int dot1 = STRATA_DP4A(v1i, u[2 * i + 1], STRATA_DP4A(v0i, u[2 * i], 0));
         const int dot2 = STRATA_DP4A(0x01010101, u[2 * i + 1], STRATA_DP4A(0x01010101, u[2 * i], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * strata_smul(dot1, sc[i]);
+        sumf_m += d8[i] * strata_smul(dot2, m[i]);
     }
     const float2 dm4f = __half22float2(dm4);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
@@ -780,7 +806,7 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
         const int vi = __vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        sumf += d8[i] * strata_smul(STRATA_DP4A(vi, u[i], 0), sc);
     }
     return d * sumf;
 }
@@ -1168,7 +1194,7 @@ struct IQ4XSTraits {
             sumi = STRATA_DP4A(r.v[j].x, u0, sumi);
             sumi = STRATA_DP4A(r.v[j].y, u1, sumi);
         }
-        sumi *= r.ls - 32;
+        sumi = strata_smul(sumi, r.ls - 32);
         const float d = r.dw * __low2float(x[iqs / 4].ds);
         return d * sumi;
     }
@@ -1529,7 +1555,7 @@ template<> struct B6X<Q6KTraits> {
             const int vil = (w.vl >> (4 * i)) & 0x0f0f0f0f;
             const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
             const int vi = __vsubss4(vil | vih, 0x20202020);
-            sumf += x.d8[i] * (STRATA_DP4A(vi, x.u[i], 0) * w.sc[i]);
+            sumf += x.d8[i] * strata_smul(STRATA_DP4A(vi, x.u[i], 0), w.sc[i]);
         }
         return w.d * sumf;
     }
@@ -1582,7 +1608,7 @@ template<> struct B6X<IQ4XSTraits> {
             sumi = STRATA_DP4A(w.v[j].x, x.u0[j], sumi);
             sumi = STRATA_DP4A(w.v[j].y, x.u1[j], sumi);
         }
-        sumi *= w.ls - 32;
+        sumi = strata_smul(sumi, w.ls - 32);
         const float d = w.dw * x.dx;
         return d * sumi;
     }
@@ -1705,15 +1731,23 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
 
 // Several matrices of one format and shape in one launch (native_mmvq_slots, native_mmvq_ids): blockIdx.y is the
 // matrix, and the rest is native_mmvq_multi_kernel for one column in its EXACT layout.
-template<typename F, int ROWS, typename S>
+template<typename F, int ROWS, typename S, bool PARTIAL = false>
 __launch_bounds__(WARPS * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_slots_kernel(S slots, int n_in, int n_out) {
+    const int row0 = ROWS * int(blockIdx.x);
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    if constexpr (PARTIAL) {
+        if (slots.table[slots.ids[blockIdx.y]] == nullptr) {
+            if (tid == 0)
+                for (int i = 0; i < ROWS && row0 + i < n_out; ++i)
+                    slots.y[std::size_t(blockIdx.y) * slots.y_stride + row0 + i] = 0.f;
+            return;
+        }
+    }
     const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
     const auto* w = static_cast<const typename F::Block*>(at.w);
     const auto* x = static_cast<const Q81Block*>(at.x);
     float* y = at.y;
-    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
-    const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / F::DIV;
     float tmp[ROWS] = {};
     for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
@@ -1743,17 +1777,19 @@ __global__ void native_mmvq_slots_kernel(S slots, int n_in, int n_out) {
     }
 }
 
-template<typename F, typename S>
+template<typename F, typename S, bool PARTIAL = false>
 void launch_slots(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
     if (n_in / F::DIV < F::BPI) {
         constexpr int ROWS = 2;
         const dim3 blocks(unsigned((std::size_t(n_out) + ROWS - 1) / ROWS), unsigned(count));
-        native_mmvq_slots_kernel<F, ROWS, S><<<blocks, threads, 0, s>>>(slots, n_in, n_out);
+        native_mmvq_slots_kernel<F, ROWS, S, PARTIAL><<<blocks, threads, 0, s>>>(slots, n_in, n_out);
     } else {
-        native_mmvq_slots_kernel<F, 1, S><<<dim3(unsigned(n_out), unsigned(count)), threads, 0, s>>>(slots, n_in, n_out);
+        native_mmvq_slots_kernel<F, 1, S, PARTIAL><<<dim3(unsigned(n_out), unsigned(count)), threads, 0, s>>>(slots, n_in, n_out);
     }
 }
+
+#include "poly_q40_expert.cuh"
 
 #if !defined(__HIPCC__)   // CUDA only: the HIP paths keep native_mmvq's kernels
 // ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
@@ -1786,7 +1822,7 @@ struct IlIQ4XS {
                 sumi = STRATA_DP4A(r.v[j].x, u0[j][c], sumi);
                 sumi = STRATA_DP4A(r.v[j].y, u1[j][c], sumi);
             }
-            sumi *= r.ls - 32;
+            sumi = strata_smul(sumi, r.ls - 32);
             const float d = r.dw * d8[c];
             out[c] = d * sumi;
         }
@@ -1867,13 +1903,13 @@ struct IlQ3K {
             const int sc_shift_high = 2 * (isc / 4);
             const int sc_high = ((r.scales[8 + isc_high] >> sc_shift_high) & 3) << 4;
             sc[i] = (sc_low | sc_high) - 32;
-            vi[i] = ((r.vl >> (2 * i)) & 0x03030303) | (((r.vh >> i) & 0x01010101) * 252);
+            vi[i] = ((r.vl >> (2 * i)) & 0x03030303) | (int) (strata_bytemask((r.vh >> i) & 0x01010101) & 0xFCFCFCFCu);
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             float sumf = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) sumf += d8[i][c] * (STRATA_DP4A(vi[i], u[i][c], 0) * sc[i]);
+            for (int i = 0; i < 4; ++i) sumf += d8[i][c] * strata_smul(STRATA_DP4A(vi[i], u[i][c], 0), sc[i]);
             out[c] = r.d * sumf;
         }
     }
@@ -2111,9 +2147,198 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 }
 #define STRATA_WAVE_MMVQ(...) \
     if (!g_wave_off) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
+#elif defined(__HIPCC__)
+// ---- STRATA_MMVQ_ROW=1 (opt-in, wave32 AMD; measured on gfx1030): one wavefront per R rows and no shared memory.
+// The default layout gives a row (or two) a block of four wavefronts whose lanes each walk a quarter of the row's
+// weight blocks, park their sums in LDS, join, and let wavefront 0 add them up: for a 2 KB K-quant row that is
+// mostly launching and joining.  Here ONE wavefront does a row: lane x plays the four threads (wavefront v = 0..3,
+// lane x) of the default layout one after the other - the same weight blocks (kbx = tid / T, stride BPI) in the
+// same order with the same F::load / F::apply - and adds the four sums in the order wavefront 0 adds the LDS
+// partials, then the same butterfly.  Every output is BITWISE the default kernel's, for 1..8 columns and for the
+// one-column kernels (which share the multi-column layout's thread mapping).  W wavefronts per block, each with its
+// own R rows.
+int g_row_r = -1, g_row_w = -1;   // native_mmvq_row_tune (tests, benchmarks): -1 = the environment / the table
+int mmvq_row_env(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
+}
+// one wavefront's R rows from row0 (row0 < n_out): the body of both kernels below
+template<typename F, int NCOLS, int R, bool TS>
+__device__ __forceinline__ void mmvq_row_body(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                              float* __restrict__ y, int n_in, int n_out, int row0, int lane) {
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tot[NCOLS][R];
+#pragma unroll
+    for (int v = 0; v < WARPS; ++v) {                 // the default layout's wavefront v, lane `lane`
+        const int tid = WARP * v + lane;
+        const int kqs = F::kqs(tid);
+        float tmp[NCOLS][R] = {};
+        for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+            const int kby = kbx * F::KBY;
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                if (row0 + i < n_out) {
+                    const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < R; ++i) tot[j][i] = v == 0 ? tmp[j][i] : tot[j][i] + tmp[j][i];
+    }
+    if constexpr (TS) {
+        constexpr int V = NCOLS * R, P = s26ts::pow2_ceil(V);
+        float v[P];
+#pragma unroll
+        for (int k = 0; k < P; ++k) v[k] = k < V ? tot[k / R][k % R] : 0.0f;
+        const float sum = s26ts::tsum<P>(v, lane);
+        const int k = s26ts::tsum_token<P>(lane);
+        const int j = k / R, i = k % R;
+        if (lane == s26ts::tsum_lane<P>(k) && k < V && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = sum;
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const float sum = warp_sum(tot[j][i]);
+            if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = sum;
+        }
+}
+template<typename F, int NCOLS, int R, bool TS>
+__launch_bounds__(256)
+__global__ void native_mmvq_row_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                       float* __restrict__ y, int n_in, int n_out) {
+    const int row0 = (int(blockIdx.x) * int(blockDim.y) + int(threadIdx.y)) * R;
+    if (row0 >= n_out) return;
+    mmvq_row_body<F, NCOLS, R, TS>(w, x, y, n_in, n_out, row0, int(threadIdx.x));
+}
+template<typename F, int NCOLS>
+void row_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int r, int wv, cudaStream_t s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const bool ts = s26_tsum_on();
+    const unsigned blocks = unsigned((std::size_t(n_out) + std::size_t(r) * wv - 1) / (std::size_t(r) * wv));
+    const dim3 threads(WARP, unsigned(wv));
+#define STRATA_ROW_GO(R_) \
+    do { if (ts) native_mmvq_row_kernel<F, NCOLS, R_, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); \
+         else native_mmvq_row_kernel<F, NCOLS, R_, false><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); } while (0)
+    if (r == 1) STRATA_ROW_GO(1);
+    else if (r == 2) STRATA_ROW_GO(2);
+    else STRATA_ROW_GO(4);
+#undef STRATA_ROW_GO
+}
+// Where it was measured faster on gfx1030 (2x Radeon PRO V620, hip_mmvq_row_parity --bench, 1.2 GB of weight copies
+// in rotation so no cache holds them, STRATA_TSUM=1, microseconds a call, default -> row):
+//   Q6_K 2560 -> 10240: 1 col 48.8 -> 49.5, 2: 50.8 -> 50.2, 3: 53.0 -> 51.1, 4: 58.7 -> 55.1, 6: 88.7 -> 66.0
+//   Q5_K 2560 -> 10240: 43.8 -> 42.1, 48.8 -> 42.7, 65.5 -> 46.0, 86.1 -> 51.9, 109.5 -> 66.1
+//   Q4_K 2560 -> 6144:  26.8 -> 25.1, 30.6 -> 25.7, 37.8 -> 28.0, 48.6 -> 30.4, 63.6 -> 39.5
+//   IQ4_XS 2560 -> 6144: 28.2 -> 27.0, 29.9 -> 28.3, 32.8 -> 29.4, 35.3 -> 30.0, 42.0 -> 33.1
+//   Q6_K 2560 -> 248320 (the head): 4 cols 1206 -> 1092, 6: 2011 -> 1423
+// Not faster, and left on the default kernels: Q8_0 6144 -> 2560 (40.2 -> 40.4 at 4 columns: it already reads at
+// the card's memory speed) and matrices of a few hundred rows (Q6_K 2560 -> 512: 6.6 -> 7.4).  Q3_K, Q4_0, Q5_0,
+// IQ4_NL and Q2_0 are bitwise equal too but were not timed: they take this kernel only with STRATA_MMVQ_ROW=2 (every
+// type and shape).
+//   Q4_0 2560 -> 10240: 1 col 37.5 -> 35.6, 2: 37.4 -> 35.9, 4: 40.3 -> 36.8; 2560 -> 6144: 25.8 -> 24.8, 26.1 -> 25.0,
+//   28.1 -> 25.3; its 6144 -> 2560 is not faster (24.5 -> 24.7, 24.8 -> 24.9, 28.2 -> 25.2): from 4,096 rows up only
+template<typename F> struct RowTable { static constexpr int kind = 0, min_out = 1 << 30; };   // 0: only when forced
+template<> struct RowTable<Q6KTraits> { static constexpr int kind = 2, min_out = 1024; };     // 1 row a wavefront up to 3 columns
+template<> struct RowTable<Q5KTraits> { static constexpr int kind = 1, min_out = 1024; };     // ... up to 2 columns
+template<> struct RowTable<Q4KTraits> { static constexpr int kind = 1, min_out = 1024; };
+template<> struct RowTable<IQ4XSTraits> { static constexpr int kind = 1, min_out = 1024; };
+template<> struct RowTable<SmallTraits<Q40Block, 4>> { static constexpr int kind = 1, min_out = 4096; };
+template<typename F>
+bool row_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    static const int env_on = mmvq_row_env("STRATA_POLY_MMVQ_ROW", mmvq_row_env("STRATA_MMVQ_ROW", 0));
+    static const int env_r = mmvq_row_env("STRATA_POLY_MMVQ_ROW_R", mmvq_row_env("STRATA_MMVQ_ROW_R", 0));
+    static const int env_w = mmvq_row_env("STRATA_POLY_MMVQ_ROW_W", mmvq_row_env("STRATA_MMVQ_ROW_W", 0));
+    if (g_row_r == 0 || (g_row_r < 0 && env_on == 0)) return false;
+    if (ncols < 1 || ncols > MAX_NCOLS) return false;
+    const int kind = RowTable<F>::kind;
+    if (g_row_r < 0 && env_on < 2 && (kind == 0 || n_out < RowTable<F>::min_out)) return false;   // the table: measured shapes only
+    int r = g_row_r > 0 ? g_row_r : env_r > 0 ? env_r : (ncols <= (kind == 2 ? 3 : 2) ? 1 : 2);
+    int wv = g_row_w > 0 ? g_row_w : env_w > 0 ? env_w : 1;
+    r = r >= 4 ? (ncols <= 4 ? 4 : 2) : r >= 2 ? 2 : 1;      // 4 rows of 5..8 columns would be 32 sums a lane
+    wv = wv >= 8 ? 8 : wv >= 4 ? 4 : wv >= 2 ? 2 : 1;
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: row_launch_n<F, 1>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        case 2: row_launch_n<F, 2>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        case 3: row_launch_n<F, 3>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        case 4: row_launch_n<F, 4>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        case 5: row_launch_n<F, 5>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        case 6: row_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        case 7: row_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+        default: row_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, r, wv, s); break;
+    }
+    return true;
+}
+#define STRATA_WAVE_MMVQ(...) \
+    if (row_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
+
+// ---- STRATA_MMVQ_SET=1 (opt-in): two or three matrices that read the SAME activations (a GDN layer's qkv and gate,
+// a QSA layer's k, v and q) in ONE launch of the kernel above: the grid is the matrices' row blocks one after the
+// other and a block picks its matrix's format at run time.  Each output is computed by mmvq_row_body exactly as a
+// STRATA_MMVQ_ROW launch of its own matrix computes it (so bitwise the default kernels'); a window has one graph
+// node fewer per extra matrix.  Rows a wavefront: the table's (Q8_0, which is not in it: 2).
+template<typename F> constexpr int row_set_rows(int ncols) {
+    return RowTable<F>::kind == 0 ? 2 : ncols <= (RowTable<F>::kind == 2 ? 3 : 2) ? 1 : 2;
+}
+struct RowSetArgs {
+    const void* w[3];
+    float* y[3];
+    int n_out[3], type[3], end[3];   // end[i]: one past matrix i's last block
+};
+template<typename F, int NCOLS, bool TS>
+__device__ __forceinline__ void row_set_item(const RowSetArgs& a, int it, int blk, const Q81Block* __restrict__ x, int n_in,
+                                             int lane) {
+    constexpr int R = row_set_rows<F>(NCOLS);
+    const int row0 = blk * R;
+    if (row0 >= a.n_out[it]) return;
+    mmvq_row_body<F, NCOLS, R, TS>(static_cast<const typename F::Block*>(a.w[it]), x, a.y[it], n_in, a.n_out[it], row0, lane);
+}
+template<int NCOLS, bool TS>
+__launch_bounds__(WARP)
+__global__ void native_mmvq_rowset_kernel(RowSetArgs a, const Q81Block* __restrict__ x, int n_in) {
+    int blk = int(blockIdx.x);
+    const int it = blk < a.end[0] ? 0 : blk < a.end[1] ? 1 : 2;
+    if (it > 0) blk -= a.end[it - 1];
+    const int lane = int(threadIdx.x);
+    switch (a.type[it]) {
+        case 14: row_set_item<Q6KTraits, NCOLS, TS>(a, it, blk, x, n_in, lane); break;
+        case 13: row_set_item<Q5KTraits, NCOLS, TS>(a, it, blk, x, n_in, lane); break;
+        case 12: row_set_item<Q4KTraits, NCOLS, TS>(a, it, blk, x, n_in, lane); break;
+        case 23: row_set_item<IQ4XSTraits, NCOLS, TS>(a, it, blk, x, n_in, lane); break;
+        case 2: row_set_item<SmallTraits<Q40Block, 4>, NCOLS, TS>(a, it, blk, x, n_in, lane); break;
+        default: row_set_item<SmallTraits<Q80Block, 8>, NCOLS, TS>(a, it, blk, x, n_in, lane); break;   // 8
+    }
+}
+int row_set_rows_of(int type, int ncols) {
+    switch (type) {
+        case 14: return row_set_rows<Q6KTraits>(ncols);
+        case 13: return row_set_rows<Q5KTraits>(ncols);
+        case 12: return row_set_rows<Q4KTraits>(ncols);
+        case 23: return row_set_rows<IQ4XSTraits>(ncols);
+        case 2: return row_set_rows<SmallTraits<Q40Block, 4>>(ncols);
+        case 8: return row_set_rows<SmallTraits<Q80Block, 8>>(ncols);
+        default: return 0;
+    }
+}
+template<int NCOLS>
+void row_set_launch(const RowSetArgs& a, const Q81Block* x, int n_in, unsigned blocks, cudaStream_t s) {
+    if (s26_tsum_on()) native_mmvq_rowset_kernel<NCOLS, true><<<blocks, WARP, 0, s>>>(a, x, n_in);
+    else native_mmvq_rowset_kernel<NCOLS, false><<<blocks, WARP, 0, s>>>(a, x, n_in);
+}
+int g_row_set = -1;   // native_mmvq_set_tune: -1 = the environment
 #else
 #define STRATA_WAVE_MMVQ(...)
 #endif
+
+#include "poly_head_wide.cuh"
 
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -2580,18 +2805,82 @@ void native_q6_k_unpack(const void* weights) {
     registry.erase(found);
 }
 
+void native_mmvq_row_tune(int rows, int warps) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    g_row_r = rows;
+    g_row_w = warps;
+#else
+    (void) rows; (void) warps;
+#endif
+}
+void native_mmvq_set_tune(int on) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    g_row_set = on;
+#else
+    (void) on;
+#endif
+}
+static bool mmvq_set_impl(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream, bool explicit_on) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    static const bool env = [] { const char* v = std::getenv("STRATA_POLY_MMVQ_SET");
+        if (v == nullptr) v = std::getenv("STRATA_MMVQ_SET");
+        return v != nullptr && std::atoi(v) != 0; }();
+    if (!explicit_on && !(g_row_set >= 0 ? g_row_set != 0 : env)) return false;
+    if (items == nullptr || n_items < 2 || n_items > 3 || ncols < 1 || ncols > MAX_NCOLS || n_in <= 0 || n_in % QK != 0 ||
+        x_q8_1 == nullptr || stream == nullptr || !g_multi_exact)
+        return false;
+    RowSetArgs a{};
+    long long blocks = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (i < n_items) {
+            const NativeMmvqItem& it = items[i];
+            const int r = row_set_rows_of(it.type, ncols);
+            // a matrix with a packed copy registered (STRATA_Q8_PACKED / STRATA_Q6_PACKED) keeps its own kernel
+            if (r == 0 || it.weights == nullptr || it.y == nullptr || it.n_out <= 0 ||
+                q8_packed_registry().count(it.weights) != 0 || q6_packed_registry().count(it.weights) != 0)
+                return false;
+            a.w[i] = it.weights; a.y[i] = it.y; a.n_out[i] = it.n_out; a.type[i] = it.type;
+            blocks += (it.n_out + r - 1) / r;
+        }
+        a.end[i] = (int) blocks;
+    }
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: row_set_launch<1>(a, x, n_in, (unsigned) blocks, s); break;
+        case 2: row_set_launch<2>(a, x, n_in, (unsigned) blocks, s); break;
+        case 3: row_set_launch<3>(a, x, n_in, (unsigned) blocks, s); break;
+        case 4: row_set_launch<4>(a, x, n_in, (unsigned) blocks, s); break;
+        case 5: row_set_launch<5>(a, x, n_in, (unsigned) blocks, s); break;
+        case 6: row_set_launch<6>(a, x, n_in, (unsigned) blocks, s); break;
+        case 7: row_set_launch<7>(a, x, n_in, (unsigned) blocks, s); break;
+        default: row_set_launch<8>(a, x, n_in, (unsigned) blocks, s); break;
+    }
+    launch_check();
+    return true;
+#else
+    (void) items; (void) n_items; (void) x_q8_1; (void) n_in; (void) ncols; (void) stream; (void) explicit_on;
+    return false;
+#endif
+}
+bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream) {
+    return mmvq_set_impl(items, n_items, x_q8_1, n_in, ncols, stream, false);
+}
+bool native_mmvq_set_explicit(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream) {
+    return mmvq_set_impl(items, n_items, x_q8_1, n_in, ncols, stream, true);
+}
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
 int native_mmvq_b6_rows() { return g_b6_rows; }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, ncols > 8 && ncols <= 12 ? 8 : ncols);
     return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
 }
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, ncols > 8 && ncols <= 12 ? 8 : ncols);
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_stream(stream);
@@ -2604,9 +2893,29 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     launch_check();
 }
 
+bool native_gate_quantize_q8_1(const float* attn, const float* q_full, float* out, void* x_q8_1, int n_head,
+                               int head_dim, void* stream) {
+#if defined(__HIPCC__)
+    if (attn == nullptr || q_full == nullptr || out == nullptr || x_q8_1 == nullptr || stream == nullptr || n_head <= 0 ||
+        head_dim <= 0 || head_dim % Q8K != 0 || std::size_t(n_head) * head_dim > std::size_t(std::numeric_limits<int>::max()) ||
+        reinterpret_cast<std::uintptr_t>(attn) % 4 || reinterpret_cast<std::uintptr_t>(q_full) % 4 ||
+        reinterpret_cast<std::uintptr_t>(out) % 4 || reinterpret_cast<std::uintptr_t>(x_q8_1) % 4)
+        return false;
+    const int n_total = n_head * head_dim;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_gate_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        attn, q_full, out, static_cast<Q81Block*>(x_q8_1), n_head, head_dim);
+    launch_check();
+    return true;
+#else
+    (void) attn; (void) q_full; (void) out; (void) x_q8_1; (void) n_head; (void) head_dim; (void) stream;
+    return false;
+#endif
+}
+
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, ncols > 8 && ncols <= 12 ? 8 : ncols);
     validate_pointer(gate);
     validate_pointer(up);
     validate_pointer(x_q8_1);
@@ -2961,6 +3270,23 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+#if defined(__HIPCC__)
+    if (poly_head_two_wave_enabled(n_in, n_out, ncols)) {
+        poly_head_two_wave(weights, x_q8_1, y, n_out, ncols, static_cast<cudaStream_t>(stream));
+        launch_check();
+        return;
+    }
+    if (poly_head_wave_enabled(n_in, n_out, ncols)) {
+        poly_head_wave(weights, x_q8_1, y, n_out, ncols, static_cast<cudaStream_t>(stream));
+        launch_check();
+        return;
+    }
+    if (poly_head_wide_enabled(n_in, n_out, ncols)) {
+        poly_head_wide(weights, x_q8_1, y, n_out, static_cast<cudaStream_t>(stream));
+        launch_check();
+        return;
+    }
+#endif
     STRATA_WAVE_MMVQ(Q6KTraits)
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3109,6 +3435,15 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+    // Extended lookup windows reuse the exact <=8-column kernels. Quantized columns
+    // are contiguous; splitting here does not change a row's reduction order.
+    if (ncols > 8 && ncols <= 12) {
+        const auto* x = static_cast<const Q81Block*>(x_q8_1);
+        native_mmvq(ggml_type, weights, x, y, n_in, n_out, 8, stream);
+        native_mmvq(ggml_type, weights, x + (size_t) 8 * (n_in / Q8K), y + (size_t) 8 * n_out,
+                    n_in, n_out, ncols - 8, stream);
+        return;
+    }
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
@@ -3128,6 +3463,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
 }
+
 
 namespace {
 
@@ -3157,7 +3493,15 @@ void launch_slots_of(int ggml_type, const S& slots, int count, int n_in, int n_o
     }
     const auto s = static_cast<cudaStream_t>(stream);
     switch (ggml_type) {
-    case 2: launch_slots<SmallTraits<Q40Block, 4>>(slots, count, n_in, n_out, s); break;
+    case 2:
+#if defined(__HIPCC__)
+        if (poly_q40_expert_enabled(n_in, n_out)) {
+            poly_q40_expert_slots(slots, count, n_in, n_out, s);
+            break;
+        }
+#endif
+        launch_slots<SmallTraits<Q40Block, 4>>(slots, count, n_in, n_out, s);
+        break;
     case 6: launch_slots<SmallTraits<Q50Block, 4>>(slots, count, n_in, n_out, s); break;
     case 8: launch_slots<SmallTraits<Q80Block, 8>>(slots, count, n_in, n_out, s); break;
     case 20: launch_slots<SmallTraits<IQ4NLBlock, 4>>(slots, count, n_in, n_out, s); break;
@@ -3199,6 +3543,22 @@ bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int
     validate_pointer(ids.x);
     validate_pointer(ids.y);
     launch_slots_of(ggml_type, ids, count, n_in, n_out, stream);
+    return true;
+}
+
+bool native_mmvq_ids_partial(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
+    if (ggml_type != 2) return false;
+    if (n_out <= 0 || count < 1 || count > 65535 || ids.x_every < 1)
+        throw std::invalid_argument("native_mmvq_ids_partial requires valid rows and expert count");
+    validate_pointer(ids.table);
+    validate_pointer(ids.ids);
+    validate_pointer(ids.x);
+    validate_pointer(ids.y);
+    validate_shape(n_in, 1, 32);
+    validate_stream(stream);
+    launch_slots<SmallTraits<Q40Block, 4>, MmvqIds, true>(ids, count, n_in, n_out,
+                                                            static_cast<cudaStream_t>(stream));
+    launch_check();
     return true;
 }
 

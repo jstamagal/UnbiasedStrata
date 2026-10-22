@@ -214,9 +214,9 @@ bool fused_swiglu_q81_enabled() {
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
-    const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
-    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
-        throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
+    const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0, set = (lfuse & 4) != 0;
+    if (n_tok < 1 || n_tok > 12 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
+        throw std::invalid_argument("shared_expert_multi: needs 1..12 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
     // the activation's q8_1: the caller's (STRATA_VERIFY_QDEDUP, x_q8_1_ready) or the descriptor's, else quantized here
     const void* x_q8_1 = x_q8_1_ready ? x_q8_1_ready : nw.x_q8_1;
@@ -224,6 +224,11 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
     }
+    // STRATA_NODE_FUSE (set): gate and up through native_mmvq_set (STRATA_MMVQ_SET's kernel, each output bitwise its
+    // own native_mmvq call's); where it does not apply, as before
+    const NativeMmvqItem gu[2] = {{nw.gate_type, nw.gate_data, gate, (int) n_ff}, {nw.up_type, nw.up_data, up, (int) n_ff}};
+    if (set && native_mmvq_set(gu, 2, x_q8_1, (int) n_embd, n_tok, stream)) {
+    } else
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
     if (!(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
@@ -333,14 +338,22 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // gate and up projections, then silu(gate) * up in place in `gate`
     if (native_gate || native_up)
         native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, stream);
-    if (native_gate)
-        native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
-    else
-        gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
-    if (native_up)
-        native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
-    else
-        gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
+    bool set_done = false;
+    if (native_gate && native_up && native->fuse_set) {
+        const NativeMmvqItem items[] = {{native->gate_type, native->gate_data, gate, (int) n_ff},
+                                       {native->up_type, native->up_data, up, (int) n_ff}};
+        set_done = native_mmvq_set_explicit(items, 2, native->q8_1, (int) n_embd, 1, stream);
+    }
+    if (!set_done) {
+        if (native_gate)
+            native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
+        else
+            gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
+        if (native_up)
+            native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
+        else
+            gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
+    }
     if (native_projection && native_down && fused_swiglu_q81_enabled()) {
         native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);

@@ -67,14 +67,29 @@ __global__ void apply(const float* x, float* out, int rows, int width,
     out[start + pair + n_rot / 2] = a * s + b * c;
 }
 
-template <bool TAB>
-__global__ void norm_rope_kernel(const float* x, int in_stride, const float* __restrict__ gamma, float* out,
-                                 int n_cols, int n_rot, float epsilon, float theta_scale,
-                                 float freq_scale, float corr_low, float corr_high,
-                                 float ext_factor, float mscale, const int* positions,
-                                 const int32_t* mtab, RopeTab rt) {
+// HIP (STRATA_NORM_ROPE=2 / 3): the rotation written as `apply` writes it, so the compiler makes of it what it makes
+// of `apply` (FORM 1), or with contraction off (FORM 2).  FORM 0 is the CUDA kernel's explicit fused multiply-adds,
+// which is what nvcc makes of `apply` but not what amdclang does on every card (rope_parity check 6 fails with it on
+// gfx1151 and on gfx1030).  hip_norm_rope_parity says which form is bitwise the two kernels on a given card.
+__device__ __forceinline__ void rope_pair_as_apply(float a, float b, float c, float s, float* lo, float* hi) {
+    *lo = a * c - b * s;
+    *hi = a * s + b * c;
+}
+__device__ __forceinline__ void rope_pair_strict(float a, float b, float c, float s, float* lo, float* hi) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const float ac = a * c, bs = b * s, as = a * s, bc = b * c;
+    *lo = ac - bs;
+    *hi = as + bc;
+}
+template <bool TAB, int FORM = 0>
+__device__ __forceinline__ void norm_rope_body(const int row, const float* x, int in_stride, const float* __restrict__ gamma,
+                                               float* out, int n_cols, int n_rot, float epsilon, float theta_scale,
+                                               float freq_scale, float corr_low, float corr_high,
+                                               float ext_factor, float mscale, const int* positions,
+                                               const int32_t* mtab, RopeTab rt) {
     const int tid = threadIdx.x;
-    const int row = blockIdx.x;
     const float* in_row = x + size_t(row) * in_stride;
     float* out_row = out + size_t(row) * n_cols;
     float partial = 0.0f;
@@ -113,6 +128,14 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
             const float theta_extrap = mrope_pos(mtab, positions[row], pair) * powf(theta_scale, float(pair));
             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
         }
+        if constexpr (FORM == 1) {
+            rope_pair_as_apply(a, b, c, s, &out_row[pair], &out_row[pair + half_rot]);
+            return;
+        }
+        if constexpr (FORM == 2) {
+            rope_pair_strict(a, b, c, s, &out_row[pair], &out_row[pair + half_rot]);
+            return;
+        }
         float bs = b * s;
         float bc = b * c;
 #if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
@@ -122,6 +145,27 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
         out_row[pair] = fmaf(a, c, -bs);
         out_row[pair + half_rot] = fmaf(a, s, bc);
     }
+}
+template <bool TAB, int FORM = 0>
+__global__ void norm_rope_kernel(const float* x, int in_stride, const float* __restrict__ gamma, float* out,
+                                 int n_cols, int n_rot, float epsilon, float theta_scale,
+                                 float freq_scale, float corr_low, float corr_high,
+                                 float ext_factor, float mscale, const int* positions,
+                                 const int32_t* mtab, RopeTab rt) {
+    norm_rope_body<TAB, FORM>(blockIdx.x, x, in_stride, gamma, out, n_cols, n_rot, epsilon, theta_scale, freq_scale,
+                              corr_low, corr_high, ext_factor, mscale, positions, mtab, rt);
+}
+// STRATA_NODE_FUSE: up to three native_qsa_rms_norm_rope calls in one launch; block b runs item i's row b - first_i
+// exactly as that call's block would
+template <bool TAB, int FORM = 0>
+__global__ void norm_rope_multi_kernel(NormRopeItems its, int n_rot, float epsilon, float theta_scale,
+                                       float freq_scale, float corr_low, float corr_high,
+                                       float ext_factor, float mscale, const int32_t* mtab, RopeTab rt) {
+    int row = blockIdx.x, i = 0;
+    while (i + 1 < its.n && row >= its.it[i].rows) { row -= its.it[i].rows; ++i; }
+    const NormRopeItem& t = its.it[i];
+    norm_rope_body<TAB, FORM>(row, t.x, t.in_stride, t.gamma, t.out, t.head_dim, n_rot, epsilon, theta_scale, freq_scale,
+                              corr_low, corr_high, ext_factor, mscale, t.positions, mtab, rt);
 }
 }
 // one table per device (a layer split runs the rope kernels on several): set and read for the current device
@@ -172,6 +216,23 @@ RopeTab rope_table_for(const RopeScaling& scaling) {
 }
 void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
+namespace {
+int g_norm_rope_form = -1;   // native_norm_rope_tune (tests): -1 = STRATA_NORM_ROPE's value
+int norm_rope_form() {
+#if defined(__HIPCC__)
+    if (g_norm_rope_form >= 0) return g_norm_rope_form;
+    static const int form = [] {
+        const char* v = std::getenv("STRATA_NORM_ROPE");   // 1: the CUDA form, 2: as `apply`, 3: contraction off
+        const int n = v != nullptr ? std::atoi(v) : 0;
+        return n == 2 ? 1 : n == 3 ? 2 : 0;
+    }();
+    return form;
+#else
+    return 0;
+#endif
+}
+}  // namespace
+void native_norm_rope_tune(int form) { g_norm_rope_form = form; }
 bool native_norm_rope_usable(int head_dim, int n_rot) {
     static const bool on = [] {
         const char* off = std::getenv("STRATA_NO_NORM_ROPE");
@@ -217,9 +278,9 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
-void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
+static void norm_rope_impl(const float* x, int in_stride, const float* gamma, float* out,
                               int rows, int head_dim, int n_rot, float epsilon,
-                              const RopeScaling& scaling, const int* positions, void* stream) {
+                              const RopeScaling& scaling, const int* positions, void* stream, int form) {
     if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
         (head_dim != 128 && head_dim != 256) || in_stride < head_dim || n_rot != 64 ||
         !std::isfinite(epsilon) || epsilon < 0.0f ||
@@ -231,15 +292,62 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
     const RopeKernelArgs k = scaling.kernel_args(n_rot);
     const RopeTab rt = rope_table_for(scaling);
-    if (rt.cos != nullptr)
-        norm_rope_kernel<true><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-            x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale,
-            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt);
-    else
-        norm_rope_kernel<false><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-            x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale,
-            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt);
+#define STRATA_NR_GO(TAB_, FORM_) \
+    norm_rope_kernel<TAB_, FORM_><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>( \
+        x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale, \
+        k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt)
+    if (rt.cos != nullptr) {
+        if (form == 1) STRATA_NR_GO(true, 1); else if (form == 2) STRATA_NR_GO(true, 2); else STRATA_NR_GO(true, 0);
+    } else {
+        if (form == 1) STRATA_NR_GO(false, 1); else if (form == 2) STRATA_NR_GO(false, 2); else STRATA_NR_GO(false, 0);
+    }
+#undef STRATA_NR_GO
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+bool native_qsa_rms_norm_rope_multi(const NormRopeItems& its, int n_rot, float epsilon, const RopeScaling& scaling,
+                                    void* stream) {
+    if (its.n < 1 || its.n > kNormRopeItems || !stream || n_rot != 64 || !std::isfinite(epsilon) || epsilon < 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        return false;
+    int rows = 0;
+    for (int i = 0; i < its.n; ++i) {
+        const NormRopeItem& t = its.it[i];
+        if (!t.x || !t.gamma || !t.out || !t.positions || t.rows < 1 || (t.head_dim != 128 && t.head_dim != 256) ||
+            t.in_stride < t.head_dim || !native_norm_rope_usable(t.head_dim, n_rot) ||
+            reinterpret_cast<uintptr_t>(t.x) % 4 || reinterpret_cast<uintptr_t>(t.gamma) % 4 ||
+            reinterpret_cast<uintptr_t>(t.out) % 4 || reinterpret_cast<uintptr_t>(t.positions) % 4)
+            return false;
+        rows += t.rows;
+    }
+    if (rows > 65535) return false;
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
+    const RopeKernelArgs k = scaling.kernel_args(n_rot);
+    const RopeTab rt = rope_table_for(scaling);
+#define STRATA_NRM_GO(TAB_, FORM_) \
+    norm_rope_multi_kernel<TAB_, FORM_><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>( \
+        its, n_rot, epsilon, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, \
+        mrope_table(), rt)
+    const int form = norm_rope_form();
+    if (rt.cos != nullptr) {
+        if (form == 1) STRATA_NRM_GO(true, 1); else if (form == 2) STRATA_NRM_GO(true, 2); else STRATA_NRM_GO(true, 0);
+    } else {
+        if (form == 1) STRATA_NRM_GO(false, 1); else if (form == 2) STRATA_NRM_GO(false, 2); else STRATA_NRM_GO(false, 0);
+    }
+#undef STRATA_NRM_GO
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    return true;
+}
+void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
+                              int rows, int head_dim, int n_rot, float epsilon,
+                              const RopeScaling& scaling, const int* positions, void* stream) {
+    norm_rope_impl(x, in_stride, gamma, out, rows, head_dim, n_rot, epsilon, scaling, positions, stream, norm_rope_form());
+}
+void native_qsa_rms_norm_rope_exact(const float* x, int in_stride, const float* gamma, float* out,
+                                   int rows, int head_dim, int n_rot, float epsilon,
+                                   const RopeScaling& scaling, const int* positions, void* stream) {
+    norm_rope_impl(x, in_stride, gamma, out, rows, head_dim, n_rot, epsilon, scaling, positions, stream, 1);
 }
 }

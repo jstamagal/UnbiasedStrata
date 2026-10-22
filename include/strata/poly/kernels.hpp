@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "strata/kernels/rope_scaling.hpp"
 
 namespace strata::poly {
 
@@ -125,6 +126,9 @@ void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float 
 void geglu(const float* gate, const float* up, float* out, int n, void* stream);
 /// geglu for rows that each hold n gate values and then n up values; out has n values a row.
 void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream);
+/// SwiGLU/GEGLU of interleaved gate/up expert rows directly into Q8_1 blocks.
+void expert_activation_q8(const float* gate_up, void* out, int n, int rows, float limit,
+                          bool gelu, void* stream);
 /// The routing of `rows` tokens from their router scores (n_expert a token, times in_scale), as an architecture's
 /// route() does it on the host: probabilities by `gate` (0 softmax, 1 sigmoid, 2 sqrt(softplus)), the n_used
 /// largest of the probabilities plus `bias` (null: none), the lower expert first among equals; their weights are the
@@ -165,7 +169,8 @@ void add_bias(const float* b, float* acc, int n, int rows, void* stream);
 /// launch recorded once can then be replayed for every position (attend() and store_f16_at() take it too).
 void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int dim, int heads, int n_rot,
                     float theta_scale, int64_t pos, int rows, float eps, void* stream, const float* freq = nullptr,
-                    const int32_t* axes = nullptr, int sections = 1, const long long* at = nullptr);
+                    const int32_t* axes = nullptr, int sections = 1, const long long* at = nullptr,
+                    const strata::kernels::RopeKernelArgs* rope = nullptr);
 /// An attention cache stored as ggml Q8_0: a row is `n` int8 codes and `n / 32` fp16 scales with
 /// `n = kv_heads * dim`, row-major (`codes[row * n + blk * 32 + j]`, `scales[row * (n / 32) + blk]`).
 /// A q8 read is active wherever `codes` is not null.  The value a block holds is
@@ -253,7 +258,8 @@ void shortconv(const float* bcx, float* state, const float* w, float* out, int c
 /// out = rms_norm(o) * o_norm * silu(z), n_head * dim values a token.  qkv, alpha and beta are overwritten.
 void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const float* a, float* s,
               const float* z, const float* o_norm, float* out, int dim, int n_head, int k_heads, int rows,
-              float norm_eps, void* stream, float* snap = nullptr, size_t stride = 0, unsigned snaps = 0);
+              float norm_eps, void* stream, float* snap = nullptr, size_t stride = 0, unsigned snaps = 0,
+              bool qk_pre_normed = false, bool gates_precomputed = false);
 
 // ---- DeepSeek V4 (deepseek4): one key head that is its value too, a window of raw rows, rows compressed 4 or 128
 // to one, and an indexer that picks among the 4-to-1 rows

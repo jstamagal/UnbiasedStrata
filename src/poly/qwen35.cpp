@@ -3,6 +3,7 @@
 #include "qwen35.hpp"
 
 #include "runtime.hpp"
+#include "qwen35_fuse.hpp"
 #include "strata/poly/kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -77,6 +78,25 @@ void Qwen35::load_geometry() {
     }
     sections_ = covered;
     theta_scale_ = std::pow(shape_f("rope.freq_base"), -2.f / (float) n_rot_);
+    if (opt_.rope_scaling != "none" || opt_.rope_scale != 1.0) {
+        const char* enabled = std::getenv("STRATA_POLY_YARN");
+        need(enabled && std::string(enabled) == "1", "RoPE scaling requires STRATA_POLY_YARN=1");
+        strata::kernels::RopeScaling sc;
+        if (opt_.rope_scaling == "yarn") sc.type = strata::kernels::RopeScalingType::YaRN;
+        else if (opt_.rope_scaling == "linear") sc.type = strata::kernels::RopeScalingType::Linear;
+        else throw std::runtime_error("--rope-scaling must be yarn or linear when --rope-scale is set");
+        sc.factor = opt_.rope_scale;
+        sc.freq_base = shape_f("rope.freq_base");
+        sc.orig_ctx = shape_i("context_length");
+        if (const auto* original = find("rope.scaling.original_context_length")) sc.orig_ctx = original->u;
+        sc.ext_factor = sc.type == strata::kernels::RopeScalingType::YaRN ? 1.0 : 0.0;
+        if (const char* why = strata::kernels::rope_scaling_invalid(sc)) throw std::runtime_error(why);
+        rope_args_ = sc.kernel_args(n_rot_);
+        rope_scaled_ = true;
+        std::fprintf(stderr, "poly: RoPE %s x%.6g, original context %.0f\n",
+                     opt_.rope_scaling.c_str(), sc.factor, sc.orig_ctx);
+    }
+
 
     // this architecture puts no limit on a SwiGLU's inputs
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
@@ -277,23 +297,54 @@ void Qwen35::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int
 // The gated delta net.  One projection gives the queries, keys and values, which a convolution over the last
 // four tokens mixes; another gives the gate of the output.
 void Qwen35::gdn(Block& B, int n) {
-    lin(B.wqkv, xn_, proj_, n, xq_);
-    lin(B.wz, xn_, z_, n, xq_);
-    lin(B.alpha, xn_, alpha_, n, xq_);
-    lin(B.beta, xn_, beta_, n, xq_);
+    const kernels::NativeMmvqItem gdn_proj[] = {
+        {(int) B.wqkv.type, B.wqkv.p, proj_, (int) B.wqkv.n_out},
+        {(int) B.wz.type, B.wz.p, z_, (int) B.wz.n_out},
+    };
+    if (n != 1 || !kernels::native_mmvq_set(gdn_proj, 2, xq_, n_embd_, 1, st_)) {
+        lin(B.wqkv, xn_, proj_, n, xq_);
+        lin(B.wz, xn_, z_, n, xq_);
+    }
+    static const bool fuse = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
+        return v && std::atoi(v) == 1;
+    }();
+    const bool conv_normed = fuse && n == 1 && !opt_.dump;
+    const bool gates_fused = fuse && n == 1 && !opt_.dump &&
+                             B.alpha.type == kTypeF32 && B.beta.type == kTypeF32;
+    if (gates_fused) {
+        qwen35_alpha_beta_gates(fp(B.alpha), fp(B.beta), xn_, fp(B.dt), fp(B.a), alpha_, beta_, n_embd_,
+                                v_heads_, n, sum_threads(n_embd_), st_);
+    } else if (fuse && n <= 8 && B.alpha.type == kTypeF32 && B.beta.type == kTypeF32) {
+        qwen35_alpha_beta(fp(B.alpha), fp(B.beta), xn_, alpha_, beta_, n_embd_, v_heads_, n,
+                          sum_threads(n_embd_), st_);
+    } else {
+        lin(B.alpha, xn_, alpha_, n, xq_);
+        lin(B.beta, xn_, beta_, n, xq_);
+    }
     if (rows_of_) {   // step(): each row with its own sequence's convolution and state
         for (int i = 0; i < n; ++i) {
             const int s = rows_of_[i].seq;
             const size_t c = (size_t) i * conv_dim_, h = (size_t) i * v_heads_, d = (size_t) i * d_inner_;
-            conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, 1, st_);
+            if (conv_normed)
+                qwen35_conv_norm1(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c,
+                                   conv_dim_, s_dim_, k_heads_, rms_eps_, nullptr, st_);
+            else
+                conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, 1, st_);
             gdn_step(qkv_ + c, alpha_ + h, beta_ + h, fp(B.dt), fp(B.a), seq_state(s, B.s), z_ + d, fp(B.o_norm),
-                     gated_ + d, s_dim_, v_heads_, k_heads_, 1, rms_eps_, st_);
+                     gated_ + d, s_dim_, v_heads_, k_heads_, 1, rms_eps_, st_, nullptr, 0, 0, conv_normed,
+                     gates_fused);
         }
     } else {
-        conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
-                   snap_bits_ ? snap_at_ + (B.past - state_) : nullptr, rec_n_, snap_bits_);
+        if (conv_normed)
+            qwen35_conv_norm1(proj_, B.past, fp(B.conv), qkv_, conv_dim_, s_dim_, k_heads_, rms_eps_,
+                               (snap_bits_ & 1u) ? snap_at_ + (B.past - state_) : nullptr, st_);
+        else
+            conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
+                       snap_bits_ ? snap_at_ + (B.past - state_) : nullptr, rec_n_, snap_bits_);
         gdn_step(qkv_, alpha_, beta_, fp(B.dt), fp(B.a), B.s, z_, fp(B.o_norm), gated_, s_dim_, v_heads_, k_heads_, n,
-                 rms_eps_, st_, snap_bits_ ? snap_at_ + (B.s - state_) : nullptr, rec_n_, snap_bits_);
+                 rms_eps_, st_, snap_bits_ ? snap_at_ + (B.s - state_) : nullptr, rec_n_, snap_bits_, conv_normed,
+                 gates_fused);
     }
     lin(B.wo, gated_, ao_, n);
 }
@@ -349,7 +400,7 @@ void Qwen35::attn_store(Block& B, int64_t pos, int n) {
     const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens from what at_ holds
     lin(B.wk, xn_, kraw_, n, xq_);
     head_norm_rope(kraw_, head_dim_, fp(B.k_norm), k_, head_dim_, n_kv_, n_rot_, theta_scale_, first, n, rms_eps_, st_,
-                   nullptr, axes, sections_, at ? at + 1 : nullptr);
+                   nullptr, axes, sections_, at ? at + 1 : nullptr, rope_scaled_ ? &rope_args_ : nullptr);
     lin(B.wv, xn_, v_, n, xq_);
     if (opt_.kv_format == KvFmt::kQ8_0) {
         if (at) {
@@ -384,7 +435,7 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
     const long long* at = recording_ ? at_ : nullptr;
     lin(B.wq, xn_, qg_, n, xq_);
     head_norm_rope(qg_, 2 * head_dim_, fp(B.q_norm), q_, head_dim_, n_head_, n_rot_, theta_scale_, first, n, rms_eps_,
-                   st_, nullptr, axes, sections_, at ? at + 1 : nullptr);
+                   st_, nullptr, axes, sections_, at ? at + 1 : nullptr, rope_scaled_ ? &rope_args_ : nullptr);
     attn_store(B, pos, n);
     const float scale = 1.f / std::sqrt((float) head_dim_);
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
@@ -404,8 +455,18 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
         attend(q_, q8 ? nullptr : B.keys, q8 ? nullptr : B.vals, pos, n, score_, chunk_, att_, head_dim_, n_head_,
                n_kv_, scale, st_, 0, 0, false, at, at ? room(n) : 0, /*score_floats*/ 0,
                q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{});
-    mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
-    lin(B.wo, att_, ao_, n);
+    static const bool fuse_attn_gate = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
+        return v && std::atoi(v) == 1;
+    }();
+    if (fuse_attn_gate && n == 1 && !opt_.dump && head_dim_ % 32 == 0 &&
+        B.wo.type != kTypeF32 && B.wo.type != kTypeBF16) {
+        qwen35_attn_gate_q8(att_, qg_ + head_dim_, q8_, n_head_, head_dim_, st_);
+        lin(B.wo, att_, ao_, n, q8_);
+    } else {
+        mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
+        lin(B.wo, att_, ao_, n);
+    }
 }
 
 // step()'s rows, each of its own sequence: the products for all of them at once, each row's position from at_, and
@@ -423,9 +484,9 @@ void Qwen35::attn_rows(Block& B, int n) {
         const long long* ai = at + 2 * i;
         // a row at a time: the turn takes one position and counts on from it, which suits a window's rows only
         head_norm_rope(qg_ + 2 * i * hq, 2 * head_dim_, fp(B.q_norm), q_ + i * hq, head_dim_, n_head_, n_rot_,
-                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
+                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1, rope_scaled_ ? &rope_args_ : nullptr);
         head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, 1,
-                       rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
+                       rms_eps_, st_, nullptr, nullptr, sections_, ai + 1, rope_scaled_ ? &rope_args_ : nullptr);
         Kvq8 kq{}, vq{};
         uint16_t *kc = nullptr, *vc = nullptr;
         if (q8) {
@@ -446,23 +507,47 @@ void Qwen35::attn_rows(Block& B, int n) {
         attend(q_ + i * hq, kc, vc, r.pos, 1, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_, 0, 0,
                false, ai, sized, 0, kq, vq);
     }
-    mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
-    lin(B.wo, att_, ao_, n);
+    static const bool fuse_attn_rows_gate = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
+        return v && std::atoi(v) == 1;
+    }();
+    if (fuse_attn_rows_gate && n == 1 && !opt_.dump && head_dim_ % 32 == 0 &&
+        B.wo.type != kTypeF32 && B.wo.type != kTypeBF16) {
+        qwen35_attn_gate_q8(att_, qg_ + head_dim_, q8_, n_head_, head_dim_, st_);
+        lin(B.wo, att_, ao_, n, q8_);
+    } else {
+        mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
+        lin(B.wo, att_, ao_, n);
+    }
 }
 
 // A layer from its input to its router's copy.  A prompt batch's MoE (moe_rows) does its own routing.
 void Qwen35::layer_head(Layer& L, int il, int n) {
     Block& B = blocks_[(size_t) il];
-    rms_norm(r_, fp(L.attn_norm), xn_, n_embd_, n, rms_eps_, st_);
-    kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    static const bool fuse = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
+        return v && std::atoi(v) == 1;
+    }();
+    const bool quick = fuse && n <= 8 && !opt_.dump;
+    if (quick)
+        kernels::native_add_rms_norm_q8_1(r_, nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                           sum_threads(n_embd_), st_);
+    else {
+        rms_norm(r_, fp(L.attn_norm), xn_, n_embd_, n, rms_eps_, st_);
+        kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    }
     dbg("attn_in", il, xn_, n_embd_);
     if (B.gdn) gdn(B, n);
     else attn(B, pos_, n);
     dbg("attn", il, ao_, n_embd_);
-    axpy(ao_, 1.f, r_, n * n_embd_, true, st_);
-
-    rms_norm(r_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
-    kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    if (quick)
+        kernels::native_add_rms_norm_q8_1(r_, ao_, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                           sum_threads(n_embd_), st_);
+    else {
+        axpy(ao_, 1.f, r_, n * n_embd_, true, st_);
+        rms_norm(r_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
+        kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    }
     dbg("ffn_in", il, xn_, n_embd_);
     if (!batched(L, n)) moe_router(L, n);
 }
@@ -502,10 +587,26 @@ bool Qwen35::route_card(int, int n, int32_t* ids, float* w) {
 
 // The shared expert, times the sigmoid of its own gate.  It runs on the GPU while the host routes.
 void Qwen35::moe_shared(const Layer& L, int il, int n) {
-    lin(L.sh_gate, xn_, g_, n, xq_);
-    lin(L.sh_up, xn_, u_, n, xq_);
-    swiglu_clamp(g_, u_, h_, n * n_ff_shexp_, clamp_shexp_[(size_t) il], st_);
-    lin(L.sh_down, h_, fo_, n);
+    const kernels::NativeMmvqItem shared_proj[] = {
+        {(int) L.sh_gate.type, L.sh_gate.p, g_, (int) L.sh_gate.n_out},
+        {(int) L.sh_up.type, L.sh_up.p, u_, (int) L.sh_up.n_out},
+    };
+    if (n != 1 || !kernels::native_mmvq_set(shared_proj, 2, xq_, n_embd_, 1, st_)) {
+        lin(L.sh_gate, xn_, g_, n, xq_);
+        lin(L.sh_up, xn_, u_, n, xq_);
+    }
+    static const bool fuse = [] {
+        const char* v = std::getenv("STRATA_POLY_Q35_FUSE");
+        return v && std::atoi(v) == 1;
+    }();
+    if (fuse && n <= 8 && !opt_.dump && std::isinf(clamp_shexp_[(size_t) il]) &&
+        L.sh_down.type != kTypeF32 && L.sh_down.type != kTypeBF16 && n_ff_shexp_ % 32 == 0) {
+        kernels::native_swiglu_quantize_q8_1(g_, u_, q8_, n_ff_shexp_, n, st_);
+        lin(L.sh_down, h_, fo_, n, q8_);
+    } else {
+        swiglu_clamp(g_, u_, h_, n * n_ff_shexp_, clamp_shexp_[(size_t) il], st_);
+        lin(L.sh_down, h_, fo_, n);
+    }
     lin(blocks_[(size_t) il].sh_gate_inp, xn_, sg_, n);
     mul_sigmoid(fo_, sg_, n_embd_, n, 1, true, st_);
 }
