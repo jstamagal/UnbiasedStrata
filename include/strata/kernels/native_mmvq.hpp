@@ -51,6 +51,9 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 /// keeps the sum.  n is a multiple of 32.
 void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
                               float eps, int threads, void* stream);
+void native_mtp_proj_norm_q8_1(const float* x0, const float* w0, const float* x1, const float* w1,
+                               float* y, void* y_q8_1, int n, int rows, float eps, int threads,
+                               bool embed_ready, void* stream);
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
@@ -166,6 +169,7 @@ struct MmvqIds {
     float* y;
     std::size_t y_stride;
     const int32_t* reuse_partner = nullptr;
+    const int32_t* reuse_group4 = nullptr;
 };
 bool native_mmvq_ids_supported(int ggml_type);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);

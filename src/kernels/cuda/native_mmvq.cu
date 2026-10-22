@@ -2406,6 +2406,7 @@ int g_row_set = -1;   // native_mmvq_set_tune: -1 = the environment
 
 #include "poly_head_wide.cuh"
 #include "poly_dense_wave.cuh"
+#include "mtp_proj_norm_q8.cuh"
 
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -3108,6 +3109,30 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     case 512: native_add_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     case 1024: native_add_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+}
+
+void native_mtp_proj_norm_q8_1(const float* x0, const float* w0, const float* x1, const float* w1,
+                               float* y, void* y_q8_1, int n, int rows, float eps, int threads,
+                               bool embed_ready, void* stream) {
+    validate_shape(n, 1);
+    validate_pointer(x0);
+    validate_pointer(w0);
+    validate_pointer(x1);
+    validate_pointer(w1);
+    validate_pointer(y);
+    validate_pointer(y_q8_1);
+    validate_stream(stream);
+    if (rows < 1) return;
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto* q = static_cast<Q81Block*>(y_q8_1);
+    switch (threads) {
+    case 128: mtp_proj_norm_q8_launch<128>(x0, w0, x1, w1, y, q, n, rows, eps, embed_ready, s); break;
+    case 256: mtp_proj_norm_q8_launch<256>(x0, w0, x1, w1, y, q, n, rows, eps, embed_ready, s); break;
+    case 512: mtp_proj_norm_q8_launch<512>(x0, w0, x1, w1, y, q, n, rows, eps, embed_ready, s); break;
+    case 1024: mtp_proj_norm_q8_launch<1024>(x0, w0, x1, w1, y, q, n, rows, eps, embed_ready, s); break;
+    default: throw std::invalid_argument("native_mtp_proj_norm_q8_1: 128, 256, 512 or 1024 threads");
     }
     launch_check();
 }

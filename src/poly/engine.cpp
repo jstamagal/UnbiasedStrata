@@ -113,6 +113,13 @@ bool mtp_attn_norm_q8_on() {
     }();
     return on;
 }
+bool mtp_proj_q8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_MTP_PROJ_Q8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 bool graph_runahead_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_GRAPH_RUNAHEAD");
@@ -2560,6 +2567,7 @@ void Engine::alloc() {
     assign_scratch();
 
     const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256,
+                                draft_ && mtp_proj_q8_on() ? 2 * n_embd_ : 0,
                                 partial_graph_on() ? n_used_ * n_ff_exp_ : 0});
     xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
     q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
@@ -2596,6 +2604,9 @@ void Engine::alloc() {
             const char* reuse = std::getenv("STRATA_POLY_EXPERT_REUSE_META");
             if (reuse && reuse[0] == '1' && reuse[1] == '\0')
                 d_reuse_partner_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "expert reuse metadata");
+            const char* group4 = std::getenv("STRATA_POLY_EXPERT_REUSE_GROUP4_META");
+            if (group4 && group4[0] == '1' && group4[1] == '\0')
+                d_reuse_group4_ = (int32_t*) dmalloc(rr * 4 * sizeof(int32_t), "expert group4 metadata");
         }
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
         if (partial_graph_on()) {
@@ -3769,6 +3780,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     }
                 }
                 const int32_t* reuse_partner = published ? d_reuse_partner_ : nullptr;
+                const int32_t* reuse_group4 = published ? d_reuse_group4_ : nullptr;
                 moe_shared(L, il, n);
                 if (adapt_overlap_on())
                     partial_graph_wait_slots(partial_device_words_, partial_device_words_ + 4,
@@ -3776,7 +3788,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 const void* const* table = adapt_overlap_on()
                     ? (const void* const*) d_partial_slots_ : d_slots_ + (size_t) il * n_expert_;
                 const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, kernels::native_q8_1_bytes(n_embd_),
-                                               n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner};
+                                               n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4};
                 kernels::native_mmvq_ids_partial(2, gate_up, rr, n_embd_, 2 * n_ff_exp_, st_);
                 if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
                     expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
@@ -3786,7 +3798,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
                 }
                 const kernels::MmvqIds down{table, d_ids_, 2 * L.gu_bytes, q8_,
-                                            kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner};
+                                            kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 if (pcie_frac_ > 0.f) {
@@ -3801,7 +3813,7 @@ void Engine::run(const int32_t* tokens, int n) {
                                                n_expert_, st_);
                     const kernels::MmvqIds dma_gu{(const void* const*) d_dma_safe_slots_, d_ids_, 0, xq_,
                                                   kernels::native_q8_1_bytes(n_embd_), n_used_, g_,
-                                                  2 * (size_t) n_ff_exp_, reuse_partner};
+                                                  2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4};
                     kernels::native_mmvq_ids_partial(2, dma_gu, rr, n_embd_, 2 * n_ff_exp_, st_);
                     if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
                         expert_activation_q8(g_, q8_, n_ff_exp_, rr, clamp_exp_[(size_t) il], gelu_, st_);
@@ -3811,7 +3823,7 @@ void Engine::run(const int32_t* tokens, int n) {
                         kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);
                     }
                     const kernels::MmvqIds dma_down{(const void* const*) d_dma_safe_slots_, d_ids_,
-                        2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner};
+                        2 * L.gu_bytes, q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4};
                     kernels::native_mmvq_ids_partial((int) L.d_type, dma_down, rr, n_ff_exp_, n_embd_, st_);
                     moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
                 }
@@ -4904,14 +4916,19 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
     if (n < kStageRows) copy2(h_r_, cur_, n * n_embd_, nullptr, nullptr, 0, st_);
     else ck(cudaMemcpyAsync(cur_, h_r_, rows * e * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
     ck(cudaEventRecord((cudaEvent_t) ev_hr_, cs(st_)), "embed");
-    if (mtp_input_norm_pair_on() && !opt_.dump)
+    const bool proj_q8 = mtp_proj_q8_on() && !opt_.dump && n >= 1 && n <= 8 && n_embd_ % 32 == 0 &&
+                         kernels::native_mmvq_supported((int) d_proj_.type);
+    if (proj_q8)
+        kernels::native_mtp_proj_norm_q8_1(cur_, fp(d_enorm_), h, fp(d_hnorm_), r_, q8_, n_embd_, n,
+                                           rms_eps_, sum_threads(n_embd_), false, st_);
+    else if (mtp_input_norm_pair_on() && !opt_.dump)
         rms_norm_pair(cur_, fp(d_enorm_), h, fp(d_hnorm_), r_, n_embd_, n, rms_eps_, st_);
     else {
         rms_norm(cur_, fp(d_enorm_), r_, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
         rms_norm(h, fp(d_hnorm_), r_ + e, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
     }
     float* x = r_ + 2 * rows * e;
-    lin(d_proj_, r_, x, n);
+    lin(d_proj_, r_, x, n, proj_q8 ? q8_ : nullptr);
     if (mtp_attn_norm_q8_on() && !opt_.dump && n >= 1 && n <= 8 && n_embd_ % 32 == 0)
         kernels::native_add_rms_norm_q8_1(x, nullptr, fp(layers_[(size_t) n_layer_].attn_norm),
                                           xn_, xq_, n_embd_, n, rms_eps_, sum_threads(n_embd_), st_);
@@ -5047,7 +5064,12 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                 const size_t e = (size_t) n_embd_;
                 float* own = hn_ + e;
                 const float* source = i == 0 ? hn_ : own;
-                if (!prefetched && mtp_input_norm_pair_on() && !opt_.dump)
+                const bool proj_q8 = mtp_proj_q8_on() && !opt_.dump && n_embd_ % 32 == 0 &&
+                                     kernels::native_mmvq_supported((int) d_proj_.type);
+                if (proj_q8)
+                    kernels::native_mtp_proj_norm_q8_1(cur_, fp(d_enorm_), source, fp(d_hnorm_), r_, q8_,
+                                                       n_embd_, 1, rms_eps_, sum_threads(n_embd_), prefetched, st_);
+                else if (!prefetched && mtp_input_norm_pair_on() && !opt_.dump)
                     rms_norm_pair(cur_, fp(d_enorm_), source, fp(d_hnorm_), r_, n_embd_, 1, rms_eps_, st_);
                 else {
                     if (!prefetched)
@@ -5055,7 +5077,7 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                     rms_norm(source, fp(d_hnorm_), r_ + e, n_embd_, 1, rms_eps_, st_, 2 * n_embd_);
                 }
                 float* x = r_ + 2 * e;
-                lin(d_proj_, r_, x, 1);
+                lin(d_proj_, r_, x, 1, proj_q8 ? q8_ : nullptr);
                 if (mtp_attn_norm_q8_on() && !opt_.dump && n_embd_ % 32 == 0)
                     kernels::native_add_rms_norm_q8_1(x, nullptr, fp(L.attn_norm), xn_, xq_, n_embd_, 1,
                                                       rms_eps_, sum_threads(n_embd_), st_);
@@ -5082,9 +5104,10 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                                           n_embd_, n_used_, partial_device_words_, st_);
                 }
                 const int32_t* reuse_partner = published ? d_reuse_partner_ : nullptr;
+                const int32_t* reuse_group4 = published ? d_reuse_group4_ : nullptr;
                 moe_shared(L, n_layer_, 1);
                 const kernels::MmvqIds gate_up{(const void* const*) d_mtp_slots_, d_ids_, 0, xq_,
-                    kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner};
+                    kernels::native_q8_1_bytes(n_embd_), n_used_, g_, 2 * (size_t) n_ff_exp_, reuse_partner, reuse_group4};
                 kernels::native_mmvq_ids_partial((int) L.gu_type, gate_up, n_used_, n_embd_, 2 * n_ff_exp_, st_);
                 if (expert_act_q8_on() && n_ff_exp_ % 32 == 0 && !opt_.dump)
                     expert_activation_q8(g_, q8_, n_ff_exp_, n_used_, clamp_exp_[(size_t) n_layer_], gelu_, st_);
@@ -5094,7 +5117,7 @@ bool Engine::mtp_graph_draft(int32_t token, int i) {
                     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * n_used_, 1, st_);
                 }
                 const kernels::MmvqIds down{(const void* const*) d_mtp_slots_, d_ids_, 2 * L.gu_bytes, q8_,
-                    kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner};
+                    kernels::native_q8_1_bytes(n_ff_exp_), 1, d_, (size_t) n_embd_, reuse_partner, reuse_group4};
                 kernels::native_mmvq_ids_partial((int) L.d_type, down, n_used_, n_ff_exp_, n_embd_, st_);
                 moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, 1, st_);
                 if (graph_runahead_on())

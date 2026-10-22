@@ -1021,6 +1021,30 @@ __device__ __forceinline__ int32_t route_reuse_partner(const int32_t* ids, int c
     return -1;
 }
 
+// Fixed four-int records partition each expert's occurrence order into groups of at most four.
+// Followers have count zero; the leader carries its count and up to three absolute partner entries.
+__device__ __forceinline__ void route_reuse_group4(const int32_t* ids, int count, int entry, int32_t* records) {
+    const int expert = ids[entry];
+    int previous = 0;
+    for (int i = 0; i < entry; ++i) previous += ids[i] == expert;
+    int group_count = 0, partner1 = -1, partner2 = -1, partner3 = -1;
+    if ((previous & 3) == 0) {
+        group_count = 1;
+        for (int i = entry + 1; i < count && group_count < 4; ++i) {
+            if (ids[i] != expert) continue;
+            if (group_count == 1) partner1 = i;
+            else if (group_count == 2) partner2 = i;
+            else partner3 = i;
+            ++group_count;
+        }
+    }
+    int32_t* record = records + size_t(entry) * 4;
+    record[0] = group_count;
+    record[1] = partner1;
+    record[2] = partner2;
+    record[3] = partner3;
+}
+
 __device__ __forceinline__ int32_t route_reuse_partner_ballot(const int32_t* ids, int count, int entry) {
     const int lane = int(threadIdx.x) & (WARP - 1);
     const int expert = __shfl_sync(0xffffffffu, lane == 0 ? ids[entry] : 0, 0, WARP);
@@ -1130,6 +1154,9 @@ __device__ __forceinline__ void route_publish_body(const volatile float* logits,
     // All warps, including inactive rows and lanes beyond n_used, reach this barrier.
     __syncthreads();
     const int t = int(threadIdx.x);
+    if (publish.expert_group4)
+        for (int entry = t; entry < rows * n_used; entry += blockDim.x)
+            route_reuse_group4(ids, rows * n_used, entry, publish.expert_group4);
     if (publish.partners) {
         if (publish.partner_ballot) {
             const int warps = int(blockDim.x) / WARP;

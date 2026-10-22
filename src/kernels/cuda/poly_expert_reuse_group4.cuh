@@ -1,10 +1,12 @@
 #pragma once
 
+#include "poly_expert_reuse_group4_meta.cuh"
+
 #if defined(__HIPCC__)
 inline bool poly_expert_reuse_group4_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_POLY_EXPERT_REUSE_GROUP4");
-        return v && v[0] == '1' && v[1] == '\0';
+        return (v && v[0] == '1' && v[1] == '\0') || poly_expert_reuse_group4_meta_on();
     }();
     return on;
 }
@@ -58,7 +60,9 @@ __global__ void __launch_bounds__(128) poly_expert_reuse_group4_kernel(
     const int row0 = 4 * ROWS * int(blockIdx.x) + ROWS * int(threadIdx.y);
     if (row0 >= n_out) return;
     const int expert = slots.ids[j];
-    const PolyExpertGroup4 group = poly_expert_group4_find(slots.ids, count, j, expert);
+    PolyExpertGroup4 group;
+    if (!poly_expert_group4_metadata(slots.reuse_group4, j, group.count, group.entry))
+        group = poly_expert_group4_find(slots.ids, count, j, expert);
     if (group.count == 0) return;
     if constexpr (PARTIAL) {
         if (slots.table[expert] == nullptr) {

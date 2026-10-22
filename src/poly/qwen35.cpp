@@ -749,11 +749,13 @@ bool Qwen35::route_card_publish(int il, int n, int32_t* ids, float* w, float* ho
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_POLY_ROUTE_PUBLISH");
         const char* meta = std::getenv("STRATA_POLY_EXPERT_REUSE_META");
+        const char* group4 = std::getenv("STRATA_POLY_EXPERT_REUSE_GROUP4_META");
         return (v && v[0] == '1' && v[1] == '\0') ||
-               (meta && meta[0] == '1' && meta[1] == '\0');
+               (meta && meta[0] == '1' && meta[1] == '\0') ||
+               (group4 && group4[0] == '1' && group4[1] == '\0');
     }();
     const RoutePublish publish{xn_, host_x, host_ids, host_wts, n * n_embd_, ready, layer_ready,
-                               d_reuse_partner_};
+                               d_reuse_partner_, false, d_reuse_group4_};
     const Layer& L = layers_[(size_t) il];
     if (fused_router(L, n)) {
         if (router_f32_publish(fp(L.gate_inp), xn_, rl_, n_embd_, n_expert_, n_used_, n,

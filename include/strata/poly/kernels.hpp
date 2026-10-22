@@ -157,6 +157,7 @@ struct RoutePublish {
     uint32_t* layer_ready;
     int32_t* partners = nullptr;
     bool partner_ballot = false;
+    int32_t* expert_group4 = nullptr;
 };
 bool route_rows_publish(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale,
                         const float* bias, const float* escale, bool norm, float w_scale,
