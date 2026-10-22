@@ -3728,6 +3728,17 @@ bool native_mmvq_ids_partial(int ggml_type, const MmvqIds& ids, int count, int n
     validate_pointer(ids.y);
     validate_shape(n_in, 1, 32);
     validate_stream(stream);
+#if defined(__HIPCC__)
+    if (poly_q40_expert_ids_enabled(n_in, n_out)) {
+        const auto s = static_cast<cudaStream_t>(stream);
+        if (ggml_type == 2)
+            poly_q40_expert_ids_partial(ids, count, n_in, n_out, s);
+        else
+            poly_q41_expert_ids_partial(ids, count, n_in, n_out, s);
+        launch_check();
+        return true;
+    }
+#endif
     if (ggml_type == 2)
         launch_slots<SmallTraits<Q40Block, 4>, MmvqIds, true>(ids, count, n_in, n_out,
                                                                 static_cast<cudaStream_t>(stream));
