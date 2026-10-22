@@ -5,6 +5,60 @@ constexpr int kPolyHeadIn = 3072;
 constexpr int kPolyHeadBlocks = kPolyHeadIn / 256;
 constexpr int kPolyHeadBlockBytes = 210;
 
+#include "poly_head_preload.cuh"
+
+template<int NC>
+__launch_bounds__(128)
+__global__ void poly_head_q6k_pair_kernel(const Q6KBlock* __restrict__ w,
+                                         const Q81Block* __restrict__ x,
+                                         float* __restrict__ y, int n_out) {
+    const int row0 = 8 * int(blockIdx.x) + 2 * int(threadIdx.y);
+    if (row0 >= n_out) return;
+    const int lane = int(threadIdx.x);
+    constexpr int XB = kPolyHeadIn / 32;
+    const int xoff = 4 * (lane / 16) + (lane % 16) / 8;
+    float sum[2][NC] = {};
+#pragma unroll 1
+    for (int kb = 0; kb < kPolyHeadBlocks; ++kb) {
+        int u[NC][2];
+        float d8[NC][2];
+#pragma unroll
+        for (int col = 0; col < NC; ++col) {
+            const Q81Block* xb = x + col * XB + kb * 8 + xoff;
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                u[col][i] = reinterpret_cast<const int*>(xb[2 * i].qs)[lane % 8];
+                d8[col][i] = __low2float(xb[2 * i].ds);
+            }
+        }
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+            const int actual_row = min(row0 + row, n_out - 1);
+            const Q6KTraits::W weight = Q6KTraits::load(w + size_t(actual_row) * kPolyHeadBlocks + kb, lane);
+#pragma unroll
+            for (int col = 0; col < NC; ++col)
+                sum[row][col] += q6_q8_dot_impl(weight.vl, weight.vh, u[col], weight.scales, weight.d, d8[col]);
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+#pragma unroll
+        for (int col = 0; col < NC; ++col) {
+            const float value = warp_sum(sum[row][col]);
+            if (lane == 0 && row0 + row < n_out)
+                y[size_t(col) * n_out + row0 + row] = value;
+        }
+    }
+}
+
+inline bool poly_head_pair_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_HEAD_PAIR");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 // A nonpersistent wave owns one output row. The four waves of a block write
 // four independent rows, avoiding the native kernel's cross-wave reduction.
 // For verify windows, each wave decodes its Q6_K weights once for all columns.
@@ -95,7 +149,8 @@ inline bool poly_head_wave_enabled(int n_in, int n_out, int ncols) {
         const char* v = std::getenv("STRATA_POLY_HEAD_WAVE");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    return on && n_in == kPolyHeadIn && n_out >= 65536 && ncols >= 1 && ncols <= 4;
+    return (on || poly_head_pair_enabled() || (ncols == 1 && poly_head_preload_enabled())) &&
+           n_in == kPolyHeadIn && n_out >= 65536 && ncols >= 1 && ncols <= 4;
 }
 
 inline void poly_head_wave(const void* weights, const void* x, float* y, int n_out,
@@ -104,6 +159,20 @@ inline void poly_head_wave(const void* weights, const void* x, float* y, int n_o
     const dim3 threads(32, 4);
     const auto* w = static_cast<const Q6KBlock*>(weights);
     const auto* q = static_cast<const Q81Block*>(x);
+    if (ncols == 1 && poly_head_preload_enabled()) {
+        poly_head_preload(w, q, y, n_out, stream);
+        return;
+    }
+    if (poly_head_pair_enabled()) {
+        const dim3 pair_blocks(unsigned((n_out + 7) / 8));
+        switch (ncols) {
+        case 1: poly_head_q6k_pair_kernel<1><<<pair_blocks, threads, 0, stream>>>(w, q, y, n_out); break;
+        case 2: poly_head_q6k_pair_kernel<2><<<pair_blocks, threads, 0, stream>>>(w, q, y, n_out); break;
+        case 3: poly_head_q6k_pair_kernel<3><<<pair_blocks, threads, 0, stream>>>(w, q, y, n_out); break;
+        case 4: poly_head_q6k_pair_kernel<4><<<pair_blocks, threads, 0, stream>>>(w, q, y, n_out); break;
+        }
+        return;
+    }
     switch (ncols) {
     case 1: poly_head_q6k_wave_kernel<1><<<blocks, threads, 0, stream>>>(w, q, y, n_out); break;
     case 2: poly_head_q6k_wave_kernel<2><<<blocks, threads, 0, stream>>>(w, q, y, n_out); break;

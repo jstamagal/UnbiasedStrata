@@ -125,3 +125,6 @@ STRATA_POLY_HEAD_WIDE=0  # stock Q6_K head is now the gfx103x default; HEAD_WIDE
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_PAIR=1  # fast partial-graph expert dispatch, grid uses real routed entry count
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=auto  # actual-count expert row grouping; ROWS=1/2/4 also selectable
 STRATA_POLY_EXPERT_IDS=1 STRATA_POLY_Q40_EXPERT_ROWS=2 STRATA_POLY_Q40_EXPERT_BLOCK=1  # full Q4 block per lane with paired-row Q8 reuse
+STRATA_POLY_HEAD_PAIR=1  # paired output rows share Q8 head inputs for 1-4 columns
+STRATA_POLY_HEAD_PRELOAD=1  # decode Q6_K head preloads Q8 inputs across persistent rows
+STRATA_POLY_HEAD_PRELOAD=1 STRATA_POLY_HEAD_PRELOAD_GRID=2048  # explicit persistent head grid, range 256-16384
